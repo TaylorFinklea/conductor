@@ -91,7 +91,7 @@ pub(crate) enum RunLifecycle {
     Finished,
 }
 
-/// One event kind from the spec's stable `conductor/event@1` list.
+/// One event kind from the spec's stable `conductor/event@2` list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
@@ -630,7 +630,7 @@ pub(crate) struct NewRun {
     pub(crate) approval: Option<serde_json::Value>,
 }
 
-/// Fields for one `conductor/event@1` row; `run_id`, `seq`, `ts`, `job`, and
+/// Fields for one `conductor/event@2` row; `run_id`, `seq`, `ts`, `job`, and
 /// `target` are filled in by the owning [`RunHandle`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EventInput {
