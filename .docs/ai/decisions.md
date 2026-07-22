@@ -253,3 +253,24 @@ dispatch the blocked Bead manually.
 the immutable approved route. It restores forward progress from real positive
 Codex evidence without treating prose as quota truth, weakening fail-closed
 provider checks, or moving claim/verify/close ownership out of Conductor.
+
+## [2026-07-22] Bursar snapshots and run artifacts are the sole active routing authority
+
+**Context**: A mutable Conductor roster and v1/Arena artifacts let approved work
+be reinterpreted at dispatch or resume. The next role-routing phases need
+durable structure before they activate behavior.
+
+**Decision**: Consume only strict `bursar/roster@2`; copy and pin its exact
+bytes, source identity, and policy digest in every `conductor/run@2` before
+selection. Use only strict `conductor/event@2` in `runs-v2/`. Finished legacy
+history remains inert while deployment preflight blocks actionable v1 recovery.
+Remove Arena outright. Represent `Plan` targets, routes, and progress as typed
+structural state only; do not activate plan execution or a generic scheduler.
+
+**Alternatives considered**: Compatibility parsers; rereading live roster
+configuration on resume; carrying Arena alongside v2; activating role policy
+with its state model.
+
+**Rationale**: Authorization must name immutable inputs and runtime evidence
+must remain interpretable after configuration changes. A clean namespace and
+closed schemas fail safely rather than silently mixing historical semantics.

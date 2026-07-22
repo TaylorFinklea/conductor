@@ -1,8 +1,8 @@
 # Conductor fleet cycle runner — static configuration.
 #
 # Execution profiles, providers, and invocation identities are owned by Bursar.
-# Every launch consumes `bursar/roster@1`; Conductor pins its artifact path and
-# SHA-256 in the approved cycle plan.
+# Every launch consumes `bursar/roster@2`; Conductor copies and pins its exact
+# snapshot bytes in the prepared run artifact.
 
 autonomy = "propose"
 
@@ -90,12 +90,6 @@ parallel = 3
 judge = "openai-codex--codex--gpt-5.6-sol--max"
 judge_fallbacks = ["openai-codex--codex--gpt-5.6-terra--xhigh", "anthropic--claude-code--claude-opus-4-8--none"]
 
-[arena]
-# Head-to-head defaults. Candidate profiles are resolved by Bursar.
-parallel = 2
-auto_apply = true
-min_score_x10 = 40
-keep_worktrees = false
 
 # Retry order is Conductor job policy, not roster ownership. Each ID must be
 # present in the Bursar snapshot; unavailable fallback profiles are omitted at

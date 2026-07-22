@@ -1,15 +1,13 @@
-//! `conductor/run@1` manifest + `conductor/event@1` JSONL run artifacts.
+//! `conductor/run@2` manifest + `conductor/event@2` JSONL run artifacts.
 //!
-//! Every run lives under `<state_dir>/runs/<run-id>/`: a whole-file atomic
-//! `manifest.json` (mirrors `ratchet.rs::save`'s sibling-temp-then-rename
-//! replace) pinning target, job, approved profile envelope, Bursar roster
-//! artifact hash, limits, artifacts, lifecycle, and final outcome, plus an
-//! append-only `events.jsonl` (mirrors `ledger.rs::append_serialized`'s
-//! read-modify-write-then-rename replace) recording one stable-schema event
-//! per attempt, verifier, review, coverage gap, and terminal outcome.
+//! Every active run lives under `<state_dir>/runs-v2/<run-id>/`: a whole-file
+//! atomic `manifest.json` replacement and an append-only `events.jsonl`.
+//! Finished `runs/` artifacts are legacy history and are never scanned by the
+//! active v2 reader.
 
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::fmt;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -20,11 +18,31 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Schema tag stamped on every manifest written by this module.
-pub(crate) const RUN_SCHEMA: &str = "conductor/run@1";
+pub(crate) const RUN_SCHEMA: &str = "conductor/run@2";
 /// Schema tag stamped on every event line written by this module.
-pub(crate) const EVENT_SCHEMA: &str = "conductor/event@1";
+pub(crate) const EVENT_SCHEMA: &str = "conductor/event@2";
 
 pub(crate) type Result<T> = std::result::Result<T, RunError>;
+
+/// Read-only deployment gate over legacy `runs/` artifacts. Active v2 code
+/// never opens a v1 run; this classifier merely blocks cutover while recovery
+/// work still exists and leaves all legacy bytes untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct LegacyV1Preflight {
+    pub(crate) pending: usize,
+    pub(crate) implementing: usize,
+    pub(crate) reclaimable: usize,
+}
+
+impl LegacyV1Preflight {
+    pub(crate) const fn actionable(self) -> usize {
+        self.pending + self.implementing + self.reclaimable
+    }
+
+    pub(crate) const fn activation_allowed(self) -> bool {
+        self.actionable() == 0
+    }
+}
 
 /// Error returned by run-artifact reads and writes.
 #[derive(Debug, Clone)]
@@ -54,16 +72,18 @@ impl std::error::Error for RunError {}
 
 /// The closed job kinds from the core-consolidation spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RunJob {
     Work,
     Review,
     Consult,
-    Arena,
+    Plan,
 }
 
 /// Run lifecycle state pinned on the manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunLifecycle {
     Started,
@@ -73,6 +93,7 @@ pub(crate) enum RunLifecycle {
 
 /// One event kind from the spec's stable `conductor/event@1` list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EventKind {
     RunStarted,
@@ -86,13 +107,34 @@ pub(crate) enum EventKind {
 
 /// `{"path": ..., "sha256": ...}` artifact identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ArtifactRef {
     pub(crate) path: String,
     pub(crate) sha256: String,
 }
 
+/// The content-addressed identity of the exact Bursar snapshot copied into a
+/// v2 run directory before profile selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RosterSnapshotArtifact {
+    pub(crate) path: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) sha256: String,
+}
+
+/// The raw snapshot envelope supplied when preparing a run. This never
+/// serializes into a manifest; [`RunHandle::create`] copies the bytes to
+/// `roster.json` and persists only its run-local identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RosterSnapshotInput {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) policy_sha256: String,
+}
+
 /// `{"repo": ..., "bead": ...}` run/event target identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RunTarget {
     pub(crate) repo: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,12 +143,14 @@ pub(crate) struct RunTarget {
 
 /// Approved profile/fallback envelope pinned into the manifest at run start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ApprovedProfileEnvelope {
     pub(crate) profiles: Vec<String>,
 }
 
 /// Runtime limits pinned into the manifest at run start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RunLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) item_wall_clock_mins: Option<u64>,
@@ -116,6 +160,7 @@ pub(crate) struct RunLimits {
 
 /// Verifier configuration pinned into the manifest before execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RunVerifier {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mechanical: Option<String>,
@@ -125,6 +170,7 @@ pub(crate) struct RunVerifier {
 
 /// Durable work-stage boundary for a mechanically verified commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkStage {
     Implementing,
@@ -134,6 +180,7 @@ pub(crate) enum WorkStage {
 
 /// Immutable mechanical-verifier evidence pinned before qualitative review.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MechanicalVerification {
     pub(crate) command: String,
     pub(crate) passed: bool,
@@ -142,6 +189,7 @@ pub(crate) struct MechanicalVerification {
 
 /// Work-only progress persisted inside the canonical run manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WorkState {
     pub(crate) cycle_id: String,
     pub(crate) authorization_sha256: String,
@@ -186,18 +234,349 @@ pub(crate) struct WorkState {
     pub(crate) stage: WorkStage,
 }
 
+/// The only durable plan-routing stages. The serde spelling is shared by
+/// manifests, events, configuration adapters, and ledger evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PlanStage {
+    Planner,
+    PeerReview,
+    SecondOpinion,
+}
+
+/// Immutable exact execution identity approved for a plan stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ApprovedExecution {
+    pub(crate) profile_id: String,
+    pub(crate) provider_id: String,
+    pub(crate) availability_key: String,
+    pub(crate) execution_key: String,
+}
+
+/// One immutable constrained route, selected before the run can advance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanStageRoute {
+    pub(crate) stage: PlanStage,
+    pub(crate) capability_role: String,
+    pub(crate) candidates: Vec<ApprovedExecution>,
+    pub(crate) provider_distinct_from: Vec<PlanStage>,
+}
+
+/// Immutable route envelope for all legal plan stages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanRoutes {
+    pub(crate) stages: Vec<PlanStageRoute>,
+}
+
+/// Tier declared or derived from a captured plan target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PlanTier {
+    Junior,
+    Senior,
+    Lead,
+}
+
+/// Bounded target complexity declared or derived from a captured plan target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PlanComplexity {
+    S,
+    M,
+    L,
+    XL,
+}
+
+/// Immutable input copied into a plan run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub(crate) enum PlanInput {
+    Bead {
+        bead_id: String,
+        artifact: ArtifactRef,
+        tier: PlanTier,
+        complexity: PlanComplexity,
+    },
+    Artifact {
+        artifact: ArtifactRef,
+        tier: PlanTier,
+        complexity: PlanComplexity,
+    },
+}
+
+/// A plan run has exactly one canonical repository and one tagged input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanTarget {
+    pub(crate) repo: String,
+    pub(crate) input: PlanInput,
+}
+
+/// Bounded revision counter. Values outside 0..=3 are rejected on deserialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct RevisionLimit(u8);
+
+impl RevisionLimit {
+    pub(crate) fn new(value: u8) -> Result<Self> {
+        if value > 3 {
+            return Err(RunError::new("plan revision limit must be in 0..=3"));
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) const fn value(self) -> u8 {
+        self.0
+    }
+
+    fn consume(&mut self) -> Result<()> {
+        if self.0 == 3 {
+            return Err(RunError::new("plan revision limit exhausted"));
+        }
+        self.0 += 1;
+        Ok(())
+    }
+}
+
+/// A stage can never be attempted zero times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct StageAttemptLimit(u8);
+
+impl StageAttemptLimit {
+    pub(crate) fn new(value: u8) -> Result<Self> {
+        if value == 0 {
+            return Err(RunError::new("plan stage-attempt limit must be nonzero"));
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) const fn value(self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PeerVerdict {
+    Approve,
+    Revise,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SecondOpinionVerdict {
+    Accept,
+    Reject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PlanTerminalVerdict {
+    Accepted,
+    Rejected,
+    Blocked,
+    NeedsInput,
+}
+
+/// Mutable plan progress; every binding becomes immutable at its legal stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum PlanProgress {
+    Prepared,
+    Authoring {
+        author: ApprovedExecution,
+        attempts: u8,
+    },
+    AwaitingPeer {
+        author: ApprovedExecution,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer: Option<ApprovedExecution>,
+        artifact: ArtifactRef,
+        revisions: RevisionLimit,
+    },
+    Revising {
+        author: ApprovedExecution,
+        peer: ApprovedExecution,
+        artifact: ArtifactRef,
+        revisions: RevisionLimit,
+    },
+    AwaitingSecondOpinion {
+        author: ApprovedExecution,
+        peer: ApprovedExecution,
+        artifact: ArtifactRef,
+        revisions: RevisionLimit,
+    },
+    Terminal {
+        verdict: PlanTerminalVerdict,
+    },
+}
+
+impl PlanProgress {
+    pub(crate) fn start_authoring(
+        &mut self,
+        author: ApprovedExecution,
+        attempt_limit: StageAttemptLimit,
+    ) -> Result<()> {
+        if !matches!(self, Self::Prepared) {
+            return Err(RunError::new("plan author can bind only from prepared"));
+        }
+        *self = Self::Authoring {
+            author,
+            attempts: attempt_limit.value(),
+        };
+        Ok(())
+    }
+
+    pub(crate) fn await_peer(&mut self, artifact: ArtifactRef) -> Result<()> {
+        let Self::Authoring { author, .. } = self else {
+            return Err(RunError::new("plan can await peer only after authoring"));
+        };
+        *self = Self::AwaitingPeer {
+            author: author.clone(),
+            peer: None,
+            artifact,
+            revisions: RevisionLimit::new(0)?,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn record_peer_verdict(
+        &mut self,
+        peer: ApprovedExecution,
+        verdict: PeerVerdict,
+    ) -> Result<()> {
+        let Self::AwaitingPeer {
+            author,
+            peer: bound_peer,
+            artifact,
+            revisions,
+        } = self
+        else {
+            return Err(RunError::new(
+                "peer verdict is not legal in this plan state",
+            ));
+        };
+        if peer.profile_id == author.profile_id || peer.provider_id == author.provider_id {
+            return Err(RunError::new(
+                "peer binding must be distinct from immutable author binding",
+            ));
+        }
+        if let Some(bound) = bound_peer {
+            if bound != &peer {
+                return Err(RunError::new(
+                    "peer binding cannot change after the first peer verdict",
+                ));
+            }
+        }
+        let author = author.clone();
+        let artifact = artifact.clone();
+        let revisions = *revisions;
+        *self = match verdict {
+            PeerVerdict::Approve => Self::AwaitingSecondOpinion {
+                author,
+                peer,
+                artifact,
+                revisions,
+            },
+            PeerVerdict::Revise => Self::Revising {
+                author,
+                peer,
+                artifact,
+                revisions,
+            },
+        };
+        Ok(())
+    }
+
+    pub(crate) fn complete_revision(&mut self, artifact: ArtifactRef) -> Result<()> {
+        let Self::Revising {
+            author,
+            peer,
+            revisions,
+            ..
+        } = self
+        else {
+            return Err(RunError::new("revision is not legal in this plan state"));
+        };
+        let author = author.clone();
+        let peer = peer.clone();
+        let mut revisions = *revisions;
+        revisions.consume()?;
+        *self = Self::AwaitingPeer {
+            author,
+            peer: Some(peer),
+            artifact,
+            revisions,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn record_second_opinion(&mut self, verdict: SecondOpinionVerdict) -> Result<()> {
+        if !matches!(self, Self::AwaitingSecondOpinion { .. }) {
+            return Err(RunError::new(
+                "second opinion verdict is not legal in this plan state",
+            ));
+        }
+        *self = Self::Terminal {
+            verdict: match verdict {
+                SecondOpinionVerdict::Accept => PlanTerminalVerdict::Accepted,
+                SecondOpinionVerdict::Reject => PlanTerminalVerdict::Rejected,
+            },
+        };
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanRunDetails {
+    pub(crate) target: PlanTarget,
+    pub(crate) routes: PlanRoutes,
+    pub(crate) progress: PlanProgress,
+    pub(crate) revision_limit: RevisionLimit,
+    pub(crate) stage_attempt_limit: StageAttemptLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReviewRunDetails {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsultRunDetails {}
+
+/// The job-tagged state space prevents any job from serializing another job's
+/// mutable state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "job", rename_all = "lowercase", deny_unknown_fields)]
+pub(crate) enum RunDetails {
+    Work { state: Option<WorkState> },
+    Review { state: ReviewRunDetails },
+    Consult { state: ConsultRunDetails },
+    Plan { state: PlanRunDetails },
+}
+
 /// `conductor/run@1` — the atomic, versioned run manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RunManifest {
     pub(crate) schema: String,
     pub(crate) run_id: String,
     pub(crate) job: RunJob,
     pub(crate) target: RunTarget,
+    pub(crate) details: RunDetails,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) approved_profiles: ApprovedProfileEnvelope,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) bursar_roster_artifact: Option<ArtifactRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) roster_snapshot: Option<RosterSnapshotArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) roster_policy_sha256: Option<String>,
     pub(crate) limits: RunLimits,
     pub(crate) verifier: RunVerifier,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,6 +590,7 @@ pub(crate) struct RunManifest {
 
 /// `conductor/event@1` — one append-only event line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RunEvent {
     pub(crate) schema: String,
     pub(crate) event_id: String,
@@ -234,6 +614,7 @@ pub(crate) struct NewRun {
     pub(crate) target: RunTarget,
     pub(crate) approved_profiles: Vec<String>,
     pub(crate) bursar_roster_artifact: Option<ArtifactRef>,
+    pub(crate) roster_snapshot: Option<RosterSnapshotInput>,
     pub(crate) limits: RunLimits,
     pub(crate) verifier: RunVerifier,
     pub(crate) work: Option<WorkState>,
@@ -276,7 +657,7 @@ const fn job_label(job: RunJob) -> &'static str {
         RunJob::Work => "work",
         RunJob::Review => "review",
         RunJob::Consult => "consult",
-        RunJob::Arena => "arena",
+        RunJob::Plan => "plan",
     }
 }
 
@@ -290,15 +671,56 @@ impl RunHandle {
     /// Same as [`Self::create`] with an explicit clock, so callers that need
     /// deterministic `created_at` ordering (e.g. legacy-run recovery tests)
     /// do not have to depend on real wall-clock spacing between calls.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "atomic run creation validates, persists, and records the initial immutable evidence"
+    )]
     pub(crate) fn create_at(
         state_dir: &Path,
         job: RunJob,
         request: NewRun,
         now: DateTime<Utc>,
     ) -> Result<Self> {
-        if let Some(artifact) = request.bursar_roster_artifact.as_ref() {
+        require_v2_activation_preflight(state_dir)?;
+        let NewRun {
+            target,
+            approved_profiles,
+            bursar_roster_artifact,
+            roster_snapshot,
+            limits,
+            verifier,
+            work,
+            approval,
+        } = request;
+        if let Some(artifact) = bursar_roster_artifact.as_ref() {
             validate_artifact_ref(artifact, "bursar roster artifact")?;
         }
+        if let Some(snapshot) = roster_snapshot.as_ref() {
+            validate_sha256(&snapshot.policy_sha256, "roster policy")?;
+            let parsed = crate::bursar::parse_roster_snapshot(&snapshot.bytes)
+                .map_err(|error| RunError::new(format!("invalid roster snapshot: {error}")))?;
+            if parsed.policy_sha256() != snapshot.policy_sha256 {
+                return Err(RunError::new(
+                    "roster snapshot policy_sha256 does not match prepared policy",
+                ));
+            }
+        }
+        let details = match job {
+            RunJob::Work => RunDetails::Work {
+                state: work.clone(),
+            },
+            RunJob::Review => RunDetails::Review {
+                state: ReviewRunDetails::default(),
+            },
+            RunJob::Consult => RunDetails::Consult {
+                state: ConsultRunDetails::default(),
+            },
+            RunJob::Plan => {
+                return Err(RunError::new(
+                    "plan runs require explicit structural PlanRunDetails and are not activated",
+                ));
+            }
+        };
         let root = runs_dir(state_dir);
         std::fs::create_dir_all(&root).map_err(|e| {
             RunError::new(format!("failed to create runs dir {}: {e}", root.display()))
@@ -323,16 +745,19 @@ impl RunHandle {
             schema: RUN_SCHEMA.to_string(),
             run_id,
             job,
-            target: request.target,
+            target,
+            details,
             created_at: created_at.clone(),
             updated_at: created_at,
             approved_profiles: ApprovedProfileEnvelope {
-                profiles: request.approved_profiles,
+                profiles: approved_profiles,
             },
-            bursar_roster_artifact: request.bursar_roster_artifact,
-            limits: request.limits,
-            verifier: request.verifier,
-            work: request.work,
+            bursar_roster_artifact,
+            roster_snapshot: None,
+            roster_policy_sha256: None,
+            limits,
+            verifier,
+            work,
             artifacts: Vec::new(),
             lifecycle: RunLifecycle::Started,
             outcome: None,
@@ -357,8 +782,24 @@ impl RunHandle {
                 ))
             })?;
             let mut initial_refs = Vec::new();
-            if let Some(approval) = request.approval.as_ref() {
+            if let Some(approval) = approval.as_ref() {
                 initial_refs.push(handle.write_approval(approval)?);
+            }
+            if let Some(snapshot) = roster_snapshot.as_ref() {
+                let relative = Path::new("roster.json");
+                write_new_file(&handle.dir.join(relative), &snapshot.bytes)?;
+                let copied = RosterSnapshotArtifact {
+                    path: "roster.json".to_string(),
+                    size_bytes: u64::try_from(snapshot.bytes.len())
+                        .map_err(|_| RunError::new("roster snapshot exceeds u64"))?,
+                    sha256: format!("{:x}", Sha256::digest(&snapshot.bytes)),
+                };
+                handle.manifest.roster_policy_sha256 = Some(snapshot.policy_sha256.clone());
+                handle.manifest.roster_snapshot = Some(copied.clone());
+                initial_refs.push(ArtifactRef {
+                    path: copied.path,
+                    sha256: copied.sha256,
+                });
             }
             if let Some(roster) = handle.manifest.bursar_roster_artifact.clone() {
                 initial_refs.push(roster);
@@ -373,7 +814,9 @@ impl RunHandle {
                 },
                 now,
             )?;
-            if handle.manifest.bursar_roster_artifact.is_none() {
+            if handle.manifest.roster_snapshot.is_none()
+                && handle.manifest.bursar_roster_artifact.is_none()
+            {
                 handle.append_event_at(
                     EventKind::CoverageGap,
                     EventInput {
@@ -789,9 +1232,76 @@ impl RunHandle {
     }
 }
 
-/// Returns `<state_dir>/runs`.
+/// Classifies legacy v1 artifacts without interpreting them as active runs.
+/// Missing legacy storage is the normal, ready-to-activate case.
+pub(crate) fn legacy_v1_preflight(state_dir: &Path) -> Result<LegacyV1Preflight> {
+    let legacy_dir = state_dir.join("runs");
+    let entries = match std::fs::read_dir(&legacy_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LegacyV1Preflight::default());
+        }
+        Err(error) => {
+            return Err(RunError::new(format!(
+                "failed to inspect legacy runs {}: {error}",
+                legacy_dir.display()
+            )));
+        }
+    };
+    let mut result = LegacyV1Preflight::default();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            RunError::new(format!("failed to inspect legacy run entry: {error}"))
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|error| RunError::new(format!("failed to stat legacy run entry: {error}")))?
+            .is_dir()
+        {
+            continue;
+        }
+        let manifest = entry.path().join("manifest.json");
+        let Ok(bytes) = std::fs::read(&manifest) else {
+            result.reclaimable += 1;
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            result.reclaimable += 1;
+            continue;
+        };
+        if value.get("schema").and_then(serde_json::Value::as_str) != Some("conductor/run@1") {
+            continue;
+        }
+        if value.get("lifecycle").and_then(serde_json::Value::as_str) == Some("finished") {
+            continue;
+        }
+        match value
+            .get("work")
+            .and_then(|work| work.get("stage"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("pending_review") => result.pending += 1,
+            Some("implementing") => result.implementing += 1,
+            _ => result.reclaimable += 1,
+        }
+    }
+    Ok(result)
+}
+
+fn require_v2_activation_preflight(state_dir: &Path) -> Result<()> {
+    let legacy = legacy_v1_preflight(state_dir)?;
+    if legacy.activation_allowed() {
+        return Ok(());
+    }
+    Err(RunError::new(format!(
+        "v2 activation blocked by legacy recovery: pending={}, implementing={}, reclaimable={}",
+        legacy.pending, legacy.implementing, legacy.reclaimable
+    )))
+}
+
+/// Returns `<state_dir>/runs-v2`, the sole active run namespace.
 pub(crate) fn runs_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join("runs")
+    state_dir.join("runs-v2")
 }
 
 fn heartbeat_path(run_dir: &Path) -> PathBuf {
@@ -831,6 +1341,14 @@ pub(crate) fn read_manifest(path: &Path) -> Result<RunManifest> {
     if let Some(artifact) = manifest.bursar_roster_artifact.as_ref() {
         validate_artifact_ref(artifact, "manifest bursar roster artifact")?;
     }
+    if let Some(snapshot) = manifest.roster_snapshot.as_ref() {
+        validate_roster_snapshot(path, snapshot, manifest.roster_policy_sha256.as_deref())?;
+    } else if manifest.roster_policy_sha256.is_some() {
+        return Err(RunError::new(
+            "manifest has roster policy_sha256 without copied roster snapshot",
+        ));
+    }
+    validate_run_details(path, &manifest)?;
     for artifact in &manifest.artifacts {
         validate_artifact_ref(artifact, "manifest artifact")?;
         validate_local_artifact(path, artifact)?;
@@ -945,6 +1463,7 @@ pub(crate) fn find_reclaimable_work_run(
     }
     if unfinished.len() > 1 {
         unfinished.sort();
+
         return Err(RunError::new(format!(
             "multiple unfinished work runs found for {cycle_id} {repo}/{bead}: {}",
             unfinished.join(", ")
@@ -954,10 +1473,119 @@ pub(crate) fn find_reclaimable_work_run(
         return Ok(Some(ReclaimCandidate::Unfinished(run_id)));
     }
     // Newest generation wins; the run_id tie-breaks equal timestamps (it
-    // embeds the same monotonic per-process counter used to keep run ids
     // collision-resistant).
     finished.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    Ok(finished.pop().map(|(_, run_id)| ReclaimCandidate::FinishedLatest(run_id)))
+    Ok(finished
+        .pop()
+        .map(|(_, run_id)| ReclaimCandidate::FinishedLatest(run_id)))
+}
+fn validate_run_details(path: &Path, manifest: &RunManifest) -> Result<()> {
+    match (&manifest.job, &manifest.details) {
+        (RunJob::Work, RunDetails::Work { .. }) => {}
+        (RunJob::Review, RunDetails::Review { .. })
+        | (RunJob::Consult, RunDetails::Consult { .. }) => {
+            if manifest.work.is_some() {
+                return Err(RunError::new("non-work run cannot carry work state"));
+            }
+        }
+        (RunJob::Plan, RunDetails::Plan { state }) => {
+            if manifest.work.is_some() {
+                return Err(RunError::new("plan run cannot carry work state"));
+            }
+            validate_plan_details(path, state)?;
+        }
+        _ => {
+            return Err(RunError::new(
+                "manifest job does not match tagged run details",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_plan_details(path: &Path, plan: &PlanRunDetails) -> Result<()> {
+    if !Path::new(&plan.target.repo).is_absolute() {
+        return Err(RunError::new(
+            "plan target repo must be canonical absolute path",
+        ));
+    }
+    let target_artifact = match &plan.target.input {
+        PlanInput::Bead {
+            bead_id, artifact, ..
+        } => {
+            if !is_identifier(bead_id) {
+                return Err(RunError::new("plan Bead target has invalid Bead id"));
+            }
+            artifact
+        }
+        PlanInput::Artifact { artifact, .. } => artifact,
+    };
+    validate_artifact_ref(target_artifact, "plan target artifact")?;
+    validate_local_artifact(path, target_artifact)?;
+    if plan.routes.stages.len() != 3 {
+        return Err(RunError::new(
+            "plan routes must contain planner, peer_review, and second_opinion",
+        ));
+    }
+    let mut seen_stages = HashSet::new();
+    let mut seen_executions = HashSet::new();
+    for route in &plan.routes.stages {
+        if !seen_stages.insert(route.stage)
+            || route.capability_role.is_empty()
+            || route.candidates.is_empty()
+        {
+            return Err(RunError::new("invalid immutable plan route"));
+        }
+        for candidate in &route.candidates {
+            if !is_identifier(&candidate.profile_id)
+                || !is_identifier(&candidate.provider_id)
+                || !is_identifier(&candidate.availability_key)
+                || candidate.execution_key.trim().is_empty()
+            {
+                return Err(RunError::new("invalid approved plan execution identity"));
+            }
+            if !seen_executions.insert((
+                route.stage,
+                candidate.profile_id.as_str(),
+                candidate.execution_key.as_str(),
+            )) {
+                return Err(RunError::new("duplicate approved execution in plan route"));
+            }
+        }
+    }
+    if !seen_stages.contains(&PlanStage::Planner)
+        || !seen_stages.contains(&PlanStage::PeerReview)
+        || !seen_stages.contains(&PlanStage::SecondOpinion)
+    {
+        return Err(RunError::new("plan routes omit a required stage"));
+    }
+    RevisionLimit::new(plan.revision_limit.value())?;
+    StageAttemptLimit::new(plan.stage_attempt_limit.value())?;
+    validate_plan_progress(path, &plan.progress)
+}
+
+fn validate_plan_progress(path: &Path, progress: &PlanProgress) -> Result<()> {
+    let artifact = match progress {
+        PlanProgress::AwaitingPeer { artifact, .. }
+        | PlanProgress::Revising { artifact, .. }
+        | PlanProgress::AwaitingSecondOpinion { artifact, .. } => Some(artifact),
+        PlanProgress::Prepared | PlanProgress::Authoring { .. } | PlanProgress::Terminal { .. } => {
+            None
+        }
+    };
+    if let Some(artifact) = artifact {
+        validate_artifact_ref(artifact, "plan progress artifact")?;
+        validate_local_artifact(path, artifact)?;
+    }
+    Ok(())
+}
+
+fn is_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn find_work_run_at_stage(
@@ -1292,6 +1920,46 @@ fn validate_local_artifact(contract_path: &Path, artifact: &ArtifactRef) -> Resu
     Ok(())
 }
 
+fn validate_roster_snapshot(
+    manifest_path: &Path,
+    snapshot: &RosterSnapshotArtifact,
+    policy_sha256: Option<&str>,
+) -> Result<()> {
+    if snapshot.path != "roster.json" {
+        return Err(RunError::new(
+            "copied roster snapshot must use the run-local roster.json path",
+        ));
+    }
+    validate_sha256(&snapshot.sha256, "copied roster snapshot")?;
+    let policy_sha256 = policy_sha256.ok_or_else(|| {
+        RunError::new("copied roster snapshot is missing its pinned policy_sha256")
+    })?;
+    validate_sha256(policy_sha256, "copied roster policy")?;
+    let run_dir = manifest_path
+        .parent()
+        .ok_or_else(|| RunError::new("manifest path has no run directory"))?;
+    let bytes = std::fs::read(run_dir.join(&snapshot.path)).map_err(|error| {
+        RunError::new(format!("failed to read copied roster snapshot: {error}"))
+    })?;
+    let size = u64::try_from(bytes.len())
+        .map_err(|_| RunError::new("copied roster snapshot exceeds u64"))?;
+    if size != snapshot.size_bytes {
+        return Err(RunError::new("copied roster snapshot size mismatch"));
+    }
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    if actual != snapshot.sha256 {
+        return Err(RunError::new("copied roster snapshot hash mismatch"));
+    }
+    let parsed = crate::bursar::parse_roster_snapshot(&bytes)
+        .map_err(|error| RunError::new(format!("copied roster snapshot invalid: {error}")))?;
+    if parsed.policy_sha256() != policy_sha256 {
+        return Err(RunError::new(
+            "copied roster snapshot policy_sha256 mismatch",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_relative_artifact_path(path: &Path) -> Result<()> {
     let mut saw_component = false;
     for component in path.components() {
@@ -1454,6 +2122,7 @@ mod tests {
                 path: "/home/.config/bursar/roster.toml".to_string(),
                 sha256: "a".repeat(64),
             }),
+            roster_snapshot: None,
             limits: RunLimits {
                 item_wall_clock_mins: Some(45),
                 max_attempts: Some(3),
@@ -1575,10 +2244,13 @@ mod tests {
                 repo: "/repo".to_string(),
                 bead: None,
             },
+            details: RunDetails::Work { state: None },
             created_at: "2026-07-16T12:00:00Z".to_string(),
             updated_at: "2026-07-16T12:00:00Z".to_string(),
             approved_profiles: ApprovedProfileEnvelope::default(),
             bursar_roster_artifact: None,
+            roster_snapshot: None,
+            roster_policy_sha256: None,
             limits: RunLimits::default(),
             verifier: RunVerifier::default(),
             work: None,
@@ -1587,7 +2259,7 @@ mod tests {
             outcome: None,
         })
         .unwrap();
-        manifest["schema"] = serde_json::json!("conductor/run@2");
+        manifest["schema"] = serde_json::json!("conductor/run@1");
         std::fs::write(&path, manifest.to_string()).unwrap();
 
         let err = read_manifest(&path).expect_err("unknown schema must fail closed");
@@ -1599,7 +2271,7 @@ mod tests {
         let temp = TempDir::new("bad-event-schema");
         let path = temp.path().join("events.jsonl");
         let bad_line = serde_json::json!({
-            "schema": "conductor/event@2",
+            "schema": "conductor/event@1",
             "event_id": "x-1",
             "run_id": "x",
             "seq": 1,
@@ -1675,7 +2347,7 @@ mod tests {
     fn run_event_open_resumes_sequence_and_rejects_unknown_schema_on_reopen() {
         let temp = TempDir::new("reopen");
         let mut handle =
-            RunHandle::create_at(temp.path(), RunJob::Arena, new_run_request(), fixed_now())
+            RunHandle::create_at(temp.path(), RunJob::Consult, new_run_request(), fixed_now())
                 .expect("create run");
         handle
             .append_event_at(
@@ -1828,7 +2500,7 @@ mod tests {
 
     #[test]
     fn run_event_read_rejects_sequence_and_identity_corruption() {
-        for corruption in ["seq", "event_id", "run_id", "job", "target"] {
+        for corruption in ["seq", "event_id", "run_id", "job", "arena_job", "target"] {
             let temp = TempDir::new(corruption);
             let mut handle =
                 RunHandle::create_at(temp.path(), RunJob::Work, new_run_request(), fixed_now())
@@ -1852,7 +2524,8 @@ mod tests {
                     rows[1]["run_id"] = serde_json::json!("run-work-other");
                     rows[1]["event_id"] = serde_json::json!("run-work-other-000002");
                 }
-                "job" => rows[1]["job"] = serde_json::json!("arena"),
+                "job" => rows[1]["job"] = serde_json::json!("review"),
+                "arena_job" => rows[1]["job"] = serde_json::json!("arena"),
                 "target" => rows[1]["target"]["repo"] = serde_json::json!("/other/repo"),
                 _ => unreachable!(),
             }
@@ -1957,8 +2630,7 @@ mod tests {
             "a superseded attempt's identity must not survive invalidation"
         );
 
-        let reopened =
-            RunHandle::open(temp.path(), handle.run_id()).expect("reopen run from disk");
+        let reopened = RunHandle::open(temp.path(), handle.run_id()).expect("reopen run from disk");
         assert_eq!(
             reopened.worker_pgid(),
             None,
@@ -2220,10 +2892,14 @@ mod tests {
 
         // The finished generation-1 history is still present and readable.
         assert_eq!(
-            read_manifest(&runs_dir(temp.path()).join(gen1.run_id()).join("manifest.json"))
-                .expect("gen1 manifest survives")
-                .outcome
-                .as_deref(),
+            read_manifest(
+                &runs_dir(temp.path())
+                    .join(gen1.run_id())
+                    .join("manifest.json")
+            )
+            .expect("gen1 manifest survives")
+            .outcome
+            .as_deref(),
             Some("stale_claim_reaped")
         );
     }
@@ -2263,6 +2939,210 @@ mod tests {
                 .is_err(),
             "two unfinished generations is an invariant violation and must fail closed"
         );
+    }
+
+    #[test]
+    fn v2_manifests_reject_v1_schema_and_unknown_fields() {
+        let temp = TempDir::new("strict-v2-schema");
+        let path = temp.path().join("manifest.json");
+        let mut value = serde_json::to_value(RunManifest {
+            schema: "conductor/run@1".to_string(),
+            run_id: "run-work-20260716T120000.000000000-p1-000000".to_string(),
+            job: RunJob::Work,
+            target: RunTarget {
+                repo: "/repo/conductor".to_string(),
+                bead: Some("conductor-run-v2".to_string()),
+            },
+            details: RunDetails::Work { state: None },
+            created_at: "2026-07-16T12:00:00Z".to_string(),
+            updated_at: "2026-07-16T12:00:00Z".to_string(),
+            approved_profiles: ApprovedProfileEnvelope::default(),
+            bursar_roster_artifact: None,
+            roster_snapshot: None,
+            roster_policy_sha256: None,
+            limits: RunLimits::default(),
+            verifier: RunVerifier::default(),
+            work: None,
+            artifacts: Vec::new(),
+            lifecycle: RunLifecycle::Started,
+            outcome: None,
+        })
+        .expect("serialize v1 manifest");
+        std::fs::write(&path, value.to_string()).expect("write v1 manifest");
+        assert!(
+            read_manifest(&path).is_err(),
+            "the v2 reader must not parse a v1 manifest"
+        );
+
+        value["schema"] = serde_json::json!("conductor/run@2");
+        value["unexpected"] = serde_json::json!(true);
+        std::fs::write(&path, value.to_string()).expect("write malformed v2 manifest");
+        assert!(
+            read_manifest(&path).is_err(),
+            "strict v2 manifests must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn prepared_run_copies_and_pins_exact_roster_snapshot_bytes() {
+        let temp = TempDir::new("copied-roster-snapshot");
+        let snapshot_bytes = br#"{
+          "schema":"bursar/roster@2",
+          "generated_at":"2026-07-16T12:00:00Z",
+          "source_artifact":{"path":"/source/roster.toml","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+          "policy_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "providers":[],
+          "profiles":[]
+        }"#
+        .to_vec();
+        let mut request = new_run_request();
+        request.roster_snapshot = Some(RosterSnapshotInput {
+            bytes: snapshot_bytes.clone(),
+            policy_sha256: "b".repeat(64),
+        });
+
+        let handle =
+            RunHandle::create_at(temp.path(), RunJob::Consult, request, fixed_now()).expect("run");
+        let roster = handle
+            .manifest()
+            .roster_snapshot
+            .as_ref()
+            .expect("copied snapshot identity");
+        assert_eq!(roster.path, "roster.json");
+        assert_eq!(roster.size_bytes, snapshot_bytes.len() as u64);
+        assert!(handle.dir().join(&roster.path).is_file());
+
+        std::fs::write(handle.dir().join(&roster.path), b"altered").expect("tamper snapshot");
+        assert!(
+            RunHandle::open(temp.path(), handle.run_id()).is_err(),
+            "resume must reject an altered copied roster snapshot"
+        );
+    }
+
+    #[test]
+    fn plan_progress_binds_distinct_roles_and_preserves_peer_across_revision() {
+        let execution = |profile_id: &str, provider_id: &str| ApprovedExecution {
+            profile_id: profile_id.to_string(),
+            provider_id: provider_id.to_string(),
+            availability_key: provider_id.to_string(),
+            execution_key: format!("{provider_id}/{profile_id}"),
+        };
+        let artifact = |name: &str| ArtifactRef {
+            path: format!("artifacts/{name}.md"),
+            sha256: "a".repeat(64),
+        };
+        let author = execution("planner", "anthropic");
+        let peer = execution("peer", "openai");
+        let different_peer = execution("other-peer", "codex");
+        let mut progress = PlanProgress::Prepared;
+
+        progress
+            .start_authoring(author.clone(), StageAttemptLimit::new(1).expect("nonzero"))
+            .expect("bind author");
+        assert!(
+            progress
+                .start_authoring(author.clone(), StageAttemptLimit::new(1).expect("nonzero"))
+                .is_err(),
+            "author binding is immutable"
+        );
+        progress
+            .await_peer(artifact("draft"))
+            .expect("submit draft");
+        assert!(
+            progress
+                .record_peer_verdict(author, PeerVerdict::Revise)
+                .is_err(),
+            "peer must be provider-distinct from the author"
+        );
+        progress
+            .record_peer_verdict(peer.clone(), PeerVerdict::Revise)
+            .expect("peer requests revision");
+        progress
+            .complete_revision(artifact("revision"))
+            .expect("bounded revision");
+        match &progress {
+            PlanProgress::AwaitingPeer {
+                peer: Some(bound),
+                revisions,
+                ..
+            } => {
+                assert_eq!(bound, &peer);
+                assert_eq!(revisions.value(), 1);
+            }
+            other => panic!("unexpected progress after revision: {other:?}"),
+        }
+        assert!(
+            progress
+                .record_peer_verdict(different_peer, PeerVerdict::Approve)
+                .is_err(),
+            "a revision cannot replace its immutable peer"
+        );
+        progress
+            .record_peer_verdict(peer, PeerVerdict::Approve)
+            .expect("same peer approves");
+        progress
+            .record_second_opinion(SecondOpinionVerdict::Accept)
+            .expect("second opinion terminates plan");
+        assert!(matches!(
+            progress,
+            PlanProgress::Terminal {
+                verdict: PlanTerminalVerdict::Accepted
+            }
+        ));
+        assert!(RevisionLimit::new(4).is_err());
+        assert!(StageAttemptLimit::new(0).is_err());
+    }
+
+    #[test]
+    fn v2_activation_preflight_blocks_actionable_v1_and_leaves_finished_history_inert() {
+        let temp = TempDir::new("legacy-v1-preflight");
+        let legacy = temp.path().join("runs");
+        let pending = legacy.join("pending");
+        let implementing = legacy.join("implementing");
+        let finished = legacy.join("finished");
+        for (dir, lifecycle, stage) in [
+            (&pending, "started", "pending_review"),
+            (&implementing, "started", "implementing"),
+            (&finished, "finished", "completed"),
+        ] {
+            std::fs::create_dir_all(dir).expect("legacy dir");
+            std::fs::write(
+                dir.join("manifest.json"),
+                serde_json::json!({
+                    "schema": "conductor/run@1",
+                    "lifecycle": lifecycle,
+                    "work": { "stage": stage }
+                })
+                .to_string(),
+            )
+            .expect("legacy manifest");
+        }
+        let finished_bytes = std::fs::read(finished.join("manifest.json")).expect("read history");
+        let preflight = legacy_v1_preflight(temp.path()).expect("classify v1");
+        assert_eq!(preflight.pending, 1);
+        assert_eq!(preflight.implementing, 1);
+        assert_eq!(preflight.reclaimable, 0);
+        assert!(!preflight.activation_allowed());
+        assert!(
+            RunHandle::create_at(temp.path(), RunJob::Consult, new_run_request(), fixed_now())
+                .is_err(),
+            "v2 activation must refuse unfinished legacy recovery"
+        );
+        assert_eq!(
+            std::fs::read(finished.join("manifest.json")).expect("history retained"),
+            finished_bytes,
+            "preflight must never mutate finished v1 history"
+        );
+
+        std::fs::remove_dir_all(&pending).expect("remove fixture pending");
+        std::fs::remove_dir_all(&implementing).expect("remove fixture implementing");
+        assert!(
+            legacy_v1_preflight(temp.path())
+                .expect("classify inert history")
+                .activation_allowed()
+        );
+        RunHandle::create_at(temp.path(), RunJob::Consult, new_run_request(), fixed_now())
+            .expect("finished v1 history is inert to v2");
     }
 
     fn event_values(path: &Path) -> Vec<serde_json::Value> {

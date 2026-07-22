@@ -1,13 +1,22 @@
 # current-state.md — conductor
 
-Branch: main
-Adversarial design review COMPLETE (2026-07-15): immutable approval-gated
-N+1 review, anonymous synthesis, complete attempt ledger, reports, CLI, and
-no-mutation proof. Live disposable GLM 5.2 → Terra E2E: complete synthesis,
-validated report, exact 2-row ledger, unchanged artifact, terminal redispatch
-blocked without another call.
-`cargo test` green (318 unit + 1 integration); strict Clippy clean.
-Rebrand `harness-conductor` → `conductor` COMPLETE (2026-07-12): source refs, GitHub repos (incl. `backlog-conductor`), dir move, `chezmoi apply`, live HOME verified clean; `conductor config check` passes.
+Branch: feat/omp-role-aware-routing
+
+Strict Conductor v2 cutover COMPLETE (2026-07-22): active runs now use only
+`bursar/roster@2`, `conductor/run@2`, and `conductor/event@2`; each prepared
+run owns the exact copied roster snapshot and its validated policy digest.
+Arena has no active source, configuration, CLI, ledger, or parser surface.
+`runs-v2/` is the sole active namespace; activation preflight blocks only
+actionable v1 recovery and leaves finished v1 history inert. Work/review/
+consult retain their behavior through structural v2 adapters; `Plan` has
+typed state, targets, constrained routes, and transition invariants but no
+model execution or generic scheduler.
+
+Verified: `cargo test run`, `cargo test quarantine`, `cargo test bursar`,
+`cargo test`, and `cargo clippy --all-targets -- -D warnings`. The no-model
+binary smoke passed `config check` with Bursar v2 and an isolated clean state
+directory; the real state directory correctly reported its actionable v1
+preflight block.
 
 ## Plan
 

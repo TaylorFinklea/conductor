@@ -1981,6 +1981,7 @@ mod tests {
                 },
                 approved_profiles: vec!["claude-sonnet-5".to_string()],
                 bursar_roster_artifact: None,
+                roster_snapshot: None,
                 limits: crate::run::RunLimits::default(),
                 verifier: crate::run::RunVerifier::default(),
                 work: Some(crate::run::WorkState {
@@ -2309,7 +2310,10 @@ mod tests {
         let artifact = capture.artifact.expect("artifact captured");
 
         std::fs::write(
-            temp.path().join("runs").join(&run_id).join(&artifact.path),
+            temp.path()
+                .join("runs-v2")
+                .join(&run_id)
+                .join(&artifact.path),
             b"tampered",
         )
         .expect("tamper artifact bytes");
@@ -2351,12 +2355,20 @@ mod tests {
         .expect("capture succeeds");
         drop(handle);
 
-        let manifest_text =
-            std::fs::read_to_string(temp.path().join("runs").join(&run_id).join("manifest.json"))
-                .expect("read manifest");
-        let events_text =
-            std::fs::read_to_string(temp.path().join("runs").join(&run_id).join("events.jsonl"))
-                .expect("read events");
+        let manifest_text = std::fs::read_to_string(
+            temp.path()
+                .join("runs-v2")
+                .join(&run_id)
+                .join("manifest.json"),
+        )
+        .expect("read manifest");
+        let events_text = std::fs::read_to_string(
+            temp.path()
+                .join("runs-v2")
+                .join(&run_id)
+                .join("events.jsonl"),
+        )
+        .expect("read events");
         assert!(!manifest_text.contains(secret_marker));
         assert!(!events_text.contains(secret_marker));
     }
@@ -2379,6 +2391,7 @@ mod tests {
                 },
                 approved_profiles: vec!["claude-sonnet-5".to_string()],
                 bursar_roster_artifact: None,
+                roster_snapshot: None,
                 limits: crate::run::RunLimits::default(),
                 verifier: crate::run::RunVerifier::default(),
                 work: Some(crate::run::WorkState {
@@ -2421,6 +2434,7 @@ mod tests {
                 },
                 approved_profiles: vec!["claude-sonnet-5".to_string()],
                 bursar_roster_artifact: None,
+                roster_snapshot: None,
                 limits: crate::run::RunLimits::default(),
                 verifier: crate::run::RunVerifier::default(),
                 work: Some(crate::run::WorkState {
@@ -2472,6 +2486,7 @@ mod tests {
                 },
                 approved_profiles: vec!["claude-sonnet-5".to_string()],
                 bursar_roster_artifact: None,
+                roster_snapshot: None,
                 limits: crate::run::RunLimits::default(),
                 verifier: crate::run::RunVerifier::default(),
                 work: Some(crate::run::WorkState {
@@ -3261,7 +3276,11 @@ mod tests {
             None,
             fixed_now(),
         );
-        let manifest_path = temp.path().join("runs").join(&run_id).join("manifest.json");
+        let manifest_path = temp
+            .path()
+            .join("runs-v2")
+            .join(&run_id)
+            .join("manifest.json");
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         manifest["work"]["authorization_sha256"] = serde_json::json!("not-a-sha256");
@@ -3292,7 +3311,11 @@ mod tests {
             None,
             fixed_now(),
         );
-        let manifest_path = temp.path().join("runs").join(&run_id).join("manifest.json");
+        let manifest_path = temp
+            .path()
+            .join("runs-v2")
+            .join(&run_id)
+            .join("manifest.json");
         std::fs::write(
             &manifest_path,
             b"{ not valid json but still mentions /repo/bursar and bursar-467 \xff\xfe",
@@ -3313,7 +3336,11 @@ mod tests {
         // for broken manifests belonging to other targets.
         let temp = TempDir::new("legacy-unparseable-unrelated");
         let run_id = manifest_for(&temp, "/repo/other", "other-1", "failed", None, fixed_now());
-        let manifest_path = temp.path().join("runs").join(&run_id).join("manifest.json");
+        let manifest_path = temp
+            .path()
+            .join("runs-v2")
+            .join(&run_id)
+            .join("manifest.json");
         std::fs::write(
             &manifest_path,
             b"{ not valid json, and unrelated to our target",

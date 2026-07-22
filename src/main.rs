@@ -1,7 +1,6 @@
 //! Conductor — fleet cycles plus approval-gated, read-only adversarial design review.
 
 mod adversarial;
-mod arena;
 mod bd;
 mod bursar;
 mod cli;

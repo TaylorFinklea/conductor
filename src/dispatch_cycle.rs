@@ -26,7 +26,7 @@ use crate::plan::{
 };
 use crate::quarantine;
 use crate::run::{
-    EventInput, EventKind, NewRun, RunHandle, RunJob, RunLimits, RunTarget,
+    EventInput, EventKind, NewRun, RosterSnapshotInput, RunHandle, RunJob, RunLimits, RunTarget,
     RunVerifier, WorkStage, WorkState,
 };
 use crate::triage::{self, CandidateRejection};
@@ -176,7 +176,7 @@ struct PlannedItem {
     approved_route: Option<ProviderRouteRecord>,
     authorization_sha256: String,
     approval_scope: ApprovalScope,
-    bursar_roster_artifact: Option<crate::bursar::RosterArtifact>,
+    bursar_roster_source_artifact: Option<crate::bursar::RosterSourceArtifact>,
 }
 
 #[expect(
@@ -203,13 +203,16 @@ pub(crate) fn run_dispatch_cycle<
     live: &L,
     bursar: &U,
 ) -> std::result::Result<DispatchCycleResult, DispatchCycleError> {
-    let _dispatch_lease = quarantine::DispatchLease::acquire(state_dir, cycle_id).map_err(
-        |error| {
+    let _dispatch_lease =
+        quarantine::DispatchLease::acquire(state_dir, cycle_id).map_err(|error| {
             DispatchCycleError::message(format!("exclusive dispatch lease unavailable: {error}"))
-        },
-    )?;
+        })?;
     let resolved_roster = bursar::resolve_roster(cfg, bursar)
         .map_err(|error| DispatchCycleError::message(format!("bursar roster snapshot: {error}")))?;
+    let roster_snapshot = RosterSnapshotInput {
+        bytes: resolved_roster.snapshot_bytes.clone(),
+        policy_sha256: resolved_roster.policy_sha256.clone(),
+    };
     let mut runtime_cfg = cfg.clone();
     runtime_cfg.roster = resolved_roster.roster;
     let cfg = &runtime_cfg;
@@ -240,25 +243,23 @@ pub(crate) fn run_dispatch_cycle<
             plan.cycle_id
         )));
     }
-    match (&plan.bursar_roster_artifact, &resolved_roster.artifact) {
-        (Some(expected), Some(actual)) if expected == actual => {}
-        (Some(expected), Some(actual)) => {
+    match &plan.bursar_roster_source_artifact {
+        Some(expected) if expected == &resolved_roster.source_artifact => {}
+        Some(expected) => {
             return Err(DispatchCycleError::message(format!(
-                "bursar roster snapshot changed after approval: expected {}#{}, found {}#{}",
-                expected.path, expected.sha256, actual.path, actual.sha256
+                "bursar roster source changed after approval: expected {}#{}, found {}#{}",
+                expected.path,
+                expected.sha256,
+                resolved_roster.source_artifact.path,
+                resolved_roster.source_artifact.sha256
             )));
         }
-        (Some(_), None) => {
+        None if plan.dispatches.is_empty() && plan.proposals.is_empty() => {}
+        None => {
             return Err(DispatchCycleError::message(
-                "approved plan pins a Bursar roster artifact but dispatch resolved only legacy roster data",
+                "approved plan is missing its Bursar v2 roster source identity",
             ));
         }
-        (None, Some(_)) => {
-            return Err(DispatchCycleError::message(
-                "approved plan is missing its Bursar roster artifact",
-            ));
-        }
-        (None, None) => {}
     }
 
     let items = planned_items(&plan)?;
@@ -283,6 +284,7 @@ pub(crate) fn run_dispatch_cycle<
             item,
             None,
             bursar,
+            &roster_snapshot,
         ) {
             Ok(attempt) => attempt,
             Err(error) => {
@@ -393,7 +395,7 @@ fn planned_items(plan: &CyclePlan) -> std::result::Result<Vec<PlannedItem>, Disp
             approved_route: approved_route(plan, repo, issue_id),
             authorization_sha256: matching[0].sha256.clone(),
             approval_scope: plan.approval_scope.clone(),
-            bursar_roster_artifact: plan.bursar_roster_artifact.clone(),
+            bursar_roster_source_artifact: plan.bursar_roster_source_artifact.clone(),
         });
     }
     Ok(items)
@@ -1355,8 +1357,7 @@ fn ambiguous_promotion_outcome<C: CommitProbe + ?Sized>(
 fn interrupt_after_promotion_merge(options: &DispatchCycleOptions) -> bool {
     #[cfg(test)]
     {
-        options.promotion_interruption
-            == Some(PromotionInterruption::AfterMergeBeforeReceipt)
+        options.promotion_interruption == Some(PromotionInterruption::AfterMergeBeforeReceipt)
     }
     #[cfg(not(test))]
     {
@@ -1392,8 +1393,7 @@ fn head_confirmation_probe_fails(options: &DispatchCycleOptions) -> bool {
 fn interrupt_after_promotion_receipt(options: &DispatchCycleOptions) -> bool {
     #[cfg(test)]
     {
-        options.promotion_interruption
-            == Some(PromotionInterruption::AfterReceiptBeforeCleanup)
+        options.promotion_interruption == Some(PromotionInterruption::AfterReceiptBeforeCleanup)
     }
     #[cfg(not(test))]
     {
@@ -1525,6 +1525,7 @@ fn dispatch_one<
     item: &PlannedItem,
     progress: Option<f64>,
     bursar: &U,
+    roster_snapshot: &RosterSnapshotInput,
 ) -> std::result::Result<DispatchOneResult, DispatchCycleError> {
     let repo_path = repo_path(cfg, &item.repo)?;
     let canonical_repo = std::fs::canonicalize(&repo_path)
@@ -1771,7 +1772,9 @@ fn dispatch_one<
                 record_replan_required(
                     report_path,
                     item,
-                    &format!("repository is dirty and could not be authenticated for recovery: {error}"),
+                    &format!(
+                        "repository is dirty and could not be authenticated for recovery: {error}"
+                    ),
                 )?;
                 return Ok(DispatchOneResult {
                     decision: None,
@@ -1834,6 +1837,7 @@ fn dispatch_one<
         &canonical_repo,
         &extracted.verify_cmd,
         before_head.as_deref(),
+        roster_snapshot,
     ) {
         Ok(run) => run,
         Err(error) => {
@@ -3202,27 +3206,17 @@ fn resume_promoted_work<
             "promoted worker claim is no longer held by conductor",
         ));
     }
-    let extracted = validate_item_authorization(
-        cfg,
-        item,
-        selected_roster,
-        canonical_repo,
-        &current,
-    )
-    .map_err(|reason| {
-        DispatchCycleError::message(format!("promoted worker approval is stale: {reason}"))
-    })?;
+    let extracted =
+        validate_item_authorization(cfg, item, selected_roster, canonical_repo, &current).map_err(
+            |reason| {
+                DispatchCycleError::message(format!("promoted worker approval is stale: {reason}"))
+            },
+        )?;
     let mut run_artifacts = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
     let mut promotion = read_promotion_record(run_artifacts.dir())?.ok_or_else(|| {
         DispatchCycleError::message("promoted worker run lost its promotion record")
     })?;
-    let work = validate_promoted_work(
-        &run_artifacts,
-        item,
-        cycle_id,
-        canonical_repo,
-        &promotion,
-    )?;
+    let work = validate_promoted_work(&run_artifacts, item, cycle_id, canonical_repo, &promotion)?;
     authenticate_pending_review_owner(&run_artifacts)?;
     validate_pending_approval(
         &run_artifacts.approval().map_err(run_artifact_error)?,
@@ -3284,7 +3278,8 @@ fn resume_promoted_work<
     }
     cleanup_run_attempt_worktrees(repo_path, run_artifacts.dir())?;
 
-    let events = crate::run::read_events(&run_artifacts.events_path()).map_err(run_artifact_error)?;
+    let events =
+        crate::run::read_events(&run_artifacts.events_path()).map_err(run_artifact_error)?;
     let finished_attempts = events
         .iter()
         .filter(|event| {
@@ -4056,8 +4051,8 @@ fn resume_pending_review<
     authenticate_pending_review_owner(&preflight_run)?;
     drop(preflight_run);
 
-    let _review_lease = quarantine::RepoLease::acquire(state_dir, canonical_repo, run_id)
-        .map_err(|error| {
+    let _review_lease =
+        quarantine::RepoLease::acquire(state_dir, canonical_repo, run_id).map_err(|error| {
             DispatchCycleError::message(format!(
                 "pending-review repository lease unavailable: {error}"
             ))
@@ -4070,16 +4065,12 @@ fn resume_pending_review<
             "pending-review claim is no longer held by conductor",
         ));
     }
-    let extracted = validate_item_authorization(
-        cfg,
-        item,
-        selected_roster,
-        canonical_repo,
-        &current,
-    )
-    .map_err(|reason| {
-        DispatchCycleError::message(format!("pending-review approval is stale: {reason}"))
-    })?;
+    let extracted =
+        validate_item_authorization(cfg, item, selected_roster, canonical_repo, &current).map_err(
+            |reason| {
+                DispatchCycleError::message(format!("pending-review approval is stale: {reason}"))
+            },
+        )?;
     let mut run_artifacts = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
     let work = validate_pending_work(&run_artifacts, item, cycle_id)?;
     authenticate_pending_review_owner(&run_artifacts)?;
@@ -4833,6 +4824,10 @@ where
     ))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "work creation binds individually validated authorization, repository, verifier, and roster inputs"
+)]
 fn create_work_run(
     cfg: &Config,
     state_dir: &Path,
@@ -4841,6 +4836,7 @@ fn create_work_run(
     canonical_repo: &str,
     verify_cmd: &str,
     before_head: Option<&str>,
+    roster_snapshot: &RosterSnapshotInput,
 ) -> std::result::Result<RunHandle, DispatchCycleError> {
     let route = item.approved_route.as_ref().ok_or_else(|| {
         DispatchCycleError::message("approved provider envelope is missing at run creation")
@@ -4868,12 +4864,13 @@ fn create_work_run(
                 bead: Some(item.issue_id.clone()),
             },
             approved_profiles: route.approved_models.clone(),
-            bursar_roster_artifact: item.bursar_roster_artifact.as_ref().map(|artifact| {
+            bursar_roster_artifact: item.bursar_roster_source_artifact.as_ref().map(|artifact| {
                 crate::run::ArtifactRef {
                     path: artifact.path.clone(),
                     sha256: artifact.sha256.clone(),
                 }
             }),
+            roster_snapshot: Some(roster_snapshot.clone()),
             limits: RunLimits {
                 item_wall_clock_mins: Some(u64::from(cfg.budgets.item_wall_clock_mins)),
                 max_attempts: Some(max_attempts),
@@ -5386,7 +5383,9 @@ fn reclaim_stale_claim<B: BdClient + ?Sized, C: CommitProbe + ?Sized>(
             // Re-check HEAD against the finished generation's own base, so a
             // repository that has moved on since the reap is never blindly
             // reopened for a fresh attempt.
-            let Some(expected_head) = run_artifacts.work().and_then(|work| work.before_head.clone())
+            let Some(expected_head) = run_artifacts
+                .work()
+                .and_then(|work| work.before_head.clone())
             else {
                 return Ok(None);
             };
@@ -6085,23 +6084,12 @@ fn append_ledger(
             .map(|effort| effort.as_str().to_string()),
         role: role.to_string(),
         task: issue.id.clone(),
-        score_1_5: None,
-        blind_rank: None,
-        judge: None,
         verify_passed,
         complexity: ceiling_label(fields.routing.complexity).to_string(),
         project: repo.to_string(),
-        bias_note: None,
         notes: format!("conductor {cycle_id}: {summary}"),
-        arena_run_id: None,
-        winner: None,
-        applied: None,
         failure_reason: None,
         duration_ms: None,
-        ralph_duration_ms: None,
-        verify_duration_ms: None,
-        tokens_used: None,
-        cost_usd: None,
     };
     ledger::append(ledger_path, &row)
         .map_err(|e| DispatchCycleError::message(format!("ledger: {e}")))
@@ -6439,7 +6427,7 @@ mod tests {
             flags: Vec::new(),
             skips: Vec::new(),
             provider_routes: Vec::new(),
-            bursar_roster_artifact: None,
+            bursar_roster_source_artifact: None,
             approval_scope: ApprovalScope::default(),
             item_authorizations: Vec::new(),
         };
@@ -6626,6 +6614,7 @@ ceiling = "S"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "fake-worker"
+provider = "opencode-go"
 "#,
             fleet.display()
         ))
@@ -6741,6 +6730,10 @@ dispatch_id = "fake-worker"
             Some("test -f worker.txt")
         );
         assert_eq!(manifest.lifecycle, crate::run::RunLifecycle::Finished);
+        assert!(
+            manifest.roster_snapshot.is_some(),
+            "every prepared v2 run must pin the resolved roster snapshot"
+        );
         assert_eq!(manifest.outcome.as_deref(), Some("verified"));
         assert!(run_dir.join("approval.json").is_file());
         assert!(run_dir.join("attempts").is_dir());
@@ -6765,18 +6758,6 @@ dispatch_id = "fake-worker"
             events
                 .iter()
                 .any(|event| event.kind == EventKind::VerifyFinished)
-        );
-        assert!(events.iter().any(|event| {
-            event.kind == EventKind::CoverageGap
-                && event.outcome.as_deref() == Some("bursar_roster_artifact_unavailable")
-        }));
-        assert!(
-            events
-                .iter()
-                .flat_map(|event| &event.artifact_refs)
-                .all(|artifact| {
-                    artifact.sha256.len() == 64 && run_dir.join(&artifact.path).is_file()
-                })
         );
     }
 
@@ -6821,6 +6802,7 @@ ceiling = "S"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "fake-worker"
+provider = "opencode-go"
 "#,
             fleet.display()
         ))
@@ -6936,6 +6918,7 @@ tier = "junior"
 ceiling = "S"
 efficiency = "lean"
 backend = "pi"
+provider = "opencode-go"
 dispatch_id = "fake-worker"
 
 [[roster]]
@@ -6944,6 +6927,7 @@ tier = "senior"
 ceiling = "M"
 efficiency = "lean"
 backend = "pi"
+provider = "opencode-go"
 dispatch_id = "senior-reviewer"
 "#,
             fleet.display()
@@ -7056,6 +7040,7 @@ ceiling = "S"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "fake-worker"
+provider = "opencode-go"
 
 [[roster]]
 name = "senior-reviewer"
@@ -7064,6 +7049,7 @@ ceiling = "M"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "senior-reviewer"
+provider = "opencode-go"
 "#,
             fleet.display()
         ))
@@ -7232,6 +7218,7 @@ ceiling = "S"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "fake-worker"
+provider = "opencode-go"
 
 [[roster]]
 name = "senior-reviewer"
@@ -7240,6 +7227,7 @@ ceiling = "M"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "senior-reviewer"
+provider = "opencode-go"
 "#,
                 fleet.display()
             ))
@@ -7431,12 +7419,9 @@ dispatch_id = "senior-reviewer"
             .to_str()
             .expect("utf8 repo")
             .to_string();
-        let _held = quarantine::RepoLease::acquire(
-            &fixture.state,
-            &canonical_repo,
-            "active-reviewer",
-        )
-        .expect("hold the repo lease as a concurrent reviewer");
+        let _held =
+            quarantine::RepoLease::acquire(&fixture.state, &canonical_repo, "active-reviewer")
+                .expect("hold the repo lease as a concurrent reviewer");
 
         let resumed = fixture
             .dispatch(
@@ -7553,6 +7538,7 @@ dispatch_id = "senior-reviewer"
         let mut fallback = fixture.cfg.roster[0].clone();
         fallback.name = "fallback-worker".to_string();
         fallback.dispatch_id = "fallback-worker".to_string();
+        fallback.provider = "codex".to_string();
         fallback.fallback.clear();
         fixture.cfg.roster.push(fallback);
         write_plan_with_proposal(
@@ -7592,6 +7578,7 @@ dispatch_id = "senior-reviewer"
         let mut fallback = fixture.cfg.roster[0].clone();
         fallback.name = "fallback-worker".to_string();
         fallback.dispatch_id = "fallback-worker".to_string();
+        fallback.provider = "codex".to_string();
         fallback.fallback.clear();
         fixture.cfg.roster.push(fallback);
         write_plan_with_proposal(
@@ -9051,9 +9038,7 @@ exit 0
         )
         .expect("parse promotion journal");
         assert_eq!(promotion["phase"], expected_phase);
-        let checkout = run_dir
-            .join("attempt-checkouts")
-            .join("001-fake-worker");
+        let checkout = run_dir.join("attempt-checkouts").join("001-fake-worker");
         assert_eq!(checkout.exists(), checkout_survives);
 
         fixture.mark_pending_review_recoverable();
@@ -9065,7 +9050,11 @@ exit 0
             .expect("resume verifies the recorded promoted HEAD");
 
         assert_eq!(resumed.verified, 1);
-        assert_eq!(exec.worker_spawns(), 1, "resume must not redispatch a worker");
+        assert_eq!(
+            exec.worker_spawns(),
+            1,
+            "resume must not redispatch a worker"
+        );
         assert_eq!(fixture.bd.close_count(), 1);
         assert_eq!(fixture.bd.release_count(), 0);
         assert!(!checkout.exists());
@@ -9433,6 +9422,7 @@ exit 0
             },
             approved_profiles: vec!["fake-worker".to_string()],
             bursar_roster_artifact: None,
+            roster_snapshot: None,
             limits: RunLimits {
                 item_wall_clock_mins: Some(1),
                 max_attempts: Some(1),
@@ -10184,9 +10174,7 @@ exit 0
         let ready = stale_run.dir().join("escaped.ready");
         let mut escaped = Command::new("python3")
             .arg("-c")
-            .arg(
-                "import os,sys,time; os.setsid(); open(sys.argv[1], 'w').close(); time.sleep(30)",
-            )
+            .arg("import os,sys,time; os.setsid(); open(sys.argv[1], 'w').close(); time.sleep(30)")
             .arg(&ready)
             .stdin(Stdio::from(lineage_stdin))
             .stdout(Stdio::null())
@@ -10195,7 +10183,10 @@ exit 0
             .expect("spawn a descendant that escapes into a new session");
         let deadline = Instant::now() + Duration::from_secs(5);
         while !ready.exists() {
-            assert!(Instant::now() < deadline, "escaped descendant was not ready");
+            assert!(
+                Instant::now() < deadline,
+                "escaped descendant was not ready"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
@@ -10347,7 +10338,8 @@ exit 0
         )
         .expect("create generation 1");
         let gen1_id = gen1.run_id().to_string();
-        gen1.finish("stale_claim_reaped").expect("reap generation 1");
+        gen1.finish("stale_claim_reaped")
+            .expect("reap generation 1");
 
         // A second crash left generation 2 stranded mid-implementation with a
         // dead owner and dead worker group.
@@ -10805,6 +10797,7 @@ ceiling = "S"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "fake-worker"
+provider = "opencode-go"
 "#,
             fleet.display()
         ))
@@ -10858,7 +10851,10 @@ dispatch_id = "fake-worker"
         assert_eq!(bd.show(&repo, "sandbox-1").unwrap().status, "open");
 
         let status = git(&repo, &["status", "--porcelain"]);
-        assert!(status.is_empty(), "repo must be restored clean, found: {status}");
+        assert!(
+            status.is_empty(),
+            "repo must be restored clean, found: {status}"
+        );
 
         let run_dir = single_contract_run(&state);
         let events_text = std::fs::read_to_string(run_dir.join("events.jsonl")).expect("events");
@@ -10872,7 +10868,11 @@ dispatch_id = "fake-worker"
             .filter_map(std::result::Result::ok)
             .filter(|entry| entry.path().extension() == Some(std::ffi::OsStr::new("patch")))
             .collect();
-        assert_eq!(patch_files.len(), 1, "exactly one quarantined patch artifact");
+        assert_eq!(
+            patch_files.len(),
+            1,
+            "exactly one quarantined patch artifact"
+        );
         let patch_text = std::fs::read_to_string(patch_files[0].path()).expect("read patch");
         assert!(patch_text.contains("untracked leftovers") || patch_text.contains("scratch.tmp"));
     }
@@ -11015,7 +11015,10 @@ provider = "codex"
             "fallback worker's prompt must reference the primary attempt's captured artifact"
         );
         assert!(
-            !fallback_spawn.argv.iter().any(|arg| arg.contains("primary partial")),
+            !fallback_spawn
+                .argv
+                .iter()
+                .any(|arg| arg.contains("primary partial")),
             "the prompt note must carry the artifact reference, never raw patch content"
         );
     }
@@ -11056,6 +11059,7 @@ provider = "codex"
                 },
                 approved_profiles: vec!["fake-worker".to_string()],
                 bursar_roster_artifact: None,
+                roster_snapshot: None,
                 limits: RunLimits::default(),
                 verifier: RunVerifier::default(),
                 work: Some(WorkState {
@@ -11111,6 +11115,7 @@ ceiling = "S"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "fake-worker"
+provider = "opencode-go"
 "#,
             fleet.display(),
             stranded_run_id
@@ -11119,8 +11124,11 @@ dispatch_id = "fake-worker"
 
         std::fs::write(repo.join("README.md"), b"sandbox\nstranded partial edit\n")
             .expect("dirty tracked file");
-        std::fs::write(repo.join("stranded-leftover.tmp"), b"stray from stranded run\n")
-            .expect("dirty untracked file");
+        std::fs::write(
+            repo.join("stranded-leftover.tmp"),
+            b"stray from stranded run\n",
+        )
+        .expect("dirty untracked file");
         assert!(!git(&repo, &["status", "--porcelain"]).is_empty());
 
         let cycle_id = "cycle-legacy-retry";
@@ -11322,6 +11330,7 @@ dispatch_id = "fake-worker"
                 },
                 approved_profiles: vec!["fake-worker".to_string()],
                 bursar_roster_artifact: None,
+                roster_snapshot: None,
                 limits: RunLimits::default(),
                 verifier: RunVerifier::default(),
                 work: Some(WorkState {
@@ -11345,8 +11354,11 @@ dispatch_id = "fake-worker"
 
         std::fs::write(repo.join("README.md"), b"sandbox\nstranded partial edit\n")
             .expect("dirty tracked file");
-        std::fs::write(repo.join("stranded-leftover.tmp"), b"stray from stranded run\n")
-            .expect("dirty untracked file");
+        std::fs::write(
+            repo.join("stranded-leftover.tmp"),
+            b"stray from stranded run\n",
+        )
+        .expect("dirty untracked file");
         let dirty_before = git(&repo, &["status", "--porcelain"]);
         assert!(!dirty_before.is_empty());
 
@@ -11398,7 +11410,7 @@ dispatch_id = "fake-worker"
 
     #[test]
     fn dispatch_refuses_dirty_repository_without_matching_run_evidence_and_leaves_files_untouched()
-     {
+    {
         let temp = TempDir::new("foreign-dirty-sandbox");
         let fleet = temp.path().join("fleet");
         std::fs::create_dir_all(&fleet).expect("mkdir fleet");
@@ -11509,6 +11521,31 @@ dispatch_id = "fake-worker"
         assert!(report.contains("repository is dirty"));
     }
 
+    fn fallback_eligibility_roster_snapshot() -> crate::bursar::RosterSnapshot {
+        crate::bursar::parse_roster_snapshot(
+            json!({
+                "schema": "bursar/roster@2",
+                "generated_at": "2026-07-17T12:00:00Z",
+                "source_artifact": {"path": "/fixture/bursar-roster.toml", "sha256": "a".repeat(64)},
+                "policy_sha256": "b".repeat(64),
+                "providers": [
+                    {"provider_id": "opencode-go", "availability_key": "opencode-go", "enabled": true, "state": "healthy", "availability": "healthy", "checked_at": "2026-07-17T12:00:00Z", "data_as_of": null, "expires_at": "2100-01-01T00:00:00Z", "reason": null, "eligible": true, "ineligibility_reason": null},
+                    {"provider_id": "codex", "availability_key": "codex", "enabled": true, "state": "healthy", "availability": "healthy", "checked_at": "2026-07-17T12:00:00Z", "data_as_of": null, "expires_at": "2100-01-01T00:00:00Z", "reason": null, "eligible": true, "ineligibility_reason": null}
+                ],
+                "profiles": [
+                    {"profile_id": "primary-worker", "provider_id": "opencode-go", "model": "primary-worker-model", "harness": "pi", "dispatch_id": "primary-worker", "reasoning_effort": null, "tier": "senior", "ceiling": "M", "efficiency": "lean", "cost": 0.0, "data_policy": "standard", "enabled": true, "roles": ["task"], "state": "healthy", "eligible": true, "ineligibility_reason": null},
+                    {"profile_id": "below-floor-worker", "provider_id": "opencode-go", "model": "below-floor-worker-model", "harness": "pi", "dispatch_id": "below-floor-worker", "reasoning_effort": null, "tier": "junior", "ceiling": "M", "efficiency": "lean", "cost": 0.0, "data_policy": "standard", "enabled": true, "roles": ["task"], "state": "healthy", "eligible": true, "ineligibility_reason": null},
+                    {"profile_id": "below-ceiling-worker", "provider_id": "opencode-go", "model": "below-ceiling-worker-model", "harness": "pi", "dispatch_id": "below-ceiling-worker", "reasoning_effort": null, "tier": "senior", "ceiling": "S", "efficiency": "lean", "cost": 0.0, "data_policy": "standard", "enabled": true, "roles": ["task"], "state": "healthy", "eligible": true, "ineligibility_reason": null},
+                    {"profile_id": "free-train-worker", "provider_id": "opencode-go", "model": "free-train-worker-model", "harness": "pi", "dispatch_id": "free-train-worker", "reasoning_effort": null, "tier": "senior", "ceiling": "M", "efficiency": "lean", "cost": 0.0, "data_policy": "trains-input", "enabled": true, "roles": ["task"], "state": "healthy", "eligible": true, "ineligibility_reason": null},
+                    {"profile_id": "fallback-worker", "provider_id": "codex", "model": "fallback-worker-model", "harness": "pi", "dispatch_id": "fallback-worker", "reasoning_effort": null, "tier": "senior", "ceiling": "M", "efficiency": "lean", "cost": 0.0, "data_policy": "standard", "enabled": true, "roles": ["task"], "state": "healthy", "eligible": true, "ineligibility_reason": null}
+                ]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("valid fallback eligibility snapshot")
+    }
+
     #[test]
     #[expect(
         clippy::too_many_lines,
@@ -11548,6 +11585,7 @@ ceiling = "M"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "primary-worker"
+provider = "opencode-go"
 fallback = ["below-floor-worker", "below-ceiling-worker", "free-train-worker", "fallback-worker"]
 
 [[roster]]
@@ -11556,6 +11594,7 @@ tier = "junior"
 ceiling = "M"
 efficiency = "lean"
 backend = "pi"
+provider = "opencode-go"
 dispatch_id = "below-floor-worker"
 
 [[roster]]
@@ -11565,6 +11604,7 @@ ceiling = "S"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "below-ceiling-worker"
+provider = "opencode-go"
 
 [[roster]]
 name = "free-train-worker"
@@ -11573,6 +11613,7 @@ ceiling = "M"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "free-train-worker"
+provider = "opencode-go"
 cost = "free-trains-input"
 
 [[roster]]
@@ -11581,6 +11622,7 @@ tier = "senior"
 ceiling = "M"
 efficiency = "lean"
 backend = "pi"
+provider = "codex"
 dispatch_id = "fallback-worker"
 "#,
             fleet.display()
@@ -11620,7 +11662,8 @@ dispatch_id = "fallback-worker"
         let commits = GitCommitProbe;
         let live = RecordingLiveSink::new(true);
         let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
-        let bursar = FakeBursarClient::unavailable();
+        let bursar = FakeBursarClient::unavailable()
+            .with_roster_snapshot(fallback_eligibility_roster_snapshot());
 
         let result = run_dispatch_cycle(
             &cfg, &bd, &exec, &commits, &reports, &state, &ledger, cycle_id, &options, &live,
@@ -11850,7 +11893,6 @@ dispatch_id = "fallback-worker"
             "healthy",
             &FakeBursarClient::with_provider_availability("opencode-go", Availability::Healthy),
         );
-
         assert_eq!(run.result.dispatched, 1);
         assert_eq!(run.result.verified, 1);
         assert_eq!(run.exec.spawns().len(), 2, "worker + verify");
@@ -12045,7 +12087,7 @@ tier = "junior"
 ceiling = "S"
 efficiency = "lean"
 backend = "pi"
-dispatch_id = "opencode-go/fake-worker"
+dispatch_id = "fake-worker"
 provider = "opencode-go"
 "#,
             fleet.display()
@@ -12324,7 +12366,7 @@ dispatch_id = "fake-worker"
             flags: Vec::new(),
             skips: Vec::new(),
             provider_routes: Vec::new(),
-            bursar_roster_artifact: None,
+            bursar_roster_source_artifact: None,
             approval_scope: ApprovalScope::default(),
             item_authorizations: Vec::new(),
         };
@@ -12374,7 +12416,10 @@ dispatch_id = "fake-worker"
             flags: Vec::new(),
             skips: Vec::new(),
             provider_routes: vec![provider_route],
-            bursar_roster_artifact: None,
+            bursar_roster_source_artifact: Some(crate::bursar::RosterSourceArtifact {
+                path: "/fixture/bursar-roster.toml".to_string(),
+                sha256: "a".repeat(64),
+            }),
             approval_scope: ApprovalScope::new(
                 ApprovalScopeKind::ExactItemScope,
                 vec![ScopeSelector::ExactItem {
@@ -12450,7 +12495,10 @@ dispatch_id = "fake-worker"
             flags: Vec::new(),
             skips: Vec::new(),
             provider_routes,
-            bursar_roster_artifact: None,
+            bursar_roster_source_artifact: Some(crate::bursar::RosterSourceArtifact {
+                path: "/fixture/bursar-roster.toml".to_string(),
+                sha256: "a".repeat(64),
+            }),
             approval_scope: ApprovalScope::new(
                 ApprovalScopeKind::ExactItemScope,
                 selectors,
@@ -13118,10 +13166,10 @@ dispatch_id = "fake-worker"
             let issue = issues
                 .get_mut(id)
                 .ok_or_else(|| BdError::new(format!("unknown issue {id}")))?;
-            issue
-                .metadata
-                .get_or_insert_with(BTreeMap::new)
-                .insert(key.to_string(), serde_json::Value::String(value.to_string()));
+            issue.metadata.get_or_insert_with(BTreeMap::new).insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
             Ok(issue.clone())
         }
     }
@@ -13692,9 +13740,7 @@ with open(response_file, "w") as fh:
             let start = Instant::now();
             loop {
                 if let Some(status) = self.child.try_wait().map_err(|error| {
-                    crate::dispatch::DispatchError::new(format!(
-                        "poll real worker child: {error}"
-                    ))
+                    crate::dispatch::DispatchError::new(format!("poll real worker child: {error}"))
                 })? {
                     return Ok(Some(status.into()));
                 }
@@ -13714,10 +13760,9 @@ with open(response_file, "w") as fh:
         }
 
         fn wait(&mut self) -> crate::dispatch::Result<ProcessStatus> {
-            self.child
-                .wait()
-                .map(ProcessStatus::from)
-                .map_err(|error| crate::dispatch::DispatchError::new(format!("wait child: {error}")))
+            self.child.wait().map(ProcessStatus::from).map_err(|error| {
+                crate::dispatch::DispatchError::new(format!("wait child: {error}"))
+            })
         }
 
         fn id(&self) -> Option<u32> {
@@ -14430,6 +14475,7 @@ ceiling = "S"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "fake-worker"
+provider = "opencode-go"
 "#,
             fleet.display()
         ))

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::config;
 
-const USAGE: &str = "usage: conductor [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]] [arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]]";
+const USAGE: &str = "usage: conductor [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]]";
 
 const DEFAULT_ADVERSARIAL_QUESTION: &str =
     "What are the highest-risk flaws in this artifact, and what must change before proceeding?";
@@ -26,7 +26,6 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("adversarial-review") => run_adversarial(&mut it),
-        Some("arena") => run_arena(&mut it),
         Some("config") => run_config(&mut it),
         Some("cycle") => run_cycle(&mut it),
         Some("dispatch") => run_dispatch(&mut it),
@@ -411,6 +410,7 @@ where
             },
             approved_profiles,
             bursar_roster_artifact: None,
+            roster_snapshot: None,
             limits: crate::run::RunLimits {
                 item_wall_clock_mins: Some(u64::from(cfg.budgets.item_wall_clock_mins)),
                 max_attempts: Some(u64::from(authorized.plan.limits.worst_case_calls)),
@@ -828,154 +828,6 @@ fn route_explain_output(
     }
 }
 
-fn run_arena(it: &mut std::vec::IntoIter<String>) -> ExitCode {
-    match it.next().as_deref() {
-        Some("run") => run_arena_run(it),
-        None => {
-            eprintln!(
-                "usage: conductor arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]"
-            );
-            ExitCode::from(2)
-        }
-        Some(sub) => {
-            eprintln!("unknown arena subcommand: {sub}");
-            ExitCode::from(2)
-        }
-    }
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "manual CLI parser stays local to the subcommand"
-)]
-fn run_arena_run(it: &mut std::vec::IntoIter<String>) -> ExitCode {
-    let mut config_path = PathBuf::from("conductor.toml");
-    let mut repo: Option<String> = None;
-    let mut bead: Option<String> = None;
-    let mut profiles = crate::arena::ProfileSelection::All;
-    let mut parallel = None;
-    let mut auto_apply = true;
-
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--config" => {
-                let Some(p) = it.next() else {
-                    eprintln!("--config requires a path argument");
-                    return ExitCode::from(2);
-                };
-                config_path = PathBuf::from(p);
-            }
-            "--repo" => {
-                let Some(value) = it.next() else {
-                    eprintln!("--repo requires an argument");
-                    return ExitCode::from(2);
-                };
-                repo = Some(value);
-            }
-            "--bead" => {
-                let Some(value) = it.next() else {
-                    eprintln!("--bead requires an argument");
-                    return ExitCode::from(2);
-                };
-                bead = Some(value);
-            }
-            "--profiles" => {
-                let Some(value) = it.next() else {
-                    eprintln!("--profiles requires an argument");
-                    return ExitCode::from(2);
-                };
-                profiles = if value == "all" {
-                    crate::arena::ProfileSelection::All
-                } else {
-                    let names: Vec<String> = value
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .collect();
-                    if names.is_empty() {
-                        eprintln!("--profiles requires at least one profile name or all");
-                        return ExitCode::from(2);
-                    }
-                    crate::arena::ProfileSelection::Named(names)
-                };
-            }
-            "--parallel" => {
-                let Some(value) = it.next() else {
-                    eprintln!("--parallel requires an integer argument");
-                    return ExitCode::from(2);
-                };
-                let Ok(parsed) = value.parse::<u32>() else {
-                    eprintln!("--parallel must be an integer");
-                    return ExitCode::from(2);
-                };
-                if parsed == 0 {
-                    eprintln!("--parallel must be at least 1");
-                    return ExitCode::from(2);
-                }
-                parallel = Some(parsed);
-            }
-            "--no-apply" => auto_apply = false,
-            other => {
-                eprintln!("unknown argument: {other}");
-                return ExitCode::from(2);
-            }
-        }
-    }
-
-    let Some(repo) = repo else {
-        eprintln!("arena run requires --repo <repo|path>");
-        return ExitCode::from(2);
-    };
-    let Some(bead) = bead else {
-        eprintln!("arena run requires --bead <id>");
-        return ExitCode::from(2);
-    };
-
-    let cfg = match config::load(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("config: invalid — {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let bd = crate::bd::CommandBdClient::new();
-    let options = crate::arena::ArenaRunOptions {
-        repo,
-        bead,
-        profiles,
-        parallel,
-        auto_apply,
-    };
-    match crate::arena::run(
-        &cfg,
-        &bd,
-        &reports_home(),
-        &state_dir(),
-        &ledger_path(),
-        &options,
-    ) {
-        Ok(result) => {
-            println!("arena {}: complete", result.run_id);
-            println!("report: {}", result.report_path.display());
-            match result.winner_profile {
-                Some(winner) if result.applied => println!("winner applied: {winner}"),
-                Some(winner) => println!("winner not applied: {winner}"),
-                None => println!("winner: none"),
-            }
-            if result.applied {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
-        }
-        Err(e) => {
-            eprintln!("arena: {e}");
-            ExitCode::from(1)
-        }
-    }
-}
-
 fn run_config(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     match it.next().as_deref() {
         None => {
@@ -1023,18 +875,13 @@ fn run_config_check(it: &mut std::vec::IntoIter<String>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match resolved_roster.artifact {
-        Some(artifact) => println!(
-            "config: valid ({} Bursar profiles; snapshot {}#{})",
-            resolved_roster.roster.len(),
-            artifact.path,
-            artifact.sha256
-        ),
-        None => println!(
-            "config: valid ({} legacy roster entries; Bursar snapshot unavailable)",
-            resolved_roster.roster.len()
-        ),
-    }
+    println!(
+        "config: valid ({} Bursar profiles; snapshot source {}#{}, policy {})",
+        resolved_roster.roster.len(),
+        resolved_roster.source_artifact.path,
+        resolved_roster.source_artifact.sha256,
+        resolved_roster.policy_sha256
+    );
 
     let path_var = std::env::var("PATH").unwrap_or_default();
     let state_dir = home_state_dir();
@@ -1530,11 +1377,9 @@ fn print_help() {
     println!("  status         Show the most recently recorded cycle");
     println!("  cycle          Dry-run scan -> triage -> plan and publish a report");
     println!("  dispatch       Dispatch an approved cycle's ready items");
-    println!("  arena run      Head-to-head harness/model arena on one bead");
     println!();
     println!("Notes:");
     println!("  adversarial-review dispatch exits 0 only for complete validated synthesis.");
-    println!("  arena run applies the winning patch by default; pass --no-apply to opt out.");
     println!("  cycle --dry-run still writes a report file even though it makes no bd writes.");
     println!(
         "  dispatch --resume reclaims a bd claim stranded by a crashed conductor process (e.g."
@@ -2508,5 +2353,9 @@ provider = "codex"
         fn wait(&mut self) -> crate::dispatch::Result<crate::dispatch::ProcessStatus> {
             Ok(crate::dispatch::ProcessStatus::code(0))
         }
+    }
+    #[test]
+    fn active_cli_has_no_arena_surface() {
+        assert!(!USAGE.contains("arena"));
     }
 }

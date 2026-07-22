@@ -179,7 +179,7 @@ pub(crate) fn run_dry_run_with_timestamps_scoped(
     let resolved_roster = crate::bursar::resolve_roster(cfg, bursar)
         .map_err(|error| CycleError::new(format!("bursar roster snapshot: {error}")))?;
     let mut runtime_cfg = cfg.clone();
-    runtime_cfg.roster = resolved_roster.roster;
+    runtime_cfg.roster.clone_from(&resolved_roster.roster);
     let cfg = &runtime_cfg;
 
     // 1. Scan
@@ -207,7 +207,7 @@ pub(crate) fn run_dry_run_with_timestamps_scoped(
     let provider_advice = provider_route_advice(cfg, &snapshots, &plan, bursar)?;
     let mut cycle_plan = CyclePlan::from_triage(cycle_id, created_at, &plan);
     cycle_plan.apply_provider_routes(provider_advice);
-    cycle_plan.bursar_roster_artifact = resolved_roster.artifact;
+    cycle_plan.bursar_roster_source_artifact = Some(resolved_roster.source_artifact.clone());
     let max_dispatch_count = match resolved_scope.kind {
         ApprovalScopeKind::FleetAudit => cycle_plan.dispatches.len(),
         ApprovalScopeKind::RepositoryScope | ApprovalScopeKind::ExactItemScope => {
@@ -256,11 +256,9 @@ pub(crate) fn run_dry_run_with_timestamps_scoped(
                 bead: None,
             },
             approved_profiles: Vec::new(),
-            bursar_roster_artifact: cycle_plan.bursar_roster_artifact.as_ref().map(|artifact| {
-                crate::run::ArtifactRef {
-                    path: artifact.path.clone(),
-                    sha256: artifact.sha256.clone(),
-                }
+            bursar_roster_artifact: Some(crate::run::ArtifactRef {
+                path: resolved_roster.source_artifact.path.clone(),
+                sha256: resolved_roster.source_artifact.sha256.clone(),
             }),
             limits: RunLimits::default(),
             verifier: RunVerifier::default(),
@@ -914,7 +912,7 @@ mod tests {
     use super::*;
     use crate::bd::{BdError, Comment, Issue};
     use crate::bursar::test_support::FakeBursarClient;
-    use crate::bursar::{Availability, BursarClient, ProviderStatus, StatusReport};
+    use crate::bursar::{Availability, BursarClient, ProviderStatus, RosterSnapshot, StatusReport};
     use crate::config;
     use serde_json::{Map, Value, json};
     use std::cell::{Cell, RefCell};
@@ -1153,6 +1151,7 @@ mod tests {
 
     struct CountingBursar {
         report: StatusReport,
+        snapshot: RosterSnapshot,
         calls: Cell<usize>,
     }
 
@@ -1160,6 +1159,10 @@ mod tests {
         fn status(&self) -> crate::bursar::Result<StatusReport> {
             self.calls.set(self.calls.get() + 1);
             Ok(self.report.clone())
+        }
+
+        fn roster_snapshot(&self) -> crate::bursar::Result<RosterSnapshot> {
+            Ok(self.snapshot.clone())
         }
     }
 
@@ -1214,6 +1217,26 @@ mod tests {
             checked_at,
             providers,
         }
+    }
+
+    fn cycle_roster_snapshot() -> RosterSnapshot {
+        crate::bursar::parse_roster_snapshot(
+            br#"{
+              "schema":"bursar/roster@2",
+              "generated_at":"2026-07-17T12:00:00Z",
+              "source_artifact":{"path":"/fixture/bursar-roster.toml","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+              "policy_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "providers":[
+                {"provider_id":"codex","availability_key":"codex","enabled":true,"state":"healthy","availability":"healthy","checked_at":"2026-07-17T12:00:00Z","data_as_of":null,"expires_at":"2100-01-01T00:00:00Z","reason":null,"eligible":true,"ineligibility_reason":null},
+                {"provider_id":"opencode-go","availability_key":"opencode-go","enabled":true,"state":"healthy","availability":"healthy","checked_at":"2026-07-17T12:00:00Z","data_as_of":null,"expires_at":"2100-01-01T00:00:00Z","reason":null,"eligible":true,"ineligibility_reason":null}
+              ],
+              "profiles":[
+                {"profile_id":"healthy-junior","provider_id":"codex","model":"gpt-healthy","harness":"codex","dispatch_id":"gpt-healthy","reasoning_effort":"medium","tier":"junior","ceiling":"S","efficiency":"lean","cost":0.0,"data_policy":"standard","enabled":true,"roles":["default","task"],"state":"healthy","eligible":true,"ineligibility_reason":null},
+                {"profile_id":"exhausted-senior","provider_id":"opencode-go","model":"exhausted","harness":"pi","dispatch_id":"opencode-go/exhausted","reasoning_effort":null,"tier":"senior","ceiling":"M","efficiency":"lean","cost":0.0,"data_policy":"standard","enabled":true,"roles":["default","task"],"state":"healthy","eligible":true,"ineligibility_reason":null}
+              ]
+            }"#,
+        )
+        .expect("valid cycle Bursar snapshot")
     }
 
     // --- The test ---
@@ -1540,6 +1563,7 @@ fallback = []
         bd.set_blocked(&repo, vec![]);
         let bursar = CountingBursar {
             report: provider_status_report(),
+            snapshot: cycle_roster_snapshot(),
             calls: Cell::new(0),
         };
 

@@ -1822,8 +1822,7 @@ mod tests {
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
 
-        let mut codex_request =
-            request(&repo, Backend::Codex, "gpt-5.6-sol", Some(BEFORE_COMMIT));
+        let mut codex_request = request(&repo, Backend::Codex, "gpt-5.6-sol", Some(BEFORE_COMMIT));
         codex_request.reasoning_effort = Some(ReasoningEffort::Max);
         let codex = spawn_request(&codex_request, temp.path())
             .expect("build Codex spawn without outer sandbox");

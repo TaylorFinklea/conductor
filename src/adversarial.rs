@@ -1558,23 +1558,12 @@ fn adversarial_base_ledger_row(
             .map(|effort| effort.as_str().to_string()),
         role: role.to_string(),
         task: plan.review_id.clone(),
-        score_1_5: None,
-        blind_rank: None,
-        judge: None,
         verify_passed: schema_valid,
         complexity: "L".to_string(),
         project: "conductor".to_string(),
-        bias_note: None,
         notes,
-        arena_run_id: None,
-        winner: None,
-        applied: None,
         failure_reason,
         duration_ms: Some(duration_ms),
-        ralph_duration_ms: None,
-        verify_duration_ms: None,
-        tokens_used: None,
-        cost_usd: None,
     }
 }
 
@@ -3177,7 +3166,6 @@ mod tests {
             .expect("production module prefix");
         for forbidden in [
             "crate::bd::",
-            "crate::arena::",
             "crate::cycle::",
             "crate::dispatch_cycle::",
             "crate::verify::",

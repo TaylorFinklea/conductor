@@ -8,10 +8,9 @@ use std::process::{Command, Stdio};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 
 const SCHEMA: &str = "bursar/status@2";
-const ROSTER_SCHEMA: &str = "bursar/roster@1";
+const ROSTER_SCHEMA: &str = "bursar/roster@2";
 const MAX_STATUS_AGE_MINS: i64 = 5;
 const NEAR_EXHAUSTED_PERCENT: f64 = 90.0;
 const PROVIDERS: [&str; 4] = ["anthropic", "codex", "opencode-go", "agy"];
@@ -139,23 +138,28 @@ pub(crate) struct StatusReport {
     pub(crate) providers: BTreeMap<String, ProviderStatus>,
 }
 
-/// Immutable Bursar roster artifact identity persisted with an approved plan.
+/// Immutable source identity carried by a Bursar v2 roster snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RosterArtifact {
+pub(crate) struct RosterSourceArtifact {
     pub(crate) path: String,
     pub(crate) sha256: String,
 }
 
-/// The read-only `bursar/roster@1` response consumed by Conductor.
+/// Read-only `bursar/roster@2` snapshot consumed by Conductor. Snapshot bytes
+/// are retained outside its serialized shape so a run can copy exactly what
+/// Bursar emitted rather than reopening the mutable source roster.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RosterSnapshot {
     schema: String,
     generated_at: String,
-    pub(crate) artifact: RosterArtifact,
+    source_artifact: RosterSourceArtifact,
+    policy_sha256: String,
     providers: Vec<RosterProvider>,
     profiles: Vec<RosterProfile>,
+    #[serde(skip)]
+    bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -194,19 +198,22 @@ struct RosterProfile {
     cost: f64,
     data_policy: String,
     enabled: bool,
+    roles: Vec<String>,
     state: String,
     eligible: bool,
     #[serde(default, deserialize_with = "deserialize_nullable")]
     ineligibility_reason: Option<String>,
 }
 
-/// Parses, authenticates, and validates a `bursar/roster@1` snapshot before
-/// any profile becomes eligible for Conductor routing.
+/// Parses, authenticates, and validates a `bursar/roster@2` snapshot before
+/// any profile becomes eligible for Conductor routing. The source artifact is
+/// provenance only: authorization must use the captured bytes, never reopen it.
 pub(crate) fn parse_roster_snapshot(bytes: &[u8]) -> Result<RosterSnapshot> {
-    let snapshot: RosterSnapshot = serde_json::from_slice(bytes).map_err(|error| {
+    let mut snapshot: RosterSnapshot = serde_json::from_slice(bytes).map_err(|error| {
         BursarError::json(format!("failed to parse bursar roster snapshot: {error}"))
     })?;
     snapshot.validate()?;
+    snapshot.bytes = bytes.to_vec();
     Ok(snapshot)
 }
 
@@ -224,29 +231,21 @@ impl RosterSnapshot {
         }
         parse_time("roster generated_at", &self.generated_at)
             .map_err(|error| BursarError::json(error.clone()))?;
-        let artifact_path = std::path::Path::new(&self.artifact.path);
-        if !artifact_path.is_absolute() {
+        let source_path = std::path::Path::new(&self.source_artifact.path);
+        if !source_path.is_absolute() {
             return Err(BursarError::json(
-                "bursar roster artifact path must be absolute",
+                "bursar roster source artifact path must be absolute",
             ));
         }
-        if !is_sha256(&self.artifact.sha256) {
+        if !is_sha256(&self.source_artifact.sha256) {
             return Err(BursarError::json(
-                "bursar roster artifact sha256 must be lowercase 64-hex",
+                "bursar roster source artifact sha256 must be lowercase 64-hex",
             ));
         }
-        let bytes = std::fs::read(artifact_path).map_err(|error| {
-            BursarError::json(format!(
-                "cannot read bursar roster artifact {}: {error}",
-                artifact_path.display()
-            ))
-        })?;
-        let actual_sha256 = format!("{:x}", Sha256::digest(bytes));
-        if actual_sha256 != self.artifact.sha256 {
-            return Err(BursarError::json(format!(
-                "bursar roster artifact hash mismatch for {}",
-                artifact_path.display()
-            )));
+        if !is_sha256(&self.policy_sha256) {
+            return Err(BursarError::json(
+                "bursar roster policy_sha256 must be lowercase 64-hex",
+            ));
         }
 
         let mut providers = HashMap::new();
@@ -291,11 +290,13 @@ impl RosterSnapshot {
         }
 
         let mut profile_ids = HashSet::new();
+        let mut execution_keys = HashSet::new();
         for profile in &self.profiles {
-            if profile.profile_id.is_empty()
-                || profile.provider_id.is_empty()
-                || profile.model.is_empty()
-                || profile.dispatch_id.is_empty()
+            if !is_identifier(&profile.profile_id)
+                || !is_identifier(&profile.provider_id)
+                || profile.model.trim().is_empty()
+                || profile.harness.trim().is_empty()
+                || profile.dispatch_id.trim().is_empty()
                 || !providers.contains_key(profile.provider_id.as_str())
                 || !profile.cost.is_finite()
                 || profile.cost < 0.0
@@ -355,6 +356,26 @@ impl RosterSnapshot {
             }
             if !profile_ids.insert(profile.profile_id.as_str()) {
                 return Err(BursarError::json("duplicate bursar roster profile_id"));
+            }
+            let execution_key = (
+                profile.provider_id.as_str(),
+                profile.model.as_str(),
+                profile.harness.as_str(),
+                profile.dispatch_id.as_str(),
+                profile.reasoning_effort.as_deref().unwrap_or_default(),
+            );
+            if !execution_keys.insert(execution_key) {
+                return Err(BursarError::json(
+                    "duplicate bursar roster execution identity",
+                ));
+            }
+            if profile.roles.is_empty()
+                || profile.roles.windows(2).any(|pair| pair[0] >= pair[1])
+                || profile.roles.iter().any(|role| !is_identifier(role))
+            {
+                return Err(BursarError::json(
+                    "bursar roster profile roles must be sorted, unique identifiers",
+                ));
             }
         }
         Ok(())
@@ -459,6 +480,10 @@ impl RosterSnapshot {
         }
         Ok(entries)
     }
+
+    pub(crate) fn policy_sha256(&self) -> &str {
+        &self.policy_sha256
+    }
 }
 
 fn backend_from_harness(harness: &str) -> Result<crate::config::Backend> {
@@ -481,31 +506,37 @@ fn is_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-/// Runtime roster resolution. Production configs carry no `[[roster]]` rows,
-/// so a missing snapshot is a launch-stopping error. Explicit legacy rows are
-/// retained only as a read-only compatibility bridge for persisted plans and
-/// fixtures until the migration window closes.
+fn is_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Runtime roster resolution. Production and compatibility surfaces consume a
+/// validated Bursar v2 snapshot; static `[[roster]]` entries cannot authorize
+/// a run.
 pub(crate) fn resolve_roster<C: BursarClient + ?Sized>(
     cfg: &crate::config::Config,
     client: &C,
 ) -> Result<ResolvedRoster> {
-    match client.roster_snapshot() {
-        Ok(snapshot) => Ok(ResolvedRoster {
-            roster: snapshot.roster_entries_with_fallbacks(&cfg.job_fallbacks)?,
-            artifact: Some(snapshot.artifact),
-        }),
-        Err(_error) if !cfg.roster.is_empty() => Ok(ResolvedRoster {
-            roster: cfg.roster.clone(),
-            artifact: None,
-        }),
-        Err(error) => Err(error),
-    }
+    let snapshot = client.roster_snapshot()?;
+    let roster = snapshot.roster_entries_with_fallbacks(&cfg.job_fallbacks)?;
+    Ok(ResolvedRoster {
+        roster,
+        source_artifact: snapshot.source_artifact.clone(),
+        policy_sha256: snapshot.policy_sha256.clone(),
+        snapshot_bytes: snapshot.bytes,
+    })
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedRoster {
     pub(crate) roster: Vec<crate::config::RosterEntry>,
-    pub(crate) artifact: Option<RosterArtifact>,
+    pub(crate) source_artifact: RosterSourceArtifact,
+    pub(crate) policy_sha256: String,
+    pub(crate) snapshot_bytes: Vec<u8>,
 }
 
 fn deserialize_nullable<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
@@ -1101,14 +1132,17 @@ pub(crate) mod test_support {
     #[derive(Debug, Clone)]
     pub(crate) struct FakeBursarClient {
         result: Result<StatusReport>,
+        snapshot: Result<RosterSnapshot>,
         observe_result: Result<()>,
         observations: Rc<RefCell<Vec<ObservationRequest>>>,
     }
 
     impl FakeBursarClient {
         fn from_result(result: Result<StatusReport>) -> Self {
+            let snapshot = fake_roster_snapshot(result.as_ref().ok());
             Self {
                 result,
+                snapshot,
                 observe_result: Ok(()),
                 observations: Rc::new(RefCell::new(Vec::new())),
             }
@@ -1116,6 +1150,11 @@ pub(crate) mod test_support {
 
         pub(crate) fn unavailable() -> Self {
             Self::from_result(Err(BursarError::unavailable("bursar unavailable on PATH")))
+        }
+
+        pub(crate) fn with_roster_snapshot(mut self, snapshot: RosterSnapshot) -> Self {
+            self.snapshot = Ok(snapshot);
+            self
         }
 
         pub(crate) fn with_provider_availability(
@@ -1208,11 +1247,120 @@ pub(crate) mod test_support {
             self.result.clone()
         }
 
+        fn roster_snapshot(&self) -> Result<RosterSnapshot> {
+            self.snapshot.clone()
+        }
+
         fn observe(&self, request: &ObservationRequest) -> Result<()> {
             self.observations.borrow_mut().push(request.clone());
             self.observe_result.clone()
         }
     }
+}
+
+#[cfg(test)]
+fn fake_roster_snapshot(status: Option<&StatusReport>) -> Result<RosterSnapshot> {
+    let runtime_availability = |provider: &str| {
+        status
+            .and_then(|report| report.providers.get(provider))
+            .map_or(Availability::Healthy, |provider| provider.availability)
+    };
+    // A roster snapshot is an authorization-time artifact. Runtime status
+    // is intentionally separate so a just-exhausted provider reaches the
+    // bounded defer path instead of erasing an approved route.
+    let availability_for = |_| Availability::Healthy;
+    let provider_json = PROVIDERS
+        .into_iter()
+        .map(|provider| {
+            let availability = availability_for(provider);
+            let eligible = matches!(availability, Availability::Healthy | Availability::Caution);
+            let state = match availability {
+                Availability::Healthy | Availability::Caution => "healthy",
+                Availability::Exhausted => "exhausted",
+                Availability::Unknown => "unknown",
+            };
+            serde_json::json!({
+                "provider_id": provider,
+                "availability_key": provider,
+                "enabled": true,
+                "state": state,
+                "availability": availability.to_string(),
+                "checked_at": "2026-07-17T12:00:00Z",
+                "data_as_of": null,
+                "expires_at": "2100-01-01T00:00:00Z",
+                "reason": null,
+                "eligible": eligible,
+                "ineligibility_reason": null
+            })
+        })
+        .collect::<Vec<_>>();
+    let cautious_provider = ["anthropic", "codex", "opencode-go"]
+        .into_iter()
+        .find(|provider| runtime_availability(provider) == Availability::Caution)
+        .or_else(|| {
+            ["anthropic", "codex", "opencode-go"]
+                .into_iter()
+                .find(|provider| runtime_availability(provider) == Availability::Healthy)
+        })
+        .unwrap_or("anthropic");
+    let profile_json = [
+        ("fake-worker", "opencode-go", "fake-worker", "junior"),
+        ("primary-worker", "opencode-go", "primary-worker", "junior"),
+        ("fallback-worker", "codex", "fallback-worker", "junior"),
+        (
+            "cautious-peer",
+            cautious_provider,
+            "cautious-peer",
+            "junior",
+        ),
+        (
+            "senior-reviewer",
+            "opencode-go",
+            "senior-reviewer",
+            "senior",
+        ),
+    ]
+    .into_iter()
+    .map(|(profile_id, provider_id, dispatch_id, tier)| {
+        let eligible = matches!(
+            availability_for(provider_id),
+            Availability::Healthy | Availability::Caution
+        );
+        serde_json::json!({
+            "profile_id": profile_id,
+            "provider_id": provider_id,
+            "model": format!("{profile_id}-model"),
+            "harness": "pi",
+            "dispatch_id": dispatch_id,
+            "reasoning_effort": null,
+            "tier": tier,
+            "ceiling": "XL",
+            "efficiency": "lean",
+            "cost": 0.0,
+            "data_policy": "standard",
+            "enabled": true,
+            "roles": ["default", "task"],
+            "state": "healthy",
+            "eligible": eligible,
+            "ineligibility_reason": null
+        })
+    })
+    .collect::<Vec<_>>();
+    parse_roster_snapshot(
+        serde_json::json!({
+            "schema": "bursar/roster@2",
+            "generated_at": "2026-07-17T12:00:00Z",
+            "source_artifact": {
+                "path": "/fixture/bursar-roster.toml",
+                "sha256": "a".repeat(64)
+            },
+            "policy_sha256": "b".repeat(64),
+            "providers": provider_json,
+            "profiles": profile_json
+        })
+        .to_string()
+        .as_bytes(),
+    )
 }
 
 #[cfg(test)]
@@ -1259,9 +1407,10 @@ mod tests {
         let sha256 = format!("{:x}", sha2::Sha256::digest(bytes));
         let json = format!(
             r#"{{
-  "schema": "bursar/roster@1",
+  "schema": "bursar/roster@2",
   "generated_at": "2026-07-17T12:00:00Z",
-  "artifact": {{"path": "{}", "sha256": "{}"}},
+  "source_artifact": {{"path": "{}", "sha256": "{}"}},
+  "policy_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "providers": [{{
     "provider_id": "anthropic",
     "availability_key": "anthropic",
@@ -1288,6 +1437,7 @@ mod tests {
     "cost": 1.0,
     "data_policy": "standard",
     "enabled": true,
+    "roles": ["default"],
     "state": "healthy",
     "eligible": true,
     "ineligibility_reason": null
@@ -1307,9 +1457,10 @@ mod tests {
         let sha256 = format!("{:x}", sha2::Sha256::digest(bytes));
         let json = format!(
             r#"{{
-  "schema": "bursar/roster@1",
+  "schema": "bursar/roster@2",
   "generated_at": "2026-07-16T12:00:00Z",
-  "artifact": {{"path": "{}", "sha256": "{}"}},
+  "source_artifact": {{"path": "{}", "sha256": "{}"}},
+  "policy_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "providers": [{{
     "provider_id": "openai-codex",
     "availability_key": "codex",
@@ -1336,6 +1487,7 @@ mod tests {
     "cost": 1.0,
     "data_policy": "standard",
     "enabled": true,
+    "roles": ["default"],
     "state": "healthy",
     "eligible": true,
     "ineligibility_reason": null
@@ -1361,6 +1513,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn roster_v2_accepts_opaque_identity_and_never_reads_live_source() {
+        let snapshot = parse_roster_snapshot(
+            br#"{
+              "schema":"bursar/roster@2",
+              "generated_at":"2026-07-16T12:00:00Z",
+              "source_artifact":{"path":"/intentionally/unreadable/roster.toml","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+              "policy_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "providers":[{
+                "provider_id":"openai-codex",
+                "availability_key":"codex",
+                "enabled":true,
+                "state":"healthy",
+                "availability":"healthy",
+                "checked_at":"2026-07-16T12:00:00Z",
+                "data_as_of":null,
+                "expires_at":"2026-07-16T13:00:00Z",
+                "reason":null,
+                "eligible":true,
+                "ineligibility_reason":null
+              }],
+              "profiles":[{
+                "profile_id":"openai-codex--omp--gpt-5.6-sol--xhigh",
+                "provider_id":"openai-codex",
+                "model":"gpt-5.6-sol",
+                "harness":"omp",
+                "dispatch_id":"openai-codex/gpt-5.6-sol",
+                "reasoning_effort":"xhigh",
+                "tier":"lead",
+                "ceiling":"XL",
+                "efficiency":"heavy",
+                "cost":1.0,
+                "data_policy":"standard",
+                "enabled":true,
+                "roles":["advisor","default","plan","task"],
+                "state":"healthy",
+                "eligible":true,
+                "ineligibility_reason":null
+              }]
+            }"#,
+        )
+        .expect("strict v2 roster must not authenticate by rereading source_artifact");
+
+        let roster = snapshot
+            .roster_entries_with_fallbacks(&[])
+            .expect("convert validated roster profile");
+        assert_eq!(roster[0].name, "openai-codex--omp--gpt-5.6-sol--xhigh");
+        assert_eq!(roster[0].provider, "openai-codex");
+        assert_eq!(roster[0].dispatch_id, "openai-codex/gpt-5.6-sol");
     }
 
     #[test]

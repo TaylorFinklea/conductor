@@ -26,7 +26,7 @@ pub(crate) struct CyclePlan {
     #[serde(default)]
     pub(crate) provider_routes: Vec<ProviderRouteRecord>,
     #[serde(default)]
-    pub(crate) bursar_roster_artifact: Option<crate::bursar::RosterArtifact>,
+    pub(crate) bursar_roster_source_artifact: Option<crate::bursar::RosterSourceArtifact>,
     pub(crate) approval_scope: ApprovalScope,
     pub(crate) item_authorizations: Vec<ItemAuthorizationRecord>,
 }
@@ -415,7 +415,7 @@ impl CyclePlan {
             flags,
             skips,
             provider_routes: Vec::new(),
-            bursar_roster_artifact: None,
+            bursar_roster_source_artifact: None,
             approval_scope: ApprovalScope {
                 max_dispatch_count: plan.dispatches.len(),
                 ..ApprovalScope::default()
@@ -746,20 +746,23 @@ mod tests {
     }
 
     #[test]
-    fn cycle_plan_pins_the_bursar_roster_artifact() {
+    fn cycle_plan_pins_the_bursar_roster_source_artifact() {
         let plan = CyclePlan::from_triage("cycle", "2026-07-16T12:00:00Z", &Plan::default());
-        let artifact = crate::bursar::RosterArtifact {
+        let artifact = crate::bursar::RosterSourceArtifact {
             path: "/absolute/roster.toml".to_string(),
             sha256: "a".repeat(64),
         };
         let cycle = CyclePlan {
-            bursar_roster_artifact: Some(artifact.clone()),
+            bursar_roster_source_artifact: Some(artifact.clone()),
             ..plan
         };
 
         let json = serde_json::to_value(cycle).expect("serialize pinned plan");
-        assert_eq!(json["bursar_roster_artifact"]["path"], artifact.path);
-        assert_eq!(json["bursar_roster_artifact"]["sha256"], artifact.sha256);
+        assert_eq!(json["bursar_roster_source_artifact"]["path"], artifact.path);
+        assert_eq!(
+            json["bursar_roster_source_artifact"]["sha256"],
+            artifact.sha256
+        );
     }
 
     #[test]

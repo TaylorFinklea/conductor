@@ -283,10 +283,8 @@ pub(crate) struct RosterEntry {
     /// Explicit Codex reasoning effort. Required for `backend = "codex"`
     /// and rejected for other backends so dispatch cannot silently ignore it.
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
-    /// Which provider/account this model lives on (mirrors
-    /// `arena_profile.provider_group`; unify on a single name in a later
-    /// phase). Empty string when unset (defaults to "" so existing rows
-    /// parse — drift detection only).
+    /// Provider/account identity for legacy static rows. V2 routing consumes
+    /// Bursar's independently validated provider identity instead.
     pub(crate) provider: String,
     /// Cost axis — `paid` (default) | `free` | `free-trains-input`. Gates
     /// per-repo eligibility; orthogonal to `Tier`.
@@ -416,46 +414,6 @@ impl Default for RatchetCeiling {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ArenaProfile {
-    pub(crate) name: String,
-    pub(crate) harness: String,
-    pub(crate) model: String,
-    pub(crate) provider_group: String,
-    pub(crate) reasoning_effort: Option<ReasoningEffort>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ArenaJudge {
-    pub(crate) name: String,
-    pub(crate) backend: Backend,
-    pub(crate) dispatch_id: String,
-    pub(crate) reasoning_effort: Option<ReasoningEffort>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ArenaConfig {
-    pub(crate) parallel: u32,
-    pub(crate) auto_apply: bool,
-    pub(crate) min_score_x10: u32,
-    pub(crate) keep_worktrees: bool,
-    pub(crate) profiles: Vec<ArenaProfile>,
-    pub(crate) judges: Vec<ArenaJudge>,
-}
-
-impl Default for ArenaConfig {
-    fn default() -> Self {
-        Self {
-            parallel: 2,
-            auto_apply: true,
-            min_score_x10: 40,
-            keep_worktrees: false,
-            profiles: Vec::new(),
-            judges: Vec::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdversarialReviewConfig {
     pub(crate) max_reviewers: u32,
@@ -485,7 +443,6 @@ pub(crate) struct Config {
     /// Auto-dispatch ceiling for the ratchet (conductor-m6). Defaults to
     /// the month-1 narrow posture (junior / S) — see `RatchetCeiling`.
     pub(crate) ratchet: RatchetCeiling,
-    pub(crate) arena: ArenaConfig,
     pub(crate) adversarial_review: AdversarialReviewConfig,
     pub(crate) roster: Vec<RosterEntry>,
     /// Runtime retry policy keyed by Bursar profile IDs. This remains static
@@ -926,10 +883,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
                 | "verify"
                 | "review"
                 | "ratchet"
-                | "arena"
                 | "adversarial_review"
-                | "arena_profile"
-                | "arena_judge"
                 | "roster"
                 | "job_fallback"
                 | "repo_policy"
@@ -947,11 +901,6 @@ fn from_doc(doc: &Doc) -> Result<Config> {
     let verify = parse_verify(doc.get("verify"))?;
     let review = parse_review(doc.get("review"))?;
     let ratchet = parse_ratchet(doc.get("ratchet"))?;
-    let arena = parse_arena(
-        doc.get("arena"),
-        doc.get("arena_profile"),
-        doc.get("arena_judge"),
-    )?;
     let roster = parse_roster(doc.get("roster"))?;
     let job_fallbacks = parse_job_fallbacks(doc.get("job_fallback"))?;
     let adversarial_review = parse_adversarial_review(doc.get("adversarial_review"), &roster)?;
@@ -963,7 +912,6 @@ fn from_doc(doc: &Doc) -> Result<Config> {
         verify,
         review,
         ratchet,
-        arena,
         adversarial_review,
         roster,
         job_fallbacks,
@@ -1187,152 +1135,6 @@ fn parse_ratchet(node: Option<&Node>) -> Result<RatchetCeiling> {
         }
     }
     Ok(r)
-}
-
-fn parse_arena(
-    table_node: Option<&Node>,
-    profile_node: Option<&Node>,
-    judge_node: Option<&Node>,
-) -> Result<ArenaConfig> {
-    let mut arena = ArenaConfig::default();
-    if let Some(node) = table_node {
-        let Node::Table(t) = node else {
-            return Err(ConfigError::new("arena must be a table"));
-        };
-        for (key, val) in t {
-            match key.as_str() {
-                "parallel" => arena.parallel = expect_u32("arena.parallel", val)?,
-                "auto_apply" => arena.auto_apply = expect_bool("arena.auto_apply", val)?,
-                "min_score_x10" => arena.min_score_x10 = expect_u32("arena.min_score_x10", val)?,
-                "keep_worktrees" => {
-                    arena.keep_worktrees = expect_bool("arena.keep_worktrees", val)?;
-                }
-                other => return Err(ConfigError::new(format!("unknown arena key: {other}"))),
-            }
-        }
-    }
-    if arena.parallel == 0 {
-        return Err(ConfigError::new("arena.parallel must be at least 1"));
-    }
-    if !(10..=50).contains(&arena.min_score_x10) {
-        return Err(ConfigError::new(
-            "arena.min_score_x10 must be between 10 and 50",
-        ));
-    }
-
-    arena.profiles = parse_arena_profiles(profile_node)?;
-    arena.judges = parse_arena_judges(judge_node)?;
-    Ok(arena)
-}
-
-fn parse_arena_profiles(node: Option<&Node>) -> Result<Vec<ArenaProfile>> {
-    let entries = match node {
-        None => return Ok(Vec::new()),
-        Some(Node::Tables(v)) => v,
-        Some(_) => {
-            return Err(ConfigError::new(
-                "arena_profile must be an array of tables ([[arena_profile]])",
-            ));
-        }
-    };
-    let mut seen = HashSet::new();
-    let mut out = Vec::with_capacity(entries.len());
-    for (i, t) in entries.iter().enumerate() {
-        for key in t.keys() {
-            if !matches!(
-                key.as_str(),
-                "name" | "harness" | "model" | "provider_group" | "reasoning_effort"
-            ) {
-                return Err(ConfigError::new(format!(
-                    "unknown arena_profile key in entry {i}: {key}"
-                )));
-            }
-        }
-        let name = get_required_str_at("arena_profile", t, i, "name")?;
-        let harness = get_required_str_at("arena_profile", t, i, "harness")?;
-        if !matches!(
-            harness.as_str(),
-            "claude" | "codex" | "opencode" | "pi" | "omp"
-        ) {
-            return Err(ConfigError::new(format!(
-                "arena_profile entry {i} unknown harness {harness:?} (expected claude|codex|opencode|pi|omp)"
-            )));
-        }
-        let model = get_required_str_at("arena_profile", t, i, "model")?;
-        let provider_group = get_required_str_at("arena_profile", t, i, "provider_group")?;
-        let reasoning_effort = parse_reasoning_effort("arena_profile", t, i)?;
-        validate_reasoning_effort(
-            "arena_profile",
-            i,
-            matches!(harness.as_str(), "codex" | "omp"),
-            harness == "codex",
-            &model,
-            reasoning_effort,
-        )?;
-        if !seen.insert(name.clone()) {
-            return Err(ConfigError::new(format!(
-                "duplicate arena_profile name: {name}"
-            )));
-        }
-        out.push(ArenaProfile {
-            name,
-            harness,
-            model,
-            provider_group,
-            reasoning_effort,
-        });
-    }
-    Ok(out)
-}
-
-fn parse_arena_judges(node: Option<&Node>) -> Result<Vec<ArenaJudge>> {
-    let entries = match node {
-        None => return Ok(Vec::new()),
-        Some(Node::Tables(v)) => v,
-        Some(_) => {
-            return Err(ConfigError::new(
-                "arena_judge must be an array of tables ([[arena_judge]])",
-            ));
-        }
-    };
-    let mut seen = HashSet::new();
-    let mut out = Vec::with_capacity(entries.len());
-    for (i, t) in entries.iter().enumerate() {
-        for key in t.keys() {
-            if !matches!(
-                key.as_str(),
-                "name" | "backend" | "dispatch_id" | "reasoning_effort"
-            ) {
-                return Err(ConfigError::new(format!(
-                    "unknown arena_judge key in entry {i}: {key}"
-                )));
-            }
-        }
-        let name = get_required_str_at("arena_judge", t, i, "name")?;
-        let backend = get_required_str_at("arena_judge", t, i, "backend")?.parse::<Backend>()?;
-        let dispatch_id = get_required_str_at("arena_judge", t, i, "dispatch_id")?;
-        let reasoning_effort = parse_reasoning_effort("arena_judge", t, i)?;
-        validate_reasoning_effort(
-            "arena_judge",
-            i,
-            matches!(backend, Backend::Codex | Backend::Omp),
-            backend == Backend::Codex,
-            &dispatch_id,
-            reasoning_effort,
-        )?;
-        if !seen.insert(name.clone()) {
-            return Err(ConfigError::new(format!(
-                "duplicate arena_judge name: {name}"
-            )));
-        }
-        out.push(ArenaJudge {
-            name,
-            backend,
-            dispatch_id,
-            reasoning_effort,
-        });
-    }
-    Ok(out)
 }
 
 fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
@@ -1655,7 +1457,7 @@ pub(crate) struct PreflightCheck {
 }
 
 pub(crate) fn preflight_checks(path_var: &str, state_dir: Option<&Path>) -> Vec<PreflightCheck> {
-    let mut checks: Vec<PreflightCheck> = Vec::with_capacity(PATH_TOOLS.len() + 1);
+    let mut checks: Vec<PreflightCheck> = Vec::with_capacity(PATH_TOOLS.len() + 2);
     for tool in PATH_TOOLS.iter().copied() {
         match find_in_path(tool, path_var) {
             Some(found) => checks.push(PreflightCheck {
@@ -1687,6 +1489,33 @@ pub(crate) fn preflight_checks(path_var: &str, state_dir: Option<&Path>) -> Vec<
             name: "state dir".to_string(),
             ok: false,
             message: "HOME not set; cannot locate ~/.local/state/conductor".to_string(),
+        }),
+    }
+    match state_dir {
+        Some(dir) => match crate::run::legacy_v1_preflight(dir) {
+            Ok(legacy) if legacy.activation_allowed() => checks.push(PreflightCheck {
+                name: "legacy v1 recovery".to_string(),
+                ok: true,
+                message: "zero actionable legacy runs".to_string(),
+            }),
+            Ok(legacy) => checks.push(PreflightCheck {
+                name: "legacy v1 recovery".to_string(),
+                ok: false,
+                message: format!(
+                    "v2 activation blocked: pending={}, implementing={}, reclaimable={}",
+                    legacy.pending, legacy.implementing, legacy.reclaimable
+                ),
+            }),
+            Err(error) => checks.push(PreflightCheck {
+                name: "legacy v1 recovery".to_string(),
+                ok: false,
+                message: format!("cannot inspect legacy runs: {error}"),
+            }),
+        },
+        None => checks.push(PreflightCheck {
+            name: "legacy v1 recovery".to_string(),
+            ok: false,
+            message: "HOME not set; cannot inspect legacy runs".to_string(),
         }),
     }
     checks
@@ -1738,6 +1567,12 @@ mod tests {
     use std::fmt::Write;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn arena_tables_are_rejected_by_the_active_config_parser() {
+        let error = parse_str("[arena]\nparallel = 2\n").expect_err("Arena is retired");
+        assert!(error.to_string().contains("unknown config key: arena"));
+    }
 
     // --- test helpers ---
 
@@ -2056,15 +1891,6 @@ mod tests {
         assert_eq!(cfg.ratchet.max_tier_floor, Tier::Junior);
         assert_eq!(cfg.ratchet.max_complexity, Ceiling::S);
         assert_eq!(cfg.ratchet.clean_cycles_to_unlock, 3);
-        assert_eq!(cfg.arena.parallel, 2);
-        assert!(cfg.arena.auto_apply);
-        assert_eq!(cfg.arena.min_score_x10, 40);
-        assert_eq!(cfg.arena.profiles.len(), 26);
-        assert_eq!(cfg.arena.profiles[0].name, "pi-glm52");
-        assert_eq!(cfg.arena.profiles[0].reasoning_effort, None);
-        assert_eq!(cfg.arena.profiles[15].name, "opencode-nw-kimi-k26-fast");
-        assert_eq!(cfg.arena.judges.len(), 2);
-        assert_eq!(cfg.arena.judges[0].name, "qwen37max");
     }
 
     #[test]
@@ -2072,8 +1898,6 @@ mod tests {
         let cfg = parse_str(include_str!("../conductor.toml"))
             .expect("checked-in conductor.toml must parse");
         assert!(cfg.roster.is_empty());
-        assert!(cfg.arena.profiles.is_empty());
-        assert!(cfg.arena.judges.is_empty());
         assert_eq!(cfg.job_fallbacks.len(), 20);
         assert_eq!(
             cfg.job_fallbacks[0].profile_id,
@@ -2127,24 +1951,6 @@ max_tier_floor = \"senior\"
 max_complexity = \"M\"
 clean_cycles_to_unlock = 3
 
-[arena]
-parallel = 2
-auto_apply = false
-min_score_x10 = 45
-keep_worktrees = true
-
-[[arena_profile]]
-name = \"codex-gpt56-terra\"
-harness = \"codex\"
-model = \"gpt-5.6-terra\"
-provider_group = \"openai-codex\"
-reasoning_effort = \"xhigh\"
-
-[[arena_judge]]
-name = \"qwen-judge\"
-backend = \"pi\"
-dispatch_id = \"opencode-go/qwen3.7-max\"
-
 [[roster]]
 name = \"sonnet-5\"
 tier = \"lead\"
@@ -2174,20 +1980,6 @@ dispatch_id = \"claude-sonnet-5\"
         assert_eq!(cfg.ratchet.max_tier_floor, Tier::Senior);
         assert_eq!(cfg.ratchet.max_complexity, Ceiling::M);
         assert_eq!(cfg.ratchet.clean_cycles_to_unlock, 3);
-        assert_eq!(cfg.arena.parallel, 2);
-        assert!(!cfg.arena.auto_apply);
-        assert_eq!(cfg.arena.min_score_x10, 45);
-        assert!(cfg.arena.keep_worktrees);
-        assert_eq!(cfg.arena.profiles.len(), 1);
-        assert_eq!(cfg.arena.profiles[0].name, "codex-gpt56-terra");
-        assert_eq!(cfg.arena.profiles[0].harness, "codex");
-        assert_eq!(cfg.arena.profiles[0].model, "gpt-5.6-terra");
-        assert_eq!(
-            cfg.arena.profiles[0].reasoning_effort,
-            Some(ReasoningEffort::Xhigh)
-        );
-        assert_eq!(cfg.arena.judges.len(), 1);
-        assert_eq!(cfg.arena.judges[0].dispatch_id, "opencode-go/qwen3.7-max");
         assert_eq!(cfg.roster.len(), 1);
         assert_eq!(cfg.roster[0].tier, Tier::Lead);
     }
@@ -2213,12 +2005,6 @@ dispatch_id = \"claude-sonnet-5\"
         assert_eq!(cfg.ratchet.max_tier_floor, Tier::Junior);
         assert_eq!(cfg.ratchet.max_complexity, Ceiling::S);
         assert_eq!(cfg.ratchet.clean_cycles_to_unlock, 3);
-        assert_eq!(cfg.arena.parallel, 2);
-        assert!(cfg.arena.auto_apply);
-        assert_eq!(cfg.arena.min_score_x10, 40);
-        assert!(!cfg.arena.keep_worktrees);
-        assert!(cfg.arena.profiles.is_empty());
-        assert!(cfg.arena.judges.is_empty());
         assert_eq!(cfg.roster.len(), 1);
     }
 
@@ -2562,42 +2348,6 @@ dispatch_id = "provider/senior"
                 "unexpected result for {label}"
             );
         }
-    }
-
-    #[test]
-    fn codex_arena_profiles_and_judges_require_explicit_effort() {
-        let valid = "\
-[[arena_profile]]
-name = \"sol\"
-harness = \"codex\"
-model = \"gpt-5.6-sol\"
-provider_group = \"openai-codex\"
-reasoning_effort = \"max\"
-
-[[arena_judge]]
-name = \"terra\"
-backend = \"codex\"
-dispatch_id = \"gpt-5.6-terra\"
-reasoning_effort = \"xhigh\"
-";
-        let cfg = parse_str(valid).expect("valid explicit Codex Arena config");
-        assert_eq!(
-            cfg.arena.profiles[0].reasoning_effort,
-            Some(ReasoningEffort::Max)
-        );
-        assert_eq!(
-            cfg.arena.judges[0].reasoning_effort,
-            Some(ReasoningEffort::Xhigh)
-        );
-
-        let invalid = "\
-[[arena_profile]]
-name = \"missing-effort\"
-harness = \"codex\"
-model = \"gpt-5.6-sol\"
-provider_group = \"openai-codex\"
-";
-        assert_err("Codex Arena profile requires effort", invalid);
     }
 
     // --- hardcoded exclude (invariant 5) ---
