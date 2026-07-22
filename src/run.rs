@@ -559,7 +559,7 @@ pub(crate) enum RunDetails {
     Plan { state: PlanRunDetails },
 }
 
-/// `conductor/run@1` — the atomic, versioned run manifest.
+/// `conductor/run@2` — the atomic, versioned run manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunManifest {
@@ -579,8 +579,6 @@ pub(crate) struct RunManifest {
     pub(crate) roster_policy_sha256: Option<String>,
     pub(crate) limits: RunLimits,
     pub(crate) verifier: RunVerifier,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) work: Option<WorkState>,
     #[serde(default)]
     pub(crate) artifacts: Vec<ArtifactRef>,
     pub(crate) lifecycle: RunLifecycle,
@@ -588,7 +586,18 @@ pub(crate) struct RunManifest {
     pub(crate) outcome: Option<String>,
 }
 
-/// `conductor/event@1` — one append-only event line.
+impl RunManifest {
+    pub(crate) fn work(&self) -> Option<&WorkState> {
+        match &self.details {
+            RunDetails::Work { state } => state.as_ref(),
+            RunDetails::Review { .. } | RunDetails::Consult { .. } | RunDetails::Plan { .. } => {
+                None
+            }
+        }
+    }
+}
+
+/// `conductor/event@2` — one append-only event line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunEvent {
@@ -706,9 +715,7 @@ impl RunHandle {
             }
         }
         let details = match job {
-            RunJob::Work => RunDetails::Work {
-                state: work.clone(),
-            },
+            RunJob::Work => RunDetails::Work { state: work },
             RunJob::Review => RunDetails::Review {
                 state: ReviewRunDetails::default(),
             },
@@ -757,7 +764,6 @@ impl RunHandle {
             roster_policy_sha256: None,
             limits,
             verifier,
-            work,
             artifacts: Vec::new(),
             lifecycle: RunLifecycle::Started,
             outcome: None,
@@ -923,11 +929,7 @@ impl RunHandle {
                 "cannot invalidate a worker group on a finished run",
             ));
         }
-        let work = self
-            .manifest
-            .work
-            .as_mut()
-            .ok_or_else(|| RunError::new("invalidating a worker group requires work state"))?;
+        let work = self.work_mut("invalidating a worker group")?;
         if work.stage != WorkStage::Implementing {
             return Err(RunError::new(
                 "worker group can only be invalidated while implementing",
@@ -954,11 +956,7 @@ impl RunHandle {
                 "cannot record a worker group on a finished run",
             ));
         }
-        let work = self
-            .manifest
-            .work
-            .as_mut()
-            .ok_or_else(|| RunError::new("recording a worker group requires work state"))?;
+        let work = self.work_mut("recording a worker group")?;
         if work.stage != WorkStage::Implementing {
             return Err(RunError::new(
                 "worker group can only be recorded while implementing",
@@ -970,7 +968,17 @@ impl RunHandle {
     }
 
     pub(crate) fn work(&self) -> Option<&WorkState> {
-        self.manifest.work.as_ref()
+        work_state(&self.manifest)
+    }
+
+    fn work_mut(&mut self, operation: &str) -> Result<&mut WorkState> {
+        match &mut self.manifest.details {
+            RunDetails::Work { state: Some(work) } => Ok(work),
+            RunDetails::Work { state: None } => {
+                Err(RunError::new(format!("{operation} requires work state")))
+            }
+            _ => Err(RunError::new(format!("{operation} requires a work run"))),
+        }
     }
 
     pub(crate) fn manifest_path(&self) -> PathBuf {
@@ -1049,11 +1057,7 @@ impl RunHandle {
                 "pending review requires mechanical verifier artifacts",
             ));
         }
-        let work = self
-            .manifest
-            .work
-            .as_mut()
-            .ok_or_else(|| RunError::new("pending review requires work state"))?;
+        let work = self.work_mut("pending review")?;
         if work.stage != WorkStage::Implementing
             || work.worker_commit.is_some()
             || work.mechanical.is_some()
@@ -1090,7 +1094,7 @@ impl RunHandle {
     /// Repairs the event-journal half of a checkpoint if the process stopped
     /// after the atomic manifest replace but before the event append.
     pub(crate) fn ensure_pending_review_event(&mut self) -> Result<()> {
-        let Some(work) = self.manifest.work.as_ref() else {
+        let Some(work) = self.work() else {
             return Err(RunError::new("pending review requires work state"));
         };
         if work.stage != WorkStage::PendingReview {
@@ -1179,7 +1183,7 @@ impl RunHandle {
         outcome: impl Into<String>,
         artifact_refs: Vec<ArtifactRef>,
     ) -> Result<()> {
-        if let Some(work) = self.manifest.work.as_mut() {
+        if let Ok(work) = self.work_mut("finishing") {
             work.stage = WorkStage::Completed;
         }
         self.append_event(
@@ -1230,6 +1234,10 @@ impl RunHandle {
         bytes.push(b'\n');
         atomic_replace(&self.manifest_path(), &bytes)
     }
+}
+
+fn work_state(manifest: &RunManifest) -> Option<&WorkState> {
+    manifest.work()
 }
 
 /// Classifies legacy v1 artifacts without interpreting them as active runs.
@@ -1444,7 +1452,7 @@ pub(crate) fn find_reclaimable_work_run(
             continue;
         }
         let manifest = read_manifest(&entry.path().join("manifest.json"))?;
-        let Some(work) = manifest.work.as_ref() else {
+        let Some(work) = work_state(&manifest) else {
             continue;
         };
         if manifest.job != RunJob::Work
@@ -1481,19 +1489,10 @@ pub(crate) fn find_reclaimable_work_run(
 }
 fn validate_run_details(path: &Path, manifest: &RunManifest) -> Result<()> {
     match (&manifest.job, &manifest.details) {
-        (RunJob::Work, RunDetails::Work { .. }) => {}
-        (RunJob::Review, RunDetails::Review { .. })
-        | (RunJob::Consult, RunDetails::Consult { .. }) => {
-            if manifest.work.is_some() {
-                return Err(RunError::new("non-work run cannot carry work state"));
-            }
-        }
-        (RunJob::Plan, RunDetails::Plan { state }) => {
-            if manifest.work.is_some() {
-                return Err(RunError::new("plan run cannot carry work state"));
-            }
-            validate_plan_details(path, state)?;
-        }
+        (RunJob::Work, RunDetails::Work { .. })
+        | (RunJob::Review, RunDetails::Review { .. })
+        | (RunJob::Consult, RunDetails::Consult { .. }) => {}
+        (RunJob::Plan, RunDetails::Plan { state }) => validate_plan_details(path, state)?,
         _ => {
             return Err(RunError::new(
                 "manifest job does not match tagged run details",
@@ -1619,7 +1618,7 @@ fn find_work_run_at_stage(
             continue;
         }
         let manifest = read_manifest(&entry.path().join("manifest.json"))?;
-        let Some(work) = manifest.work.as_ref() else {
+        let Some(work) = work_state(&manifest) else {
             continue;
         };
         if manifest.job == RunJob::Work
@@ -1789,7 +1788,7 @@ fn validate_commit_id(commit: &str) -> Result<()> {
 }
 
 fn validate_work_manifest(path: &Path, manifest: &RunManifest) -> Result<()> {
-    let Some(work) = manifest.work.as_ref() else {
+    let Some(work) = work_state(manifest) else {
         return Ok(());
     };
     if manifest.job != RunJob::Work {
@@ -1845,7 +1844,7 @@ fn validate_work_manifest(path: &Path, manifest: &RunManifest) -> Result<()> {
 }
 
 fn validate_work_events(manifest: &RunManifest, events: &[RunEvent]) -> Result<()> {
-    let Some(work) = manifest.work.as_ref() else {
+    let Some(work) = work_state(manifest) else {
         return Ok(());
     };
     if work.stage != WorkStage::PendingReview {
@@ -2253,7 +2252,6 @@ mod tests {
             roster_policy_sha256: None,
             limits: RunLimits::default(),
             verifier: RunVerifier::default(),
-            work: None,
             artifacts: Vec::new(),
             lifecycle: RunLifecycle::Started,
             outcome: None,
@@ -2407,6 +2405,15 @@ mod tests {
                 vec![artifact.clone()],
             )
             .expect("checkpoint pending review");
+        let persisted = read_manifest(&handle.manifest_path()).expect("read checkpointed manifest");
+        let RunDetails::Work { state: Some(state) } = persisted.details else {
+            panic!("work details own the mutable work state");
+        };
+        assert_eq!(
+            state.stage,
+            WorkStage::PendingReview,
+            "the tagged work state must persist the checkpoint, not a stale creation copy"
+        );
 
         let events_path = handle.events_path();
         let mut rows = event_values(&events_path);
@@ -2962,7 +2969,6 @@ mod tests {
             roster_policy_sha256: None,
             limits: RunLimits::default(),
             verifier: RunVerifier::default(),
-            work: None,
             artifacts: Vec::new(),
             lifecycle: RunLifecycle::Started,
             outcome: None,
@@ -2995,28 +3001,28 @@ mod tests {
           "profiles":[]
         }"#
         .to_vec();
-        let mut request = new_run_request();
-        request.roster_snapshot = Some(RosterSnapshotInput {
-            bytes: snapshot_bytes.clone(),
-            policy_sha256: "b".repeat(64),
-        });
+        for job in [RunJob::Review, RunJob::Consult] {
+            let mut request = new_run_request();
+            request.roster_snapshot = Some(RosterSnapshotInput {
+                bytes: snapshot_bytes.clone(),
+                policy_sha256: "b".repeat(64),
+            });
+            let handle = RunHandle::create_at(temp.path(), job, request, fixed_now()).expect("run");
+            let roster = handle
+                .manifest()
+                .roster_snapshot
+                .as_ref()
+                .expect("copied snapshot identity");
+            assert_eq!(roster.path, "roster.json");
+            assert_eq!(roster.size_bytes, snapshot_bytes.len() as u64);
+            assert!(handle.dir().join(&roster.path).is_file());
 
-        let handle =
-            RunHandle::create_at(temp.path(), RunJob::Consult, request, fixed_now()).expect("run");
-        let roster = handle
-            .manifest()
-            .roster_snapshot
-            .as_ref()
-            .expect("copied snapshot identity");
-        assert_eq!(roster.path, "roster.json");
-        assert_eq!(roster.size_bytes, snapshot_bytes.len() as u64);
-        assert!(handle.dir().join(&roster.path).is_file());
-
-        std::fs::write(handle.dir().join(&roster.path), b"altered").expect("tamper snapshot");
-        assert!(
-            RunHandle::open(temp.path(), handle.run_id()).is_err(),
-            "resume must reject an altered copied roster snapshot"
-        );
+            std::fs::write(handle.dir().join(&roster.path), b"altered").expect("tamper snapshot");
+            assert!(
+                RunHandle::open(temp.path(), handle.run_id()).is_err(),
+                "{job:?} resume must reject an altered copied roster snapshot"
+            );
+        }
     }
 
     #[test]

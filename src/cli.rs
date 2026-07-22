@@ -383,6 +383,8 @@ where
     let plan =
         crate::adversarial::load_review_plan(&review_dir).map_err(|error| error.to_string())?;
     let artifact_path = PathBuf::from(plan.artifact_source_path());
+    let resolved_roster = crate::bursar::resolve_roster(cfg, bursar)
+        .map_err(|error| format!("bursar roster snapshot: {error}"))?;
     let provider_snapshot = adversarial_provider_snapshot(cfg, bursar);
     let authorized = crate::adversarial::authorize_approved_execution(
         &review_dir,
@@ -409,8 +411,14 @@ where
                 bead: None,
             },
             approved_profiles,
-            bursar_roster_artifact: None,
-            roster_snapshot: None,
+            bursar_roster_artifact: Some(crate::run::ArtifactRef {
+                path: resolved_roster.source_artifact.path,
+                sha256: resolved_roster.source_artifact.sha256,
+            }),
+            roster_snapshot: Some(crate::run::RosterSnapshotInput {
+                bytes: resolved_roster.snapshot_bytes,
+                policy_sha256: resolved_roster.policy_sha256,
+            }),
             limits: crate::run::RunLimits {
                 item_wall_clock_mins: Some(u64::from(cfg.budgets.item_wall_clock_mins)),
                 max_attempts: Some(u64::from(authorized.plan.limits.worst_case_calls)),
@@ -1647,6 +1655,10 @@ mod tests {
         let manifest = crate::run::read_manifest(&run_dir.join("manifest.json"))
             .expect("adversarial run manifest");
         assert_eq!(manifest.job, crate::run::RunJob::Review);
+        assert!(
+            manifest.roster_snapshot.is_some(),
+            "every prepared v2 run pins a copied Bursar roster snapshot"
+        );
         assert_eq!(
             manifest.target.repo,
             std::fs::canonicalize(&fixture.artifact)

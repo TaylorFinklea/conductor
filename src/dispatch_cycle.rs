@@ -9236,7 +9236,7 @@ exit 0
         let run_dir = fixture.pending_run_dir();
         let manifest = crate::run::read_manifest(&run_dir.join("manifest.json"))
             .expect("pending manifest validates");
-        let work = manifest.work.expect("work state");
+        let work = manifest.work().cloned().expect("work state");
         assert_eq!(work.stage, WorkStage::PendingReview);
         assert_eq!(
             work.worker_commit.as_deref(),
@@ -9276,7 +9276,7 @@ exit 0
         let manifest = crate::run::read_manifest(&fixture.pending_run_dir().join("manifest.json"))
             .expect("timeout leaves valid run");
         assert_eq!(
-            manifest.work.expect("work state").stage,
+            manifest.work().expect("work state").stage,
             WorkStage::PendingReview
         );
         fixture.mark_pending_review_recoverable();
@@ -9387,9 +9387,10 @@ exit 0
         let manifest = crate::run::read_manifest(&run_dir.join("manifest.json"))
             .expect("manifest before tamper");
         let artifact = manifest
-            .work
-            .and_then(|work| work.mechanical)
-            .and_then(|mechanical| mechanical.artifact_refs.into_iter().next())
+            .work()
+            .and_then(|work| work.mechanical.as_ref())
+            .and_then(|mechanical| mechanical.artifact_refs.first())
+            .cloned()
             .expect("verifier artifact");
         std::fs::write(run_dir.join(artifact.path), b"tampered\n").expect("tamper artifact");
 
@@ -9479,7 +9480,7 @@ exit 0
             &std::fs::read(&manifest_path).expect("read pending-review manifest"),
         )
         .expect("parse pending-review manifest");
-        manifest["work"]["owner_pid"] = serde_json::json!(owner_pid);
+        manifest["details"]["state"]["owner_pid"] = serde_json::json!(owner_pid);
         let mut bytes = serde_json::to_vec_pretty(&manifest).expect("serialize stale manifest");
         bytes.push(b'\n');
         std::fs::write(&manifest_path, bytes).expect("write stale pending-review manifest");

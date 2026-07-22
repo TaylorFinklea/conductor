@@ -21,7 +21,9 @@ use crate::plan::{
     ApprovalScope, ApprovalScopeKind, CyclePlan, ItemAuthorizationRecord, ProviderRouteRecord,
     ScopeSelector, item_authorization_hash,
 };
-use crate::run::{NewRun, RunHandle, RunJob, RunLimits, RunTarget, RunVerifier};
+use crate::run::{
+    NewRun, RosterSnapshotInput, RunHandle, RunJob, RunLimits, RunTarget, RunVerifier,
+};
 use crate::scan::{self, RepoSnapshot, SkipReason, ZeroState};
 use crate::state::{self, JournalEntry, JournalSummary};
 use crate::triage::{self, Flag, Plan, RatchetState, SkipCode};
@@ -242,6 +244,20 @@ pub(crate) fn run_dry_run_with_timestamps_scoped(
     state::write_journal(state_dir, &entry)
         .map_err(|e| CycleError::new(format!("journal: {e}")))?;
 
+    record_planned_consult_run(state_dir, &cycle_plan, &report_path, &resolved_roster)?;
+
+    Ok(CycleResult {
+        cycle_id: cycle_id.to_string(),
+        report_path,
+    })
+}
+
+fn record_planned_consult_run(
+    state_dir: &Path,
+    cycle_plan: &CyclePlan,
+    report_path: &Path,
+    resolved_roster: &crate::bursar::ResolvedRoster,
+) -> Result<(), CycleError> {
     let target_repo = if cycle_plan.approval_scope.repo_paths.len() == 1 {
         cycle_plan.approval_scope.repo_paths[0].clone()
     } else {
@@ -260,20 +276,24 @@ pub(crate) fn run_dry_run_with_timestamps_scoped(
                 path: resolved_roster.source_artifact.path.clone(),
                 sha256: resolved_roster.source_artifact.sha256.clone(),
             }),
+            roster_snapshot: Some(RosterSnapshotInput {
+                bytes: resolved_roster.snapshot_bytes.clone(),
+                policy_sha256: resolved_roster.policy_sha256.clone(),
+            }),
             limits: RunLimits::default(),
             verifier: RunVerifier::default(),
             ..NewRun::default()
         },
     )
     .map_err(|error| CycleError::new(format!("run artifact: {error}")))?;
-    let plan_path = state_dir.join("plans").join(format!("{cycle_id}.json"));
+    let plan_path = state_dir
+        .join("plans")
+        .join(format!("{}.json", cycle_plan.cycle_id));
+    let journal_path = state_dir.join("journal.json");
     let artifact_refs = [
-        (&plan_path, Path::new("artifacts/cycle-plan.json")),
-        (&report_path, Path::new("artifacts/report.json")),
-        (
-            &state_dir.join("journal.json"),
-            Path::new("artifacts/journal.json"),
-        ),
+        (plan_path.as_path(), Path::new("artifacts/cycle-plan.json")),
+        (report_path, Path::new("artifacts/report.json")),
+        (journal_path.as_path(), Path::new("artifacts/journal.json")),
     ]
     .into_iter()
     .map(|(source, destination)| run.capture_artifact(source, destination))
@@ -281,11 +301,7 @@ pub(crate) fn run_dry_run_with_timestamps_scoped(
     .map_err(|error| CycleError::new(format!("run artifact: {error}")))?;
     run.finish_with_artifacts("planned", artifact_refs)
         .map_err(|error| CycleError::new(format!("run artifact: {error}")))?;
-
-    Ok(CycleResult {
-        cycle_id: cycle_id.to_string(),
-        report_path,
-    })
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1654,6 +1670,19 @@ fallback = []
                 .as_str()
                 .unwrap()
                 .contains("alpha/deferred → terminal defer")
+        );
+
+        let consult_run = std::fs::read_dir(state.path().join("runs-v2"))
+            .expect("v2 runs directory")
+            .next()
+            .expect("consult run")
+            .expect("run entry")
+            .path();
+        let consult_manifest = crate::run::read_manifest(&consult_run.join("manifest.json"))
+            .expect("consult manifest");
+        assert!(
+            consult_manifest.roster_snapshot.is_some(),
+            "every prepared v2 run pins a copied Bursar roster snapshot"
         );
     }
 

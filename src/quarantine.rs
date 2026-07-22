@@ -1514,7 +1514,7 @@ pub(crate) fn most_recent_failed_run(
     if manifest.outcome.as_deref() == Some("verified") {
         return Ok(None);
     }
-    let before_head = manifest.work.and_then(|work| work.before_head);
+    let before_head = manifest.work().and_then(|work| work.before_head.clone());
     let attempt_started = run_has_readable_attempt_started_event(&root, &manifest.run_id);
     Ok(Some(AdoptableRun {
         run_id: manifest.run_id,
@@ -3283,7 +3283,7 @@ mod tests {
             .join("manifest.json");
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-        manifest["work"]["authorization_sha256"] = serde_json::json!("not-a-sha256");
+        manifest["details"]["state"]["authorization_sha256"] = serde_json::json!("not-a-sha256");
         std::fs::write(
             &manifest_path,
             serde_json::to_vec_pretty(&manifest).unwrap(),
