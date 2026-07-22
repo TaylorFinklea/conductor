@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -305,6 +306,15 @@ pub(crate) struct JobFallbackPolicy {
     pub(crate) fallback_profile_ids: Vec<String>,
 }
 
+/// One enabled Conductor-owned profile weight for an opaque capability role.
+/// Bursar supplies the profile's facts; this configuration owns selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoleBindingConfig {
+    pub(crate) role: String,
+    pub(crate) profile_id: String,
+    pub(crate) weight: NonZeroU32,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ScanConfig {
     pub(crate) root: String,
@@ -448,6 +458,9 @@ pub(crate) struct Config {
     /// Runtime retry policy keyed by Bursar profile IDs. This remains static
     /// Conductor policy and is resolved against each Bursar snapshot.
     pub(crate) job_fallbacks: Vec<JobFallbackPolicy>,
+    /// Conductor-owned enabled role/profile weights. Empty means role routing
+    /// is not configured and any caller must fail closed.
+    pub(crate) role_bindings: Vec<RoleBindingConfig>,
     /// Per-repo `[[repo_policy]]` entries; absent repos default to
     /// `CostPolicy::Proprietary` (fail closed for `FreeTrainsInput`).
     pub(crate) repo_policies: Vec<RepoPolicy>,
@@ -883,6 +896,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
                 | "verify"
                 | "review"
                 | "ratchet"
+                | "role_binding"
                 | "adversarial_review"
                 | "roster"
                 | "job_fallback"
@@ -900,6 +914,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
     let budgets = parse_budgets(doc.get("budgets"))?;
     let verify = parse_verify(doc.get("verify"))?;
     let review = parse_review(doc.get("review"))?;
+    let role_bindings = parse_role_bindings(doc.get("role_binding"))?;
     let ratchet = parse_ratchet(doc.get("ratchet"))?;
     let roster = parse_roster(doc.get("roster"))?;
     let job_fallbacks = parse_job_fallbacks(doc.get("job_fallback"))?;
@@ -915,6 +930,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
         adversarial_review,
         roster,
         job_fallbacks,
+        role_bindings,
         repo_policies,
     })
 }
@@ -1281,6 +1297,79 @@ fn parse_job_fallbacks(node: Option<&Node>) -> Result<Vec<JobFallbackPolicy>> {
         });
     }
     Ok(out)
+}
+
+fn parse_role_bindings(node: Option<&Node>) -> Result<Vec<RoleBindingConfig>> {
+    let entries = match node {
+        None => return Ok(Vec::new()),
+        Some(Node::Tables(entries)) => entries,
+        Some(_) => {
+            return Err(ConfigError::new(
+                "role_binding must be an array of tables ([[role_binding]])",
+            ));
+        }
+    };
+    let mut seen = HashSet::new();
+    let mut bindings = Vec::with_capacity(entries.len());
+    for (index, table) in entries.iter().enumerate() {
+        for key in table.keys() {
+            if !matches!(key.as_str(), "role" | "profile_id" | "weight" | "enabled") {
+                return Err(ConfigError::new(format!(
+                    "unknown role_binding key in entry {index}: {key}"
+                )));
+            }
+        }
+        let role = get_required_str_at("role_binding", table, index, "role")?;
+        let profile_id = get_required_str_at("role_binding", table, index, "profile_id")?;
+        if !is_opaque_identifier(&role) || !is_opaque_identifier(&profile_id) {
+            return Err(ConfigError::new(format!(
+                "role_binding entry {index} role and profile_id must be opaque identifiers"
+            )));
+        }
+        let weight = NonZeroU32::new(expect_u32(
+            "role_binding.weight",
+            table.get("weight").ok_or_else(|| {
+                ConfigError::new(format!("role_binding entry {index} missing weight"))
+            })?,
+        )?)
+        .ok_or_else(|| {
+            ConfigError::new(format!(
+                "role_binding entry {index} weight must be a nonzero u32"
+            ))
+        })?;
+        let enabled = match table.get("enabled") {
+            Some(value) => expect_bool("role_binding.enabled", value)?,
+            None => {
+                return Err(ConfigError::new(format!(
+                    "role_binding entry {index} missing enabled"
+                )));
+            }
+        };
+        if !enabled {
+            return Err(ConfigError::new(format!(
+                "role_binding entry {index} must be enabled"
+            )));
+        }
+        if !seen.insert((role.clone(), profile_id.clone())) {
+            return Err(ConfigError::new(format!(
+                "duplicate role_binding role/profile_id: {role}/{profile_id}"
+            )));
+        }
+        bindings.push(RoleBindingConfig {
+            role,
+            profile_id,
+            weight,
+        });
+    }
+    Ok(bindings)
+}
+
+fn is_opaque_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn parse_reasoning_effort(

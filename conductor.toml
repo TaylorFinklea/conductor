@@ -83,6 +83,27 @@ always_orchestra = false
 enabled = true
 min_tier_gap = 1
 
+# Generic Conductor-owned role routing. IDs are opaque Bursar profile labels;
+# Bursar retains capability and eligibility ownership, while these weights
+# control the enabled `plan` pool. Weights are relative, not percentages.
+[[role_binding]]
+role = "plan"
+profile_id = "openai-codex--omp--gpt-5.6-sol--xhigh"
+weight = 60
+enabled = true
+
+[[role_binding]]
+role = "plan"
+profile_id = "anthropic--omp--claude-opus-4-8--max"
+weight = 20
+enabled = true
+
+[[role_binding]]
+role = "plan"
+profile_id = "opencode-go--omp--kimi-k3--max"
+weight = 20
+enabled = true
+
 [adversarial_review]
 # N provider-distinct reviewers plus one additional Lead synthesis profile.
 max_reviewers = 7

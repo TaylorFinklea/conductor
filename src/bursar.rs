@@ -156,53 +156,53 @@ pub(crate) struct RosterSnapshot {
     generated_at: String,
     source_artifact: RosterSourceArtifact,
     policy_sha256: String,
-    providers: Vec<RosterProvider>,
-    profiles: Vec<RosterProfile>,
+    pub(crate) providers: Vec<RosterProvider>,
+    pub(crate) profiles: Vec<RosterProfile>,
     #[serde(skip)]
     bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RosterProvider {
-    provider_id: String,
-    availability_key: String,
-    enabled: bool,
-    state: String,
-    availability: Availability,
-    checked_at: String,
+pub(crate) struct RosterProvider {
+    pub(crate) provider_id: String,
+    pub(crate) availability_key: String,
+    pub(crate) enabled: bool,
+    pub(crate) state: String,
+    pub(crate) availability: Availability,
+    pub(crate) checked_at: String,
     #[serde(default, deserialize_with = "deserialize_nullable")]
-    data_as_of: Option<String>,
+    pub(crate) data_as_of: Option<String>,
     #[serde(default, deserialize_with = "deserialize_nullable")]
-    expires_at: Option<String>,
+    pub(crate) expires_at: Option<String>,
     #[serde(default, deserialize_with = "deserialize_nullable")]
-    reason: Option<String>,
-    eligible: bool,
+    pub(crate) reason: Option<String>,
+    pub(crate) eligible: bool,
     #[serde(default, deserialize_with = "deserialize_nullable")]
-    ineligibility_reason: Option<String>,
+    pub(crate) ineligibility_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RosterProfile {
-    profile_id: String,
-    provider_id: String,
-    model: String,
-    harness: String,
-    dispatch_id: String,
+pub(crate) struct RosterProfile {
+    pub(crate) profile_id: String,
+    pub(crate) provider_id: String,
+    pub(crate) model: String,
+    pub(crate) harness: String,
+    pub(crate) dispatch_id: String,
     #[serde(default, deserialize_with = "deserialize_nullable")]
-    reasoning_effort: Option<String>,
-    tier: String,
-    ceiling: String,
-    efficiency: String,
-    cost: f64,
-    data_policy: String,
-    enabled: bool,
-    roles: Vec<String>,
-    state: String,
-    eligible: bool,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) tier: String,
+    pub(crate) ceiling: String,
+    pub(crate) efficiency: String,
+    pub(crate) cost: f64,
+    pub(crate) data_policy: String,
+    pub(crate) enabled: bool,
+    pub(crate) roles: Vec<String>,
+    pub(crate) state: String,
+    pub(crate) eligible: bool,
     #[serde(default, deserialize_with = "deserialize_nullable")]
-    ineligibility_reason: Option<String>,
+    pub(crate) ineligibility_reason: Option<String>,
 }
 
 /// Parses, authenticates, and validates a `bursar/roster@2` snapshot before
