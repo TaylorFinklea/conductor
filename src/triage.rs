@@ -559,6 +559,7 @@ mod tests {
             use_bursar: true,
             unknown_429_cooldown_mins: 15,
             item_wall_clock_mins: 45,
+            max_plan_revisions: 1,
             review_resume_budget_mins: None,
             cycle_wall_clock_mins: 90,
             authorized_legacy_run_ids: Vec::new(),

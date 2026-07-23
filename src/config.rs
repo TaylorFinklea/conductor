@@ -344,6 +344,9 @@ pub(crate) struct Budgets {
     pub(crate) use_bursar: bool,
     pub(crate) unknown_429_cooldown_mins: u32,
     pub(crate) item_wall_clock_mins: u32,
+    /// Upper bound for plan peer-requested revisions; the CLI may choose a
+    /// lower value but can never widen this configured hard limit.
+    pub(crate) max_plan_revisions: u8,
     /// A fresh review-only budget available to an explicitly resumed
     /// pending-review run. `None` is fail-closed: resume may inspect but not
     /// spawn a reviewer.
@@ -367,6 +370,7 @@ impl Default for Budgets {
             use_bursar: true,
             unknown_429_cooldown_mins: 15,
             item_wall_clock_mins: 45,
+            max_plan_revisions: 1,
             review_resume_budget_mins: None,
             cycle_wall_clock_mins: 90,
             authorized_legacy_run_ids: Vec::new(),
@@ -1094,6 +1098,16 @@ fn parse_budgets(node: Option<&Node>) -> Result<Budgets> {
             }
             "item_wall_clock_mins" => {
                 b.item_wall_clock_mins = expect_u32("budgets.item_wall_clock_mins", val)?;
+            }
+            "max_plan_revisions" => {
+                let value = expect_u32("budgets.max_plan_revisions", val)?;
+                b.max_plan_revisions = u8::try_from(value)
+                    .map_err(|_| ConfigError::new("budgets.max_plan_revisions must be in 0..=3"))?;
+                if b.max_plan_revisions > 3 {
+                    return Err(ConfigError::new(
+                        "budgets.max_plan_revisions must be in 0..=3",
+                    ));
+                }
             }
             "review_resume_budget_mins" => {
                 let minutes = expect_u32("budgets.review_resume_budget_mins", val)?;

@@ -263,6 +263,68 @@ fn canonical_document_json(document: &PlanDocument) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("failed to serialize plan document: {error}"))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerReviewWire {
+    schema: String,
+    verdict: String,
+    findings: Vec<PlanFinding>,
+}
+
+fn parse_peer_review(bytes: &[u8]) -> Result<(crate::run::PeerVerdict, Vec<PlanFinding>), String> {
+    let review: PeerReviewWire = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid plan peer-review JSON: {error}"))?;
+    if review.schema != "conductor/plan-peer-review@1" {
+        return Err("plan peer-review schema must be conductor/plan-peer-review@1".to_string());
+    }
+    for finding in &review.findings {
+        if !valid_identifier(&finding.id)
+            || !matches!(
+                finding.severity.as_str(),
+                "low" | "medium" | "high" | "critical"
+            )
+            || finding.location.trim().is_empty()
+            || finding.problem.trim().is_empty()
+            || finding.required_change.trim().is_empty()
+        {
+            return Err("plan peer-review finding is malformed".to_string());
+        }
+    }
+    match review.verdict.as_str() {
+        "approve" if review.findings.is_empty() => {
+            Ok((crate::run::PeerVerdict::Approve, Vec::new()))
+        }
+        "approve" => Err("approved plan peer-review must not include findings".to_string()),
+        "revise" if !review.findings.is_empty() => {
+            Ok((crate::run::PeerVerdict::Revise, review.findings))
+        }
+        "revise" => Err("revise plan peer-review requires findings".to_string()),
+        _ => Err("plan peer-review verdict must be approve or revise".to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecondOpinionWire {
+    schema: String,
+    verdict: String,
+}
+
+fn parse_second_opinion(bytes: &[u8]) -> Result<crate::run::SecondOpinionVerdict, String> {
+    let opinion: SecondOpinionWire = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid plan second-opinion JSON: {error}"))?;
+    if opinion.schema != "conductor/plan-second-opinion@1" {
+        return Err(
+            "plan second-opinion schema must be conductor/plan-second-opinion@1".to_string(),
+        );
+    }
+    match opinion.verdict.as_str() {
+        "accept" => Ok(crate::run::SecondOpinionVerdict::Accept),
+        "reject" => Ok(crate::run::SecondOpinionVerdict::Reject),
+        _ => Err("plan second-opinion verdict must be accept or reject".to_string()),
+    }
+}
+
 fn render_markdown(document: &PlanDocument) -> String {
     let mut markdown = String::new();
     match document {
@@ -368,10 +430,19 @@ pub(crate) struct PlanJobPaths {
     pub(crate) reports_home: PathBuf,
 }
 
-/// A planner invocation deliberately accepts only a disposable worktree and
-/// returns bytes; it cannot receive authority to mutate the target checkout.
+/// A plan executor receives only an isolated authoring request or the blinded
+/// review material for the bounded stage it is authorized to perform.
 pub(crate) trait PlanAuthor {
     fn author(&self, request: &PlanAuthorRequest) -> Result<Vec<u8>, String>;
+    fn revise(&self, _request: &PlanRevisionRequest) -> Result<Vec<u8>, String> {
+        Err("plan executor has no revision capability".to_string())
+    }
+    fn peer_review(&self, _request: &PlanPeerReviewRequest) -> Result<Vec<u8>, String> {
+        Err("plan executor has no peer-review capability".to_string())
+    }
+    fn second_opinion(&self, _request: &PlanSecondOpinionRequest) -> Result<Vec<u8>, String> {
+        Err("plan executor has no second-opinion capability".to_string())
+    }
 }
 
 /// Immutable author invocation context.
@@ -382,6 +453,52 @@ pub(crate) struct PlanAuthorRequest {
     pub(crate) output_kind: PlanOutputKind,
     pub(crate) execution: crate::run::ApprovedExecution,
     pub(crate) profile: crate::bursar::RosterProfile,
+}
+
+/// Blind peer-review context. It deliberately has no author identity and no
+/// prior verdict: only the target, rubric, and canonical plan are visible.
+#[derive(Debug, Clone)]
+pub(crate) struct PlanPeerReviewRequest {
+    pub(crate) worktree: PathBuf,
+    pub(crate) target: crate::run::PlanTarget,
+    pub(crate) rubric: String,
+    pub(crate) canonical_plan: Vec<u8>,
+    pub(crate) execution: crate::run::ApprovedExecution,
+    pub(crate) profile: crate::bursar::RosterProfile,
+}
+
+/// A revision returns the peer's strict findings and the previous canonical
+/// artifact to the same immutable author in an isolated worktree.
+#[derive(Debug, Clone)]
+pub(crate) struct PlanRevisionRequest {
+    pub(crate) worktree: PathBuf,
+    pub(crate) prior_plan: Vec<u8>,
+    pub(crate) findings: Vec<PlanFinding>,
+    pub(crate) output_kind: PlanOutputKind,
+    pub(crate) execution: crate::run::ApprovedExecution,
+    pub(crate) profile: crate::bursar::RosterProfile,
+}
+
+/// Final spec opinion context. It excludes both author identity and peer
+/// verdict, leaving only the target and accepted canonical artifact.
+#[derive(Debug, Clone)]
+pub(crate) struct PlanSecondOpinionRequest {
+    pub(crate) worktree: PathBuf,
+    pub(crate) target: crate::run::PlanTarget,
+    pub(crate) canonical_plan: Vec<u8>,
+    pub(crate) execution: crate::run::ApprovedExecution,
+    pub(crate) profile: crate::bursar::RosterProfile,
+}
+
+/// Typed peer finding returned from the strict review wire format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanFinding {
+    pub(crate) id: String,
+    pub(crate) severity: String,
+    pub(crate) location: String,
+    pub(crate) problem: String,
+    pub(crate) required_change: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,6 +549,14 @@ pub(crate) fn prepare<C: crate::bursar::BursarClient + ?Sized>(
     bursar: &C,
     request: PlanPrepareRequest,
 ) -> Result<PreparedPlan, String> {
+    let require_second_opinion =
+        request.output_kind == PlanOutputKind::Spec || request.require_second_opinion;
+    if request.max_plan_revisions > config.budgets.max_plan_revisions {
+        return Err(format!(
+            "plan revision request {} exceeds configured maximum {}",
+            request.max_plan_revisions, config.budgets.max_plan_revisions
+        ));
+    }
     let repo = canonical_repo(&request.repo)?;
     let (target_head, target_status) = git_identity(&repo)?;
     if !target_status.is_empty() {
@@ -460,7 +585,7 @@ pub(crate) fn prepare<C: crate::bursar::BursarClient + ?Sized>(
     let role = crate::role_routing::RoleId::new("plan")
         .map_err(|error| format!("planner role: {error}"))?;
     router
-        .validate_preapproval_contingencies(&role, &constraints, request.require_second_opinion)
+        .validate_preapproval_contingencies(&role, &constraints, require_second_opinion)
         .map_err(|error| format!("plan peer contingency: {error}"))?;
     let prepared = router
         .prepare_planner(
@@ -490,7 +615,7 @@ pub(crate) fn prepare<C: crate::bursar::BursarClient + ?Sized>(
         author: prepared.selected.clone(),
         approval_block_id: "dispatch-plan".to_string(),
         approval_watermark: approval_watermark.clone(),
-        require_second_opinion: request.require_second_opinion,
+        require_second_opinion,
     };
     let input_bytes = captured_input_bytes;
     let target = crate::run::PlanTarget {
@@ -501,6 +626,7 @@ pub(crate) fn prepare<C: crate::bursar::BursarClient + ?Sized>(
         target,
         routes: plan_routes,
         progress: crate::run::PlanProgress::Prepared,
+        stage_attempts: crate::run::PlanStageAttempts::default(),
         revision_limit,
         stage_attempt_limit,
     };
@@ -759,12 +885,18 @@ fn planned_routes(prepared: &crate::role_routing::PreparedPlanner) -> crate::run
                 capability_role: "plan".to_string(),
                 candidates: planner_candidates,
                 provider_distinct_from: Vec::new(),
+                constraints: crate::run::PlanStageConstraints::unconstrained(),
             },
             crate::run::PlanStageRoute {
                 stage: crate::run::PlanStage::PeerReview,
                 capability_role: "plan".to_string(),
                 candidates: candidates.clone(),
-                provider_distinct_from: vec![crate::run::PlanStage::Planner],
+                provider_distinct_from: Vec::new(),
+                constraints: crate::run::PlanStageConstraints {
+                    distinct_execution_from: vec![crate::run::PlanStage::Planner],
+                    tier_at_least: vec![crate::run::PlanStage::Planner],
+                    provider_diversity: crate::run::PlanProviderDiversity::CrossProviderOrDegraded,
+                },
             },
             crate::run::PlanStageRoute {
                 stage: crate::run::PlanStage::SecondOpinion,
@@ -774,6 +906,14 @@ fn planned_routes(prepared: &crate::role_routing::PreparedPlanner) -> crate::run
                     crate::run::PlanStage::Planner,
                     crate::run::PlanStage::PeerReview,
                 ],
+                constraints: crate::run::PlanStageConstraints {
+                    distinct_execution_from: vec![
+                        crate::run::PlanStage::Planner,
+                        crate::run::PlanStage::PeerReview,
+                    ],
+                    tier_at_least: vec![crate::run::PlanStage::Planner],
+                    provider_diversity: crate::run::PlanProviderDiversity::PairwiseDistinct,
+                },
             },
         ],
     }
@@ -802,9 +942,6 @@ where
     let plan = run.plan().map_err(|error| error.to_string())?;
     if plan.target.repo != run.manifest().target.repo {
         return Err("plan manifest target does not match structural plan target".to_string());
-    }
-    if matches!(plan.progress, crate::run::PlanProgress::AwaitingPeer { .. }) {
-        return Ok(());
     }
     if matches!(plan.progress, crate::run::PlanProgress::Terminal { .. }) {
         return Err("terminal plan runs cannot be dispatched".to_string());
@@ -851,6 +988,21 @@ where
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| format!("plan run guard: {error}"))?;
+    if matches!(
+        run.plan().map_err(|error| error.to_string())?.progress,
+        crate::run::PlanProgress::AwaitingPeer { .. }
+            | crate::run::PlanProgress::Revising { .. }
+            | crate::run::PlanProgress::AwaitingSecondOpinion { .. }
+    ) {
+        return dispatch_review_stages(
+            &mut run,
+            bursar,
+            author,
+            &captured_snapshot,
+            &repo,
+            &approval,
+        );
+    }
     let planner_candidates = planner_candidates(run.plan().map_err(|error| error.to_string())?)?;
     let selected = match run
         .plan()
@@ -911,6 +1063,21 @@ where
     let profile = profile_for_execution(&captured_snapshot, &selected)?;
     run.record_plan_author_attempt()
         .map_err(|error| format!("plan author attempt: {error}"))?;
+    let author_attempt = run
+        .plan()
+        .map_err(|error| error.to_string())?
+        .stage_attempts
+        .planner;
+    append_plan_invocation(
+        &mut run,
+        crate::run::EventKind::AttemptStarted,
+        crate::run::PlanStage::Planner,
+        &selected,
+        &input_bytes,
+        None,
+        author_attempt,
+        "started",
+    )?;
     let output = with_isolated_worktree(&repo, &approval.target_head, |worktree| {
         author.author(&PlanAuthorRequest {
             worktree: worktree.to_path_buf(),
@@ -925,6 +1092,21 @@ where
         Err(first_error) => {
             run.record_plan_author_attempt()
                 .map_err(|error| format!("plan author repair attempt: {error}"))?;
+            let repair_attempt = run
+                .plan()
+                .map_err(|error| error.to_string())?
+                .stage_attempts
+                .planner;
+            append_plan_invocation(
+                &mut run,
+                crate::run::EventKind::AttemptStarted,
+                crate::run::PlanStage::Planner,
+                &selected,
+                &input_bytes,
+                None,
+                repair_attempt,
+                "started",
+            )?;
             let repair = with_isolated_worktree(&repo, &approval.target_head, |worktree| {
                 author.author(&PlanAuthorRequest {
                     worktree: worktree.to_path_buf(),
@@ -940,6 +1122,21 @@ where
         }
     };
     let canonical = canonical_document_json(&document)?;
+    let author_attempt = run
+        .plan()
+        .map_err(|error| error.to_string())?
+        .stage_attempts
+        .planner;
+    append_plan_invocation(
+        &mut run,
+        crate::run::EventKind::AttemptFinished,
+        crate::run::PlanStage::Planner,
+        &selected,
+        &input_bytes,
+        Some(&canonical),
+        author_attempt,
+        "returned",
+    )?;
     let json = run
         .capture_plan_artifact(Path::new("artifacts/plan-document.json"), &canonical)
         .map_err(|error| format!("plan JSON artifact: {error}"))?;
@@ -955,7 +1152,531 @@ where
             .map_err(|error| format!("plan needs-input checkpoint: {error}"))
     } else {
         run.await_plan_peer(json)
-            .map_err(|error| format!("plan peer checkpoint: {error}"))
+            .map_err(|error| format!("plan peer checkpoint: {error}"))?;
+        dispatch_review_stages(
+            &mut run,
+            bursar,
+            author,
+            &captured_snapshot,
+            &repo,
+            &approval,
+        )
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "each persisted plan review stage keeps its binding, provider, and artifact gates explicit"
+)]
+fn dispatch_review_stages<C, A>(
+    run: &mut crate::run::RunHandle,
+    bursar: &C,
+    executor: &A,
+    snapshot: &crate::bursar::RosterSnapshot,
+    repo: &Path,
+    approval: &PlanApproval,
+) -> Result<(), String>
+where
+    C: crate::bursar::BursarClient + ?Sized,
+    A: PlanAuthor + ?Sized,
+{
+    loop {
+        match run
+            .plan()
+            .map_err(|error| error.to_string())?
+            .progress
+            .clone()
+        {
+            crate::run::PlanProgress::Terminal { .. } => return Ok(()),
+            crate::run::PlanProgress::AwaitingPeer {
+                author,
+                peer,
+                artifact,
+                ..
+            } => {
+                let (reviewer, degraded) = match peer {
+                    Some(bound) => {
+                        if let Err(error) = recheck_author(bursar, &bound) {
+                            run.finish_plan_blocked().map_err(|checkpoint| {
+                                format!("plan blocked after bound peer loss: {checkpoint}")
+                            })?;
+                            return Err(format!("bound plan peer is no longer eligible: {error}"));
+                        }
+                        (bound, false)
+                    }
+                    None => select_reviewer(
+                        bursar,
+                        run.plan().map_err(|error| error.to_string())?,
+                        snapshot,
+                        crate::run::PlanStage::PeerReview,
+                        &author,
+                        None,
+                    )?,
+                };
+                let profile = profile_for_execution(snapshot, &reviewer)?;
+                let canonical_plan = plan_artifact_bytes(run, &artifact)?;
+                let attempt = run
+                    .record_plan_stage_attempt(crate::run::PlanStage::PeerReview)
+                    .map_err(|error| format!("plan peer attempt: {error}"))?;
+                append_plan_invocation(
+                    run,
+                    crate::run::EventKind::AttemptStarted,
+                    crate::run::PlanStage::PeerReview,
+                    &reviewer,
+                    &canonical_plan,
+                    None,
+                    attempt,
+                    "started",
+                )?;
+                recheck_author(bursar, &reviewer)?;
+                let first = with_isolated_worktree(repo, &approval.target_head, |worktree| {
+                    executor.peer_review(&PlanPeerReviewRequest {
+                        worktree: worktree.to_path_buf(),
+                        target: run
+                            .plan()
+                            .map_err(|error| error.to_string())?
+                            .target
+                            .clone(),
+                        rubric: peer_rubric(approval.output_kind),
+                        canonical_plan: canonical_plan.clone(),
+                        execution: reviewer.clone(),
+                        profile: profile.clone(),
+                    })
+                })?;
+                let (review_bytes, verdict, _findings, final_attempt) = match parse_peer_review(
+                    &first,
+                ) {
+                    Ok((verdict, findings)) => (first, verdict, findings, attempt),
+                    Err(first_error) => {
+                        let repair_attempt = run
+                            .record_plan_stage_attempt(crate::run::PlanStage::PeerReview)
+                            .map_err(|error| format!("plan peer repair attempt: {error}"))?;
+                        append_plan_invocation(
+                            run,
+                            crate::run::EventKind::AttemptStarted,
+                            crate::run::PlanStage::PeerReview,
+                            &reviewer,
+                            &canonical_plan,
+                            None,
+                            repair_attempt,
+                            "started",
+                        )?;
+                        recheck_author(bursar, &reviewer)?;
+                        let repair =
+                            with_isolated_worktree(repo, &approval.target_head, |worktree| {
+                                executor.peer_review(&PlanPeerReviewRequest {
+                                    worktree: worktree.to_path_buf(),
+                                    target: run
+                                        .plan()
+                                        .map_err(|error| error.to_string())?
+                                        .target
+                                        .clone(),
+                                    rubric: peer_rubric(approval.output_kind),
+                                    canonical_plan,
+                                    execution: reviewer.clone(),
+                                    profile,
+                                })
+                            })?;
+                        let (verdict, findings) =
+                                parse_peer_review(&repair).map_err(|second_error| {
+                                    format!(
+                                        "plan peer output invalid after repair: {first_error}; {second_error}"
+                                    )
+                                })?;
+                        (repair, verdict, findings, repair_attempt)
+                    }
+                };
+                let evidence_input = plan_artifact_bytes(run, &artifact)?;
+                append_plan_invocation(
+                    run,
+                    crate::run::EventKind::AttemptFinished,
+                    crate::run::PlanStage::PeerReview,
+                    &reviewer,
+                    &evidence_input,
+                    Some(&review_bytes),
+                    final_attempt,
+                    "returned",
+                )?;
+                run.capture_plan_artifact(
+                    Path::new(&format!("artifacts/peer-review-{final_attempt}.json")),
+                    &review_bytes,
+                )
+                .map_err(|error| format!("plan peer artifact: {error}"))?;
+                if degraded {
+                    run.append_event(
+                        crate::run::EventKind::CoverageGap,
+                        crate::run::EventInput {
+                            profile_id: Some(reviewer.profile_id.clone()),
+                            outcome: Some("peer_provider_diversity_degraded".to_string()),
+                            ..crate::run::EventInput::default()
+                        },
+                    )
+                    .map_err(|error| format!("plan peer degradation event: {error}"))?;
+                }
+                run.record_plan_peer_verdict(reviewer, verdict, approval.require_second_opinion)
+                    .map_err(|error| format!("plan peer verdict checkpoint: {error}"))?;
+            }
+            crate::run::PlanProgress::Revising {
+                author,
+                peer: _,
+                artifact,
+                ..
+            } => {
+                recheck_author(bursar, &author).map_err(|error| {
+                    let _ = run.finish_plan_blocked();
+                    format!("immutable plan author is no longer eligible for revision: {error}")
+                })?;
+                let profile = profile_for_execution(snapshot, &author)?;
+                let prior_plan = plan_artifact_bytes(run, &artifact)?;
+                let peer_attempt = run
+                    .plan()
+                    .map_err(|error| error.to_string())?
+                    .stage_attempts
+                    .peer_review;
+                let peer_bytes = std::fs::read(
+                    run.dir()
+                        .join(format!("artifacts/peer-review-{peer_attempt}.json")),
+                )
+                .map_err(|error| format!("captured plan peer findings: {error}"))?;
+                let (verdict, findings) = parse_peer_review(&peer_bytes)?;
+                if !matches!(verdict, crate::run::PeerVerdict::Revise) {
+                    return Err("revision state has no persisted revise findings".to_string());
+                }
+                let attempt = run
+                    .record_plan_stage_attempt(crate::run::PlanStage::Planner)
+                    .map_err(|error| format!("plan revision attempt: {error}"))?;
+                append_plan_invocation(
+                    run,
+                    crate::run::EventKind::AttemptStarted,
+                    crate::run::PlanStage::Planner,
+                    &author,
+                    &prior_plan,
+                    None,
+                    attempt,
+                    "started",
+                )?;
+                recheck_author(bursar, &author)?;
+                let first = with_isolated_worktree(repo, &approval.target_head, |worktree| {
+                    executor.revise(&PlanRevisionRequest {
+                        worktree: worktree.to_path_buf(),
+                        prior_plan: prior_plan.clone(),
+                        findings: findings.clone(),
+                        output_kind: approval.output_kind,
+                        execution: author.clone(),
+                        profile: profile.clone(),
+                    })
+                })?;
+                let (document, final_attempt) = match parse_document(approval.output_kind, &first) {
+                    Ok(document) => (document, attempt),
+                    Err(first_error) => {
+                        let repair_attempt = run
+                            .record_plan_stage_attempt(crate::run::PlanStage::Planner)
+                            .map_err(|error| format!("plan revision repair attempt: {error}"))?;
+                        append_plan_invocation(
+                            run,
+                            crate::run::EventKind::AttemptStarted,
+                            crate::run::PlanStage::Planner,
+                            &author,
+                            &prior_plan,
+                            None,
+                            repair_attempt,
+                            "started",
+                        )?;
+                        recheck_author(bursar, &author)?;
+                        let repair =
+                            with_isolated_worktree(repo, &approval.target_head, |worktree| {
+                                executor.revise(&PlanRevisionRequest {
+                                    worktree: worktree.to_path_buf(),
+                                    prior_plan,
+                                    findings,
+                                    output_kind: approval.output_kind,
+                                    execution: author.clone(),
+                                    profile,
+                                })
+                            })?;
+                        (
+                            parse_document(approval.output_kind, &repair).map_err(
+                                |second_error| {
+                                    format!(
+                                        "plan revision output invalid after repair: {first_error}; {second_error}"
+                                    )
+                                },
+                            )?,
+                            repair_attempt,
+                        )
+                    }
+                };
+                let canonical = canonical_document_json(&document)?;
+                let evidence_input = plan_artifact_bytes(run, &artifact)?;
+                append_plan_invocation(
+                    run,
+                    crate::run::EventKind::AttemptFinished,
+                    crate::run::PlanStage::Planner,
+                    &author,
+                    &evidence_input,
+                    Some(&canonical),
+                    final_attempt,
+                    "returned",
+                )?;
+                let json = run
+                    .capture_plan_artifact(
+                        Path::new(&format!("artifacts/plan-revision-{final_attempt}.json")),
+                        &canonical,
+                    )
+                    .map_err(|error| format!("plan revision JSON artifact: {error}"))?;
+                run.capture_plan_artifact(
+                    Path::new(&format!("artifacts/plan-revision-{final_attempt}.md")),
+                    render_markdown(&document).as_bytes(),
+                )
+                .map_err(|error| format!("plan revision Markdown artifact: {error}"))?;
+                let (head, status) = git_identity(repo)?;
+                if head != approval.target_head || status != approval.target_status {
+                    return Err(
+                        "plan revision changed target repository HEAD or status".to_string()
+                    );
+                }
+                run.complete_plan_revision(json)
+                    .map_err(|error| format!("plan revision checkpoint: {error}"))?;
+            }
+            crate::run::PlanProgress::AwaitingSecondOpinion {
+                author,
+                peer,
+                artifact,
+                ..
+            } => {
+                let (reviewer, _) = select_reviewer(
+                    bursar,
+                    run.plan().map_err(|error| error.to_string())?,
+                    snapshot,
+                    crate::run::PlanStage::SecondOpinion,
+                    &author,
+                    Some(&peer),
+                )?;
+                let profile = profile_for_execution(snapshot, &reviewer)?;
+                let canonical_plan = plan_artifact_bytes(run, &artifact)?;
+                let attempt = run
+                    .record_plan_stage_attempt(crate::run::PlanStage::SecondOpinion)
+                    .map_err(|error| format!("plan second-opinion attempt: {error}"))?;
+                append_plan_invocation(
+                    run,
+                    crate::run::EventKind::AttemptStarted,
+                    crate::run::PlanStage::SecondOpinion,
+                    &reviewer,
+                    &canonical_plan,
+                    None,
+                    attempt,
+                    "started",
+                )?;
+                recheck_author(bursar, &reviewer)?;
+                let first = with_isolated_worktree(repo, &approval.target_head, |worktree| {
+                    executor.second_opinion(&PlanSecondOpinionRequest {
+                        worktree: worktree.to_path_buf(),
+                        target: run
+                            .plan()
+                            .map_err(|error| error.to_string())?
+                            .target
+                            .clone(),
+                        canonical_plan: canonical_plan.clone(),
+                        execution: reviewer.clone(),
+                        profile: profile.clone(),
+                    })
+                })?;
+                let (opinion_bytes, verdict, final_attempt) = match parse_second_opinion(&first) {
+                    Ok(verdict) => (first, verdict, attempt),
+                    Err(first_error) => {
+                        let repair_attempt = run
+                            .record_plan_stage_attempt(crate::run::PlanStage::SecondOpinion)
+                            .map_err(|error| {
+                                format!("plan second-opinion repair attempt: {error}")
+                            })?;
+                        append_plan_invocation(
+                            run,
+                            crate::run::EventKind::AttemptStarted,
+                            crate::run::PlanStage::SecondOpinion,
+                            &reviewer,
+                            &canonical_plan,
+                            None,
+                            repair_attempt,
+                            "started",
+                        )?;
+                        recheck_author(bursar, &reviewer)?;
+                        let repair =
+                            with_isolated_worktree(repo, &approval.target_head, |worktree| {
+                                executor.second_opinion(&PlanSecondOpinionRequest {
+                                    worktree: worktree.to_path_buf(),
+                                    target: run
+                                        .plan()
+                                        .map_err(|error| error.to_string())?
+                                        .target
+                                        .clone(),
+                                    canonical_plan,
+                                    execution: reviewer.clone(),
+                                    profile,
+                                })
+                            })?;
+                        let verdict = parse_second_opinion(&repair).map_err(|second_error| {
+                            format!(
+                                "plan second-opinion output invalid after repair: {first_error}; {second_error}"
+                            )
+                        })?;
+                        (repair, verdict, repair_attempt)
+                    }
+                };
+                let evidence_input = plan_artifact_bytes(run, &artifact)?;
+                append_plan_invocation(
+                    run,
+                    crate::run::EventKind::AttemptFinished,
+                    crate::run::PlanStage::SecondOpinion,
+                    &reviewer,
+                    &evidence_input,
+                    Some(&opinion_bytes),
+                    final_attempt,
+                    "returned",
+                )?;
+                run.capture_plan_artifact(
+                    Path::new(&format!("artifacts/second-opinion-{final_attempt}.json")),
+                    &opinion_bytes,
+                )
+                .map_err(|error| format!("plan second-opinion artifact: {error}"))?;
+                run.record_plan_second_opinion(reviewer, verdict)
+                    .map_err(|error| format!("plan second-opinion checkpoint: {error}"))?;
+            }
+            crate::run::PlanProgress::Prepared
+            | crate::run::PlanProgress::Authoring { .. }
+            | crate::run::PlanProgress::Blocked { .. } => {
+                return Err("plan review stages require a completed author artifact".to_string());
+            }
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the append boundary records the complete fixed invocation evidence tuple"
+)]
+fn append_plan_invocation(
+    run: &mut crate::run::RunHandle,
+    kind: crate::run::EventKind,
+    stage: crate::run::PlanStage,
+    execution: &crate::run::ApprovedExecution,
+    input: &[u8],
+    output: Option<&[u8]>,
+    attempt: u8,
+    outcome: &str,
+) -> Result<(), String> {
+    run.append_event(
+        kind,
+        crate::run::EventInput {
+            profile_id: Some(execution.profile_id.clone()),
+            outcome: Some(outcome.to_string()),
+            plan_invocation: Some(crate::run::PlanInvocationEvidence {
+                role: "plan".to_string(),
+                stage,
+                execution: execution.clone(),
+                input_sha256: format!("{:x}", Sha256::digest(input)),
+                output_sha256: output.map(|bytes| format!("{:x}", Sha256::digest(bytes))),
+                attempt,
+                duration_ms: None,
+                tokens: None,
+            }),
+            ..crate::run::EventInput::default()
+        },
+    )
+    .map_err(|error| format!("plan invocation evidence: {error}"))
+}
+
+fn plan_artifact_bytes(
+    run: &crate::run::RunHandle,
+    artifact: &crate::run::ArtifactRef,
+) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(run.dir().join(&artifact.path))
+        .map_err(|error| format!("captured plan artifact: {error}"))?;
+    if format!("{:x}", Sha256::digest(&bytes)) != artifact.sha256 {
+        return Err("captured plan artifact digest changed".to_string());
+    }
+    Ok(bytes)
+}
+
+fn peer_rubric(kind: PlanOutputKind) -> String {
+    format!(
+        "Review this {} for correctness, completeness, executable acceptance criteria, and target safety. Return only strict conductor/plan-peer-review@1 JSON.",
+        kind.label()
+    )
+}
+
+fn select_reviewer<C: crate::bursar::BursarClient + ?Sized>(
+    bursar: &C,
+    plan: &crate::run::PlanRunDetails,
+    snapshot: &crate::bursar::RosterSnapshot,
+    stage: crate::run::PlanStage,
+    author: &crate::run::ApprovedExecution,
+    peer: Option<&crate::run::ApprovedExecution>,
+) -> Result<(crate::run::ApprovedExecution, bool), String> {
+    let route = plan
+        .routes
+        .stages
+        .iter()
+        .find(|route| route.stage == stage)
+        .ok_or_else(|| "plan authorization omits required reviewer route".to_string())?;
+    let author_tier = execution_tier(snapshot, author)?;
+    let mut live = Vec::new();
+    for candidate in &route.candidates {
+        if candidate.execution_key == author.execution_key
+            || peer.is_some_and(|known| candidate.execution_key == known.execution_key)
+            || execution_tier(snapshot, candidate)? < author_tier
+        {
+            continue;
+        }
+        if recheck_author(bursar, candidate).is_ok() {
+            live.push(candidate.clone());
+        }
+    }
+    if live.is_empty() {
+        return Err("no approved distinct reviewer candidate is currently eligible".to_string());
+    }
+    match route.constraints.provider_diversity {
+        crate::run::PlanProviderDiversity::None => Ok((live.remove(0), false)),
+        crate::run::PlanProviderDiversity::CrossProviderOrDegraded => {
+            if let Some(candidate) = live
+                .iter()
+                .find(|candidate| candidate.provider_id != author.provider_id)
+            {
+                return Ok((candidate.clone(), false));
+            }
+            Ok((live.remove(0), true))
+        }
+        crate::run::PlanProviderDiversity::PairwiseDistinct => {
+            let peer = peer.ok_or_else(|| {
+                "pairwise-distinct second opinion requires a bound peer".to_string()
+            })?;
+            live.into_iter()
+                .find(|candidate| {
+                    candidate.provider_id != author.provider_id
+                        && candidate.provider_id != peer.provider_id
+                })
+                .map(|candidate| (candidate, false))
+                .ok_or_else(|| {
+                    "no approved pairwise-provider-distinct second opinion is currently eligible"
+                        .to_string()
+                })
+        }
+    }
+}
+
+fn execution_tier(
+    snapshot: &crate::bursar::RosterSnapshot,
+    execution: &crate::run::ApprovedExecution,
+) -> Result<u8, String> {
+    let profile = snapshot
+        .profiles
+        .iter()
+        .find(|profile| profile.profile_id == execution.profile_id)
+        .ok_or_else(|| "approved plan execution is absent from captured roster".to_string())?;
+    match profile.tier.as_str() {
+        "junior" => Ok(0),
+        "senior" => Ok(1),
+        "lead" => Ok(2),
+        _ => Err("approved plan execution has an invalid captured tier".to_string()),
     }
 }
 
@@ -1274,6 +1995,24 @@ mod tests {
             }
             Ok(outputs.remove(0))
         }
+        fn revise(&self, _request: &PlanRevisionRequest) -> Result<Vec<u8>, String> {
+            let mut outputs = self.0.lock().map_err(|_| "fake author lock".to_string())?;
+            if outputs.is_empty() {
+                return Err("fake author has no revision output".to_string());
+            }
+            Ok(outputs.remove(0))
+        }
+
+        fn peer_review(&self, _request: &PlanPeerReviewRequest) -> Result<Vec<u8>, String> {
+            Ok(
+                br#"{"schema":"conductor/plan-peer-review@1","verdict":"approve","findings":[]}"#
+                    .to_vec(),
+            )
+        }
+
+        fn second_opinion(&self, _request: &PlanSecondOpinionRequest) -> Result<Vec<u8>, String> {
+            Ok(br#"{"schema":"conductor/plan-second-opinion@1","verdict":"accept"}"#.to_vec())
+        }
     }
 
     struct StatusSwitchBursar {
@@ -1323,6 +2062,12 @@ mod tests {
                 .push(request.execution.clone());
             Ok(self.output.clone())
         }
+        fn peer_review(&self, _request: &PlanPeerReviewRequest) -> Result<Vec<u8>, String> {
+            Ok(
+                br#"{"schema":"conductor/plan-peer-review@1","verdict":"approve","findings":[]}"#
+                    .to_vec(),
+            )
+        }
     }
 
     struct FailingAuthor(std::sync::Mutex<usize>);
@@ -1334,6 +2079,77 @@ mod tests {
                 .lock()
                 .map_err(|_| "failing author lock".to_string())? += 1;
             Err("simulated author crash".to_string())
+        }
+    }
+
+    struct ScriptedExecutor {
+        authors: std::sync::Mutex<Vec<Result<Vec<u8>, String>>>,
+        revisions: std::sync::Mutex<Vec<Result<Vec<u8>, String>>>,
+        peers: std::sync::Mutex<Vec<Result<Vec<u8>, String>>>,
+        seconds: std::sync::Mutex<Vec<Result<Vec<u8>, String>>>,
+        calls: std::sync::Mutex<Vec<(String, crate::run::ApprovedExecution)>>,
+    }
+
+    impl ScriptedExecutor {
+        fn new(
+            authors: Vec<Result<Vec<u8>, String>>,
+            revisions: Vec<Result<Vec<u8>, String>>,
+            peers: Vec<Result<Vec<u8>, String>>,
+            seconds: Vec<Result<Vec<u8>, String>>,
+        ) -> Self {
+            Self {
+                authors: std::sync::Mutex::new(authors),
+                revisions: std::sync::Mutex::new(revisions),
+                peers: std::sync::Mutex::new(peers),
+                seconds: std::sync::Mutex::new(seconds),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn take(
+            queue: &std::sync::Mutex<Vec<Result<Vec<u8>, String>>>,
+            stage: &str,
+        ) -> Result<Vec<u8>, String> {
+            queue
+                .lock()
+                .map_err(|_| format!("{stage} script lock"))?
+                .drain(..1)
+                .next()
+                .ok_or_else(|| format!("{stage} script is exhausted"))?
+        }
+
+        fn record(
+            &self,
+            stage: &str,
+            execution: &crate::run::ApprovedExecution,
+        ) -> Result<(), String> {
+            self.calls
+                .lock()
+                .map_err(|_| "script call lock".to_string())?
+                .push((stage.to_string(), execution.clone()));
+            Ok(())
+        }
+    }
+
+    impl PlanAuthor for ScriptedExecutor {
+        fn author(&self, request: &PlanAuthorRequest) -> Result<Vec<u8>, String> {
+            self.record("author", &request.execution)?;
+            Self::take(&self.authors, "author")
+        }
+
+        fn revise(&self, request: &PlanRevisionRequest) -> Result<Vec<u8>, String> {
+            self.record("revision", &request.execution)?;
+            Self::take(&self.revisions, "revision")
+        }
+
+        fn peer_review(&self, request: &PlanPeerReviewRequest) -> Result<Vec<u8>, String> {
+            self.record("peer", &request.execution)?;
+            Self::take(&self.peers, "peer")
+        }
+
+        fn second_opinion(&self, request: &PlanSecondOpinionRequest) -> Result<Vec<u8>, String> {
+            self.record("second", &request.execution)?;
+            Self::take(&self.seconds, "second")
         }
     }
 
@@ -1381,6 +2197,7 @@ mod tests {
             ("planner-a", "anthropic"),
             ("planner-b", "codex"),
             ("planner-c", "opencode-go"),
+            ("planner-d", "anthropic"),
         ]
         .into_iter()
         .map(|(profile_id, provider_id)| {
@@ -1420,6 +2237,12 @@ enabled = true
 [[role_binding]]
 role = "plan"
 profile_id = "planner-c"
+weight = 1
+enabled = true
+
+[[role_binding]]
+role = "plan"
+profile_id = "planner-d"
 weight = 1
 enabled = true
 "#,
@@ -1508,6 +2331,22 @@ enabled = true
         .expect("write responses");
     }
 
+    fn implementation_document() -> Vec<u8> {
+        br#"{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()
+    }
+
+    fn spec_document() -> Vec<u8> {
+        br#"{"schema":"conductor/plan-document@1","kind":"spec","title":"Spec","context":"Context","goals":["Goal"],"constraints":["Constraint"],"requirements":["Requirement"],"acceptance":["Acceptance"],"verification":["cargo test"],"non_goals":[],"risks":[],"assumptions":[],"open_questions":[]}"#.to_vec()
+    }
+
+    fn peer_approve() -> Vec<u8> {
+        br#"{"schema":"conductor/plan-peer-review@1","verdict":"approve","findings":[]}"#.to_vec()
+    }
+
+    fn peer_revise() -> Vec<u8> {
+        br#"{"schema":"conductor/plan-peer-review@1","verdict":"revise","findings":[{"id":"F-1","severity":"high","location":"tasks.one","problem":"Missing detail","required_change":"Add the missing detail"}]}"#.to_vec()
+    }
+
     #[test]
     fn artifact_implementation_plan_authoring_ends_at_awaiting_peer_without_repo_mutation() {
         let (temp, paths, config, bursar) = plan_fixture("artifact");
@@ -1535,11 +2374,43 @@ enabled = true
         dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("dispatch");
         assert_eq!(
             status(&paths, &prepared.run_id).expect("status"),
-            "awaiting_peer"
+            "accepted"
         );
         assert_eq!(
             git_output(&repo, ["rev-parse", "HEAD"]).expect("head"),
             before
+        );
+    }
+    #[test]
+    fn implementation_plan_executes_required_peer_review_to_acceptance() {
+        let (temp, paths, config, bursar) = plan_fixture("implementation-peer");
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let author = FakeAuthor::new(vec![br#"{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()]);
+
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("dispatch");
+
+        assert_eq!(
+            status(&paths, &prepared.run_id).expect("status"),
+            "accepted",
+            "implementation plans require an executed peer verdict before acceptance"
         );
     }
 
@@ -1619,7 +2490,7 @@ enabled = true
         assert!(candidates.contains(&calls[0]));
         assert_eq!(
             status(&paths, &prepared.run_id).expect("status"),
-            "awaiting_peer"
+            "accepted"
         );
     }
 
@@ -1806,5 +2677,325 @@ enabled = true
             }
         ));
         assert!(cancel(&paths, &config, &prepared.run_id).is_err());
+    }
+    #[test]
+    fn spec_second_opinion_rejection_is_terminal_and_evidenced() {
+        let (temp, paths, config, bursar) = plan_fixture("spec-second-reject");
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::Spec,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("spec preparation strengthens the required second opinion");
+        approve(&paths, &prepared.run_id);
+        let executor = ScriptedExecutor::new(
+            vec![Ok(spec_document())],
+            Vec::new(),
+            vec![Ok(peer_approve())],
+            vec![Ok(
+                br#"{"schema":"conductor/plan-second-opinion@1","verdict":"reject"}"#.to_vec(),
+            )],
+        );
+
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor)
+            .expect("strict second opinion executes");
+
+        assert_eq!(
+            status(&paths, &prepared.run_id).expect("status"),
+            "rejected"
+        );
+        let calls = executor.calls.lock().expect("calls");
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(stage, _)| stage.as_str())
+                .collect::<Vec<_>>(),
+            ["author", "peer", "second"]
+        );
+        assert_ne!(calls[0].1.execution_key, calls[1].1.execution_key);
+        assert_ne!(calls[0].1.provider_id, calls[1].1.provider_id);
+        assert_ne!(calls[0].1.provider_id, calls[2].1.provider_id);
+        assert_ne!(calls[1].1.provider_id, calls[2].1.provider_id);
+        drop(calls);
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let events = crate::run::read_events(&run.events_path()).expect("events");
+        let stages = events
+            .iter()
+            .filter(|event| event.kind == crate::run::EventKind::AttemptFinished)
+            .filter_map(|event| event.plan_invocation.as_ref())
+            .map(|evidence| evidence.stage)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            vec![
+                crate::run::PlanStage::Planner,
+                crate::run::PlanStage::PeerReview,
+                crate::run::PlanStage::SecondOpinion,
+            ]
+        );
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.kind == crate::run::EventKind::AttemptFinished)
+                .filter_map(|event| event.plan_invocation.as_ref())
+                .all(|evidence| {
+                    evidence.role == "plan"
+                        && evidence.input_sha256.len() == 64
+                        && evidence
+                            .output_sha256
+                            .as_ref()
+                            .is_some_and(|digest| digest.len() == 64)
+                        && evidence.attempt == 1
+                })
+        );
+    }
+
+    #[test]
+    fn revision_reuses_immutable_author_and_peer_then_exhausts_at_authorized_limit() {
+        let (temp, paths, config, bursar) = plan_fixture("same-author-peer");
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let executor = ScriptedExecutor::new(
+            vec![Ok(implementation_document())],
+            vec![Ok(implementation_document())],
+            vec![Ok(peer_revise()), Ok(peer_approve())],
+            Vec::new(),
+        );
+
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).expect("revision flow");
+
+        assert_eq!(
+            status(&paths, &prepared.run_id).expect("status"),
+            "accepted"
+        );
+        let calls = executor.calls.lock().expect("calls");
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(stage, _)| stage.as_str())
+                .collect::<Vec<_>>(),
+            ["author", "peer", "revision", "peer"]
+        );
+        assert_eq!(calls[0].1, calls[2].1, "revision stays on its first author");
+        assert_eq!(
+            calls[1].1, calls[3].1,
+            "a valid peer verdict pins that reviewer"
+        );
+        assert_ne!(calls[0].1.execution_key, calls[1].1.execution_key);
+        drop(calls);
+
+        let (temp, paths, config, bursar) = plan_fixture("revision-exhaustion");
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 0,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let exhausted = ScriptedExecutor::new(
+            vec![Ok(implementation_document())],
+            Vec::new(),
+            vec![Ok(peer_revise())],
+            Vec::new(),
+        );
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &exhausted)
+            .expect("exhaustion is a terminal completed review");
+        assert_eq!(
+            status(&paths, &prepared.run_id).expect("status"),
+            "rejected"
+        );
+        assert_eq!(
+            exhausted
+                .calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .map(|(stage, _)| stage.as_str())
+                .collect::<Vec<_>>(),
+            ["author", "peer"]
+        );
+        drop(temp);
+    }
+    #[test]
+    fn malformed_peer_repair_and_crash_resume_use_only_pinned_candidates() {
+        let (temp, paths, config, fake) = plan_fixture("peer-repair-resume");
+        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let repaired = ScriptedExecutor::new(
+            vec![Ok(implementation_document())],
+            Vec::new(),
+            vec![Ok(b"not review json".to_vec()), Ok(peer_approve())],
+            Vec::new(),
+        );
+
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &repaired)
+            .expect("one persisted peer schema repair");
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert_eq!(run.plan().expect("plan").stage_attempts.peer_review, 2);
+        assert_eq!(
+            status(&paths, &prepared.run_id).expect("status"),
+            "accepted"
+        );
+
+        let (temp, paths, config, fake) = plan_fixture("peer-resume-degraded");
+        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let resumed = ScriptedExecutor::new(
+            vec![Ok(implementation_document())],
+            Vec::new(),
+            vec![Err("simulated peer crash".to_string()), Ok(peer_approve())],
+            Vec::new(),
+        );
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &resumed).is_err());
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let author_provider = match run.plan().expect("plan").progress {
+            crate::run::PlanProgress::AwaitingPeer { ref author, .. } => author.provider_id.clone(),
+            ref other => panic!("expected persisted peer boundary after crash, got {other:?}"),
+        };
+        for provider in ["anthropic", "codex", "opencode-go"] {
+            if provider != author_provider {
+                bursar.exhaust(provider);
+            }
+        }
+
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &resumed)
+            .expect("unbound peer may use recorded same-provider degraded contingency");
+        assert_eq!(
+            status(&paths, &prepared.run_id).expect("status"),
+            "accepted"
+        );
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert!(
+            crate::run::read_events(&run.events_path())
+                .expect("events")
+                .iter()
+                .any(|event| event.outcome.as_deref() == Some("peer_provider_diversity_degraded"))
+        );
+        drop(temp);
+    }
+    #[test]
+    fn loss_of_a_bound_peer_blocks_without_replacement() {
+        let (temp, paths, config, fake) = plan_fixture("bound-peer-loss");
+        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let executor = ScriptedExecutor::new(
+            vec![Ok(implementation_document())],
+            vec![Ok(implementation_document())],
+            vec![
+                Ok(peer_revise()),
+                Err("simulated bound-peer crash".to_string()),
+            ],
+            Vec::new(),
+        );
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let progress = run.plan().expect("plan").progress.clone();
+        let peer_provider = match &progress {
+            crate::run::PlanProgress::AwaitingPeer {
+                peer: Some(peer), ..
+            } => peer.provider_id.clone(),
+            other => panic!("expected a persisted bound peer, got {other:?}"),
+        };
+        let calls_before = executor.calls.lock().expect("calls").len();
+        bursar.exhaust(&peer_provider);
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
     }
 }

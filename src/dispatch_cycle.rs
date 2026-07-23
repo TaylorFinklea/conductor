@@ -4938,6 +4938,7 @@ where
                                     "{outcome_label}; quarantine failed: {error}"
                                 )),
                                 provider_limit: provider_limit_evidence.clone(),
+                                plan_invocation: None,
                             },
                         )
                         .map_err(run_artifact_error)?;
@@ -4974,6 +4975,7 @@ where
                 artifact_refs,
                 outcome: Some(outcome_label),
                 provider_limit: provider_limit_evidence.clone(),
+                plan_invocation: None,
             },
         ) {
             if worker_succeeded {
@@ -6091,8 +6093,9 @@ fn record_runtime_observation(
         run_id,
         diagnostic,
     );
-    deck::append_callout(report_path, level, "BURSAR_OBSERVE", &markdown)
-    .map_err(|error| DispatchCycleError::message(format!("report runtime observation: {error}")))
+    deck::append_callout(report_path, level, "BURSAR_OBSERVE", &markdown).map_err(|error| {
+        DispatchCycleError::message(format!("report runtime observation: {error}"))
+    })
 }
 
 fn next_eligible_roster<'a>(

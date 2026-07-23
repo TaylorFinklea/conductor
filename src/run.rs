@@ -281,6 +281,38 @@ pub(crate) enum PlanStage {
     PeerReview,
     SecondOpinion,
 }
+/// Provider-diversity policy pinned for a delayed plan stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PlanProviderDiversity {
+    None,
+    /// Prefer a cross-provider peer; a different exact execution on the
+    /// author's provider is legal only when no cross-provider candidate lives.
+    CrossProviderOrDegraded,
+    /// A spec's author, peer, and final opinion must use pairwise-distinct
+    /// providers. There is no degraded success path.
+    PairwiseDistinct,
+}
+
+/// Immutable relationship constraints for a delayed plan stage. Referenced
+/// stages are bound only once their concrete execution is known.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanStageConstraints {
+    pub(crate) distinct_execution_from: Vec<PlanStage>,
+    pub(crate) tier_at_least: Vec<PlanStage>,
+    pub(crate) provider_diversity: PlanProviderDiversity,
+}
+
+impl PlanStageConstraints {
+    pub(crate) const fn unconstrained() -> Self {
+        Self {
+            distinct_execution_from: Vec::new(),
+            tier_at_least: Vec::new(),
+            provider_diversity: PlanProviderDiversity::None,
+        }
+    }
+}
 
 /// Immutable exact execution identity approved for a plan stage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +332,7 @@ pub(crate) struct PlanStageRoute {
     pub(crate) capability_role: String,
     pub(crate) candidates: Vec<ApprovedExecution>,
     pub(crate) provider_distinct_from: Vec<PlanStage>,
+    pub(crate) constraints: PlanStageConstraints,
 }
 
 /// Immutable route envelope for all legal plan stages.
@@ -393,6 +426,34 @@ impl StageAttemptLimit {
 
     pub(crate) const fn value(self) -> u8 {
         self.0
+    }
+}
+
+/// Persisted per-stage call counters. Schema repairs and backend failures are
+/// calls too, so every transition can enforce the approved bounded budget after
+/// a crash or resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanStageAttempts {
+    pub(crate) planner: u8,
+    pub(crate) peer_review: u8,
+    pub(crate) second_opinion: u8,
+}
+
+impl PlanStageAttempts {
+    fn record(&mut self, stage: PlanStage, limit: StageAttemptLimit) -> Result<u8> {
+        let count = match stage {
+            PlanStage::Planner => &mut self.planner,
+            PlanStage::PeerReview => &mut self.peer_review,
+            PlanStage::SecondOpinion => &mut self.second_opinion,
+        };
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| RunError::new("plan stage attempt counter overflow"))?;
+        if *count > limit.value() {
+            return Err(RunError::new("plan stage attempt limit exhausted"));
+        }
+        Ok(*count)
     }
 }
 
@@ -541,9 +602,9 @@ impl PlanProgress {
                 "peer verdict is not legal in this plan state",
             ));
         };
-        if peer.profile_id == author.profile_id || peer.provider_id == author.provider_id {
+        if peer.execution_key == author.execution_key {
             return Err(RunError::new(
-                "peer binding must be distinct from immutable author binding",
+                "peer binding must use a distinct exact execution from immutable author",
             ));
         }
         if let Some(bound) = bound_peer {
@@ -618,6 +679,8 @@ pub(crate) struct PlanRunDetails {
     pub(crate) target: PlanTarget,
     pub(crate) routes: PlanRoutes,
     pub(crate) progress: PlanProgress,
+    #[serde(default)]
+    pub(crate) stage_attempts: PlanStageAttempts,
     pub(crate) revision_limit: RevisionLimit,
     pub(crate) stage_attempt_limit: StageAttemptLimit,
 }
@@ -679,6 +742,22 @@ impl RunManifest {
     }
 }
 
+/// Typed evidence for one plan backend invocation. Start and finish events
+/// share the immutable identity and input digest; the finish event adds the
+/// observed output digest, duration, and any harness-reported token count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanInvocationEvidence {
+    pub(crate) role: String,
+    pub(crate) stage: PlanStage,
+    pub(crate) execution: ApprovedExecution,
+    pub(crate) input_sha256: String,
+    pub(crate) output_sha256: Option<String>,
+    pub(crate) attempt: u8,
+    pub(crate) duration_ms: Option<u64>,
+    pub(crate) tokens: Option<u64>,
+}
+
 /// `conductor/event@2` — one append-only event line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -699,6 +778,8 @@ pub(crate) struct RunEvent {
     pub(crate) outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) provider_limit: Option<RuntimeLimitEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) plan_invocation: Option<PlanInvocationEvidence>,
 }
 
 /// Fields pinned into a new run's manifest at creation.
@@ -738,6 +819,7 @@ pub(crate) struct EventInput {
     pub(crate) artifact_refs: Vec<ArtifactRef>,
     pub(crate) outcome: Option<String>,
     pub(crate) provider_limit: Option<RuntimeLimitEvidence>,
+    pub(crate) plan_invocation: Option<PlanInvocationEvidence>,
 }
 
 /// Handle to one created (or reopened) run directory; owns the manifest and
@@ -1510,12 +1592,18 @@ impl RunHandle {
     }
 
     pub(crate) fn finish_plan_blocked(&mut self) -> Result<()> {
-        if !matches!(self.plan()?.progress, PlanProgress::Authoring { .. }) {
+        if !matches!(
+            self.plan()?.progress,
+            PlanProgress::Authoring { .. }
+                | PlanProgress::AwaitingPeer { .. }
+                | PlanProgress::Revising { .. }
+                | PlanProgress::AwaitingSecondOpinion { .. }
+        ) {
             return Err(RunError::new(
-                "terminal plan block requires active authoring",
+                "terminal plan block requires an active plan stage",
             ));
         }
-        self.plan_mut("blocking started plan")?.progress = PlanProgress::Terminal {
+        self.plan_mut("blocking active plan")?.progress = PlanProgress::Terminal {
             verdict: PlanTerminalVerdict::Blocked,
         };
         self.manifest.updated_at = Utc::now().to_rfc3339();
@@ -1527,9 +1615,10 @@ impl RunHandle {
     /// can resume only within the approved bounded attempt budget.
     pub(crate) fn record_plan_author_attempt(&mut self) -> Result<()> {
         let attempt_limit = self.plan()?.stage_attempt_limit;
-        self.plan_mut("recording plan author attempt")?
-            .progress
-            .record_author_attempt(attempt_limit)?;
+        let plan = self.plan_mut("recording plan author attempt")?;
+        plan.stage_attempts
+            .record(PlanStage::Planner, attempt_limit)?;
+        plan.progress.record_author_attempt(attempt_limit)?;
         self.manifest.updated_at = Utc::now().to_rfc3339();
         self.write_manifest()
     }
@@ -1551,6 +1640,176 @@ impl RunHandle {
                 outcome: Some("plan_document_ready".to_string()),
                 ..EventInput::default()
             },
+        )
+    }
+
+    /// Persists an authorized peer, second-opinion, or revision call before it
+    /// starts. This is the crash/resume budget boundary for every non-initial
+    /// plan backend invocation.
+    pub(crate) fn record_plan_stage_attempt(&mut self, stage: PlanStage) -> Result<u8> {
+        let attempt_limit = self.plan()?.stage_attempt_limit;
+        let progress = &self.plan()?.progress;
+        let legal = matches!(
+            (stage, progress),
+            (PlanStage::Planner, PlanProgress::Revising { .. })
+                | (PlanStage::PeerReview, PlanProgress::AwaitingPeer { .. })
+                | (
+                    PlanStage::SecondOpinion,
+                    PlanProgress::AwaitingSecondOpinion { .. }
+                )
+        );
+        if !legal {
+            return Err(RunError::new(
+                "plan stage attempt is not legal in the current plan state",
+            ));
+        }
+        let attempt = self
+            .plan_mut("recording plan stage attempt")?
+            .stage_attempts
+            .record(stage, attempt_limit)?;
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()?;
+        Ok(attempt)
+    }
+
+    /// Applies a validated peer verdict and either advances to the required
+    /// next gate, starts the same-author revision, or terminally preserves the
+    /// rejected artifact when the authorized revision budget is exhausted.
+    pub(crate) fn record_plan_peer_verdict(
+        &mut self,
+        peer: ApprovedExecution,
+        verdict: PeerVerdict,
+        require_second_opinion: bool,
+    ) -> Result<()> {
+        let (artifact, exhausted) = match self.plan()?.progress.clone() {
+            PlanProgress::AwaitingPeer {
+                artifact,
+                revisions,
+                ..
+            } => (
+                artifact,
+                matches!(verdict, PeerVerdict::Revise)
+                    && revisions.value() >= self.plan()?.revision_limit.value(),
+            ),
+            _ => {
+                return Err(RunError::new(
+                    "peer verdict requires a plan awaiting peer review",
+                ));
+            }
+        };
+        if exhausted {
+            self.plan_mut("finishing exhausted plan revision")?.progress = PlanProgress::Terminal {
+                verdict: PlanTerminalVerdict::Rejected,
+            };
+        } else {
+            self.plan_mut("recording plan peer verdict")?
+                .progress
+                .record_peer_verdict(peer.clone(), verdict)?;
+            if matches!(verdict, PeerVerdict::Approve) && !require_second_opinion {
+                self.plan_mut("accepting implementation plan")?.progress = PlanProgress::Terminal {
+                    verdict: PlanTerminalVerdict::Accepted,
+                };
+            }
+        }
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()?;
+        self.append_event(
+            EventKind::ReviewFinished,
+            EventInput {
+                profile_id: Some(peer.profile_id),
+                artifact_refs: vec![artifact.clone()],
+                outcome: Some(match verdict {
+                    PeerVerdict::Approve if require_second_opinion => "peer_approved".to_string(),
+                    PeerVerdict::Approve => "accepted".to_string(),
+                    PeerVerdict::Revise if exhausted => "revision_exhausted".to_string(),
+                    PeerVerdict::Revise => "revision_required".to_string(),
+                }),
+                ..EventInput::default()
+            },
+        )?;
+        if exhausted {
+            self.finish_with_artifacts("rejected", vec![artifact])
+        } else if matches!(verdict, PeerVerdict::Approve) && !require_second_opinion {
+            self.finish_with_artifacts("accepted", vec![artifact])
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Checkpoints one validated same-author revision and returns to the
+    /// already-bound peer. The revision count changes only at this durable
+    /// successful transition.
+    pub(crate) fn complete_plan_revision(&mut self, artifact: ArtifactRef) -> Result<()> {
+        validate_artifact_ref(&artifact, "plan revision artifact")?;
+        validate_local_artifact(&self.manifest_path(), &artifact)?;
+        self.plan_mut("completing plan revision")?
+            .progress
+            .complete_revision(artifact.clone())?;
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()?;
+        self.append_event(
+            EventKind::AttemptFinished,
+            EventInput {
+                artifact_refs: vec![artifact],
+                outcome: Some("plan_revision_ready".to_string()),
+                ..EventInput::default()
+            },
+        )
+    }
+
+    /// Records a strict final spec opinion. A final reject is terminal and
+    /// never re-opens the peer/revision loop.
+    pub(crate) fn record_plan_second_opinion(
+        &mut self,
+        second: ApprovedExecution,
+        verdict: SecondOpinionVerdict,
+    ) -> Result<()> {
+        let PlanProgress::AwaitingSecondOpinion {
+            author,
+            peer,
+            artifact,
+            ..
+        } = self.plan()?.progress.clone()
+        else {
+            return Err(RunError::new(
+                "second opinion requires a plan awaiting second opinion",
+            ));
+        };
+        if second.execution_key == author.execution_key
+            || second.execution_key == peer.execution_key
+        {
+            return Err(RunError::new(
+                "second opinion must use a distinct exact execution",
+            ));
+        }
+        if second.provider_id == author.provider_id || second.provider_id == peer.provider_id {
+            return Err(RunError::new(
+                "second opinion must use a pairwise-distinct provider",
+            ));
+        }
+        self.plan_mut("recording plan second opinion")?
+            .progress
+            .record_second_opinion(verdict)?;
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()?;
+        self.append_event(
+            EventKind::ReviewFinished,
+            EventInput {
+                profile_id: Some(second.profile_id),
+                artifact_refs: vec![artifact.clone()],
+                outcome: Some(match verdict {
+                    SecondOpinionVerdict::Accept => "accepted".to_string(),
+                    SecondOpinionVerdict::Reject => "rejected".to_string(),
+                }),
+                ..EventInput::default()
+            },
+        )?;
+        self.finish_with_artifacts(
+            match verdict {
+                SecondOpinionVerdict::Accept => "accepted",
+                SecondOpinionVerdict::Reject => "rejected",
+            },
+            vec![artifact],
         )
     }
 
@@ -1675,6 +1934,7 @@ impl RunHandle {
             artifact_refs: input.artifact_refs,
             outcome: input.outcome.clone(),
             provider_limit: input.provider_limit,
+            plan_invocation: input.plan_invocation,
         };
         append_event_line(&self.events_path(), &event)?;
         self.next_seq += 1;
@@ -1715,6 +1975,7 @@ impl RunHandle {
                 artifact_refs,
                 profile_id: None,
                 provider_limit: None,
+                plan_invocation: None,
             },
         )
     }

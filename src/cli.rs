@@ -1,6 +1,6 @@
 //! subcommand parsing, exit codes (0 ok; 1 cycle had flags/failures; 2 config/env error)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use crate::config;
@@ -220,12 +220,15 @@ fn parse_plan_prepare_options(args: &[String]) -> Result<PlanPrepareOptions, Str
                 .to_string(),
         ),
     }
+    let output_kind = output_kind.ok_or_else(|| {
+        "plan prepare requires --output-kind <spec|implementation-plan>".to_string()
+    })?;
+    let require_second_opinion =
+        require_second_opinion || output_kind == crate::plan_job::PlanOutputKind::Spec;
     Ok(PlanPrepareOptions {
         repo: repo.ok_or_else(|| "plan prepare requires --repo <path>".to_string())?,
         target,
-        output_kind: output_kind.ok_or_else(|| {
-            "plan prepare requires --output-kind <spec|implementation-plan>".to_string()
-        })?,
+        output_kind,
         tier,
         complexity,
         max_plan_revisions,
@@ -434,18 +437,25 @@ fn run_plan_dispatch(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let paths = plan_paths();
     let author = CommandPlanAuthor;
     match crate::plan_job::dispatch(
-        &plan_paths(),
+        &paths,
         &config,
         &crate::bursar::CommandBursarClient::new(),
         &run_id,
         &author,
     ) {
-        Ok(()) => {
-            println!("awaiting_peer");
-            ExitCode::SUCCESS
-        }
+        Ok(()) => match crate::plan_job::status(&paths, &run_id) {
+            Ok(state) => {
+                println!("{state}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("plan dispatch status: {error}");
+                ExitCode::from(1)
+            }
+        },
         Err(error) => {
             eprintln!("plan dispatch: {error}");
             ExitCode::from(1)
@@ -483,34 +493,132 @@ impl crate::plan_job::PlanAuthor for CommandPlanAuthor {
         }
         Ok(output.stdout)
     }
+
+    fn revise(&self, request: &crate::plan_job::PlanRevisionRequest) -> Result<Vec<u8>, String> {
+        let findings = serde_json::to_string(&request.findings)
+            .map_err(|error| format!("plan revision findings: {error}"))?;
+        let prompt = format!(
+            "Return only strict conductor/plan-document@1 {} JSON. Revise this prior immutable plan to address these required peer findings without applying changes.\nPrior plan:\n{}\nFindings:\n{}",
+            match request.output_kind {
+                crate::plan_job::PlanOutputKind::Spec => "spec",
+                crate::plan_job::PlanOutputKind::ImplementationPlan => "implementation-plan",
+            },
+            String::from_utf8_lossy(&request.prior_plan),
+            findings,
+        );
+        run_plan_backend(
+            &request.profile,
+            &request.execution,
+            &prompt,
+            &request.worktree,
+            "plan revision",
+        )
+    }
+
+    fn peer_review(
+        &self,
+        request: &crate::plan_job::PlanPeerReviewRequest,
+    ) -> Result<Vec<u8>, String> {
+        let target = serde_json::to_string(&request.target)
+            .map_err(|error| format!("plan peer target: {error}"))?;
+        let prompt = format!(
+            "Return only strict conductor/plan-peer-review@1 JSON. {}\nTarget:\n{}\nCanonical plan:\n{}",
+            request.rubric,
+            target,
+            String::from_utf8_lossy(&request.canonical_plan),
+        );
+        run_plan_backend(
+            &request.profile,
+            &request.execution,
+            &prompt,
+            &request.worktree,
+            "plan peer review",
+        )
+    }
+
+    fn second_opinion(
+        &self,
+        request: &crate::plan_job::PlanSecondOpinionRequest,
+    ) -> Result<Vec<u8>, String> {
+        let target = serde_json::to_string(&request.target)
+            .map_err(|error| format!("plan second-opinion target: {error}"))?;
+        let prompt = format!(
+            "Return only strict conductor/plan-second-opinion@1 JSON with accept or reject. Independently assess this final canonical plan. Do not discuss any peer verdict.\nTarget:\n{}\nCanonical plan:\n{}",
+            target,
+            String::from_utf8_lossy(&request.canonical_plan),
+        );
+        run_plan_backend(
+            &request.profile,
+            &request.execution,
+            &prompt,
+            &request.worktree,
+            "plan second opinion",
+        )
+    }
 }
 
+fn run_plan_backend(
+    profile: &crate::bursar::RosterProfile,
+    execution: &crate::run::ApprovedExecution,
+    prompt: &str,
+    worktree: &Path,
+    stage: &str,
+) -> Result<Vec<u8>, String> {
+    let argv = plan_backend_argv(profile, execution, prompt, worktree)?;
+    let (program, command_args) = argv
+        .split_first()
+        .ok_or_else(|| format!("{stage} argv was empty"))?;
+    let output = Command::new(program)
+        .args(command_args)
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("{stage} {program}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{stage} {program}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output.stdout)
+}
 fn plan_author_argv(
     request: &crate::plan_job::PlanAuthorRequest,
     prompt: &str,
 ) -> Result<Vec<String>, String> {
-    if request.profile.profile_id != request.execution.profile_id
-        || request.profile.provider_id != request.execution.provider_id
-    {
-        return Err("plan author profile differs from approved execution".to_string());
+    plan_backend_argv(
+        &request.profile,
+        &request.execution,
+        prompt,
+        &request.worktree,
+    )
+}
+
+fn plan_backend_argv(
+    profile: &crate::bursar::RosterProfile,
+    execution: &crate::run::ApprovedExecution,
+    prompt: &str,
+    worktree: &Path,
+) -> Result<Vec<String>, String> {
+    if profile.profile_id != execution.profile_id || profile.provider_id != execution.provider_id {
+        return Err("plan profile differs from approved execution".to_string());
     }
-    let backend = crate::bursar::backend_from_harness(&request.profile.harness)
-        .map_err(|error| format!("plan author harness: {error}"))?;
-    let reasoning_effort = request
-        .profile
+    let backend = crate::bursar::backend_from_harness(&profile.harness)
+        .map_err(|error| format!("plan harness: {error}"))?;
+    let reasoning_effort = profile
         .reasoning_effort
         .as_deref()
         .map(str::parse::<crate::config::ReasoningEffort>)
         .transpose()
-        .map_err(|error| format!("plan author reasoning_effort: {error}"))?;
+        .map_err(|error| format!("plan reasoning_effort: {error}"))?;
     crate::dispatch::readonly_argv_for_backend(
         backend,
-        &request.profile.dispatch_id,
+        &profile.dispatch_id,
         reasoning_effort,
         prompt,
-        &request.worktree,
+        worktree,
     )
-    .map_err(|error| format!("plan author argv: {error}"))
+    .map_err(|error| format!("plan argv: {error}"))
 }
 fn run_adversarial(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     match it.next().as_deref() {
@@ -1955,6 +2063,10 @@ mod tests {
         .expect("strict Bead prepare grammar");
 
         assert_eq!(parsed.max_plan_revisions, 1);
+        assert!(
+            parsed.require_second_opinion,
+            "spec CLI defaults must preserve the required second-opinion gate"
+        );
     }
     #[test]
     fn adversarial_plan_and_dispatch_parsers_enforce_exact_grammar() {
