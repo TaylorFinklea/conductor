@@ -456,7 +456,7 @@ pub(crate) fn prepare<C: crate::bursar::BursarClient + ?Sized>(
     let router =
         crate::role_routing::RoleRouter::with_pinned_snapshot(&paths.state_dir, policy, snapshot)
             .map_err(|error| format!("role router: {error}"))?;
-    let role = crate::role_routing::RoleId::new("planner")
+    let role = crate::role_routing::RoleId::new("plan")
         .map_err(|error| format!("planner role: {error}"))?;
     router
         .validate_preapproval_contingencies(&role, &constraints, request.require_second_opinion)
@@ -722,7 +722,7 @@ fn planner_constraints(
         allowed_provider_ids: providers,
         approved_execution_keys: execution_keys,
         required_roles: [
-            crate::role_routing::RoleId::new("planner").map_err(|error| error.to_string())?
+            crate::role_routing::RoleId::new("plan").map_err(|error| error.to_string())?
         ]
         .into_iter()
         .collect(),
@@ -752,19 +752,19 @@ fn planned_routes(prepared: &crate::role_routing::PreparedPlanner) -> crate::run
         stages: vec![
             crate::run::PlanStageRoute {
                 stage: crate::run::PlanStage::Planner,
-                capability_role: "planner".to_string(),
+                capability_role: "plan".to_string(),
                 candidates: candidates.clone(),
                 provider_distinct_from: Vec::new(),
             },
             crate::run::PlanStageRoute {
                 stage: crate::run::PlanStage::PeerReview,
-                capability_role: "planner".to_string(),
+                capability_role: "plan".to_string(),
                 candidates: candidates.clone(),
                 provider_distinct_from: vec![crate::run::PlanStage::Planner],
             },
             crate::run::PlanStageRoute {
                 stage: crate::run::PlanStage::SecondOpinion,
-                capability_role: "planner".to_string(),
+                capability_role: "plan".to_string(),
                 candidates,
                 provider_distinct_from: vec![
                     crate::run::PlanStage::Planner,
@@ -871,6 +871,8 @@ where
         }
         _ => return Err("plan dispatch state is not resumable authoring".to_string()),
     };
+    run.record_plan_author_attempt()
+        .map_err(|error| format!("plan author attempt: {error}"))?;
     let output = with_isolated_worktree(&repo, &approval.target_head, |worktree| {
         author.author(&PlanAuthorRequest {
             worktree: worktree.to_path_buf(),
@@ -882,6 +884,8 @@ where
     let document = match parse_document(approval.output_kind, &output) {
         Ok(document) => document,
         Err(first_error) => {
+            run.record_plan_author_attempt()
+                .map_err(|error| format!("plan author repair attempt: {error}"))?;
             let repair = with_isolated_worktree(&repo, &approval.target_head, |worktree| {
                 author.author(&PlanAuthorRequest {
                     worktree: worktree.to_path_buf(),
@@ -1223,7 +1227,7 @@ mod tests {
                 "profile_id": profile_id, "provider_id": provider_id, "model": profile_id,
                 "harness": "pi", "dispatch_id": profile_id, "reasoning_effort": null,
                 "tier": "lead", "ceiling": "XL", "efficiency": "lean", "cost": 0.0,
-                "data_policy": "standard", "enabled": true, "roles": ["planner"],
+                "data_policy": "standard", "enabled": true, "roles": ["plan"],
                 "state": "healthy", "eligible": true, "ineligibility_reason": null
             })
         })
@@ -1241,19 +1245,19 @@ mod tests {
         let config = crate::config::parse_str(
             r#"
 [[role_binding]]
-role = "planner"
+role = "plan"
 profile_id = "planner-a"
 weight = 1
 enabled = true
 
 [[role_binding]]
-role = "planner"
+role = "plan"
 profile_id = "planner-b"
 weight = 1
 enabled = true
 
 [[role_binding]]
-role = "planner"
+role = "plan"
 profile_id = "planner-c"
 weight = 1
 enabled = true

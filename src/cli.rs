@@ -102,7 +102,7 @@ fn parse_plan_prepare_options(args: &[String]) -> Result<PlanPrepareOptions, Str
     let mut output_kind = None;
     let mut tier = None;
     let mut complexity = None;
-    let mut max_plan_revisions = 0;
+    let mut max_plan_revisions = 1;
     let mut revisions_seen = false;
     let mut require_second_opinion = false;
     let mut config = PathBuf::from("conductor.toml");
@@ -320,47 +320,35 @@ fn plan_cli_input(
             })
         }
         PlanCliTarget::Bead(bead_id) => {
-            let output = Command::new("bd")
-                .args(["show", bead_id, "--json"])
-                .stdin(Stdio::null())
-                .output()
-                .map_err(|error| format!("bd show {bead_id}: {error}"))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "bd show {bead_id}: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
-            }
-            let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-                .map_err(|error| format!("bd show {bead_id} JSON: {error}"))?;
-            let tier = bead_tier(&value)?;
-            let complexity = bead_complexity(&value)?;
+            let issue = crate::bd::BdClient::show(
+                &crate::bd::CommandBdClient::new(),
+                &options.repo,
+                bead_id,
+            )
+            .map_err(|error| format!("bd show {bead_id}: {error}"))?;
+            let crate::fields::Triage::Triaged(fields) = crate::fields::extract(&issue) else {
+                return Err("Bead lacks valid metadata tier_floor and complexity".to_string());
+            };
+            let tier = match fields.tier_floor {
+                crate::config::Tier::Junior => crate::run::PlanTier::Junior,
+                crate::config::Tier::Senior => crate::run::PlanTier::Senior,
+                crate::config::Tier::Lead => crate::run::PlanTier::Lead,
+            };
+            let complexity = match fields.complexity {
+                crate::config::Ceiling::S => crate::run::PlanComplexity::S,
+                crate::config::Ceiling::M => crate::run::PlanComplexity::M,
+                crate::config::Ceiling::L => crate::run::PlanComplexity::L,
+                crate::config::Ceiling::Xl => crate::run::PlanComplexity::XL,
+            };
+            let bytes = serde_json::to_vec(&issue)
+                .map_err(|error| format!("serialize captured Bead {bead_id}: {error}"))?;
             Ok(crate::plan_job::PlanPrepareInput::Bead {
                 bead_id: bead_id.clone(),
-                bytes: output.stdout,
+                bytes,
                 tier,
                 complexity,
             })
         }
-    }
-}
-
-fn bead_tier(value: &serde_json::Value) -> Result<crate::run::PlanTier, String> {
-    match value.get("tier").and_then(serde_json::Value::as_str) {
-        Some("junior") => Ok(crate::run::PlanTier::Junior),
-        Some("senior") => Ok(crate::run::PlanTier::Senior),
-        Some("lead") => Ok(crate::run::PlanTier::Lead),
-        _ => Err("Bead JSON must contain tier: junior|senior|lead".to_string()),
-    }
-}
-
-fn bead_complexity(value: &serde_json::Value) -> Result<crate::run::PlanComplexity, String> {
-    match value.get("complexity").and_then(serde_json::Value::as_str) {
-        Some("S") => Ok(crate::run::PlanComplexity::S),
-        Some("M") => Ok(crate::run::PlanComplexity::M),
-        Some("L") => Ok(crate::run::PlanComplexity::L),
-        Some("XL") => Ok(crate::run::PlanComplexity::XL),
-        _ => Err("Bead JSON must contain complexity: S|M|L|XL".to_string()),
     }
 }
 

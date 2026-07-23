@@ -456,15 +456,30 @@ impl PlanProgress {
     pub(crate) fn start_authoring(
         &mut self,
         author: ApprovedExecution,
-        attempt_limit: StageAttemptLimit,
+        _attempt_limit: StageAttemptLimit,
     ) -> Result<()> {
         if !matches!(self, Self::Prepared) {
             return Err(RunError::new("plan author can bind only from prepared"));
         }
         *self = Self::Authoring {
             author,
-            attempts: attempt_limit.value(),
+            attempts: 0,
         };
+        Ok(())
+    }
+
+    fn record_author_attempt(&mut self, attempt_limit: StageAttemptLimit) -> Result<()> {
+        let Self::Authoring { attempts, .. } = self else {
+            return Err(RunError::new(
+                "plan author attempt is not legal in this state",
+            ));
+        };
+        *attempts = attempts
+            .checked_add(1)
+            .ok_or_else(|| RunError::new("plan author attempt counter overflow"))?;
+        if *attempts > attempt_limit.value() {
+            return Err(RunError::new("plan author attempt limit exhausted"));
+        }
         Ok(())
     }
 
@@ -1429,6 +1444,17 @@ impl RunHandle {
                 ..EventInput::default()
             },
         )
+    }
+
+    /// Persists each author invocation before the harness starts, so a crash
+    /// can resume only within the approved bounded attempt budget.
+    pub(crate) fn record_plan_author_attempt(&mut self) -> Result<()> {
+        let attempt_limit = self.plan()?.stage_attempt_limit;
+        self.plan_mut("recording plan author attempt")?
+            .progress
+            .record_author_attempt(attempt_limit)?;
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()
     }
 
     /// Atomically checkpoints a validated author artifact at the structural
