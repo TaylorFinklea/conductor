@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use super::super::bursar::{Availability, BudgetAction, BudgetDecision};
+    use super::super::bursar::{
+        Availability, BudgetAction, BudgetDecision, BursarClient, ObservationExpiryBasis,
+        ObservationRequest, RuntimeLimitReason, test_support::FakeBursarClient,
+    };
     use super::super::config::{Backend, Ceiling, Cost, CostPolicy, Efficiency, RosterEntry, Tier};
     use super::super::fields::RoutingFields;
     use super::super::triage::CandidateRejection;
@@ -220,6 +223,56 @@ mod tests {
                     .iter()
                     .any(|reason| reason.code == "outside-fallback-chain")
         }));
+    }
+
+    #[test]
+    fn runtime_observation_excludes_provider_from_next_routing_snapshot() {
+        let mut primary = paid_entry("primary", Tier::Senior, Efficiency::Lean, "opencode-go");
+        primary.fallback = vec!["fallback".to_string()];
+        let fallback = paid_entry("fallback", Tier::Senior, Efficiency::Lean, "codex");
+        let roster = vec![primary.clone(), fallback.clone()];
+        let client = FakeBursarClient::with_provider_availabilities(&[
+            ("opencode-go", Availability::Healthy),
+            ("codex", Availability::Healthy),
+        ])
+        .with_observation_writeback();
+
+        client
+            .observe(&ObservationRequest::runtime_limit(
+                "opencode-go",
+                Some(primary.dispatch_id.clone()),
+                "2026-07-13T12:30:00Z",
+                ObservationExpiryBasis::ProviderReset,
+                RuntimeLimitReason::Http429,
+            ))
+            .expect("record runtime limit");
+
+        let decisions = snapshot_provider_decisions(&client, &roster, true);
+        assert_eq!(
+            decisions.get("opencode-go").map(|decision| decision.action),
+            Some(BudgetAction::Defer)
+        );
+        let advice = select(
+            "repo",
+            &RoutingFields {
+                tier_floor: Tier::Senior,
+                complexity: Ceiling::M,
+                verify_cmd: None,
+                trains_ok: false,
+            },
+            CostPolicy::Proprietary,
+            &roster,
+            &decisions,
+            &HashMap::new(),
+            None,
+        );
+        assert_eq!(
+            advice
+                .selected
+                .as_ref()
+                .map(|candidate| candidate.model.as_str()),
+            Some(fallback.name.as_str())
+        );
     }
 
     #[test]

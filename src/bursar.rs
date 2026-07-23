@@ -580,7 +580,7 @@ pub(crate) struct BudgetDecision {
     pub(crate) summary: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub(crate) enum ObservationExpiryBasis {
     ProviderReset,
@@ -596,12 +596,13 @@ impl ObservationExpiryBasis {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub(crate) enum RuntimeLimitReason {
     Http429,
     QuotaExceeded,
     RateLimit,
+    SessionLimit,
 }
 
 impl RuntimeLimitReason {
@@ -610,6 +611,7 @@ impl RuntimeLimitReason {
             Self::Http429 => "runtime HTTP 429",
             Self::QuotaExceeded => "runtime quota exceeded",
             Self::RateLimit => "runtime rate limit",
+            Self::SessionLimit => "runtime session limit",
         }
     }
 }
@@ -618,6 +620,20 @@ impl RuntimeLimitReason {
 pub(crate) struct ObservationRequest {
     pub(crate) provider: String,
     pub(crate) model: Option<String>,
+    pub(crate) expires_at: String,
+    pub(crate) expiry_basis: ObservationExpiryBasis,
+    pub(crate) reason: RuntimeLimitReason,
+}
+
+/// Durable, bounded evidence derived from a canonical runtime provider limit.
+/// The owning run event supplies the run id and cycle work state; this record
+/// binds the observed provider condition to the selected profile and model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeLimitEvidence {
+    pub(crate) provider: String,
+    pub(crate) model: Option<String>,
+    pub(crate) profile: String,
     pub(crate) expires_at: String,
     pub(crate) expiry_basis: ObservationExpiryBasis,
     pub(crate) reason: RuntimeLimitReason,
@@ -638,6 +654,17 @@ impl ObservationRequest {
             expires_at: expires_at.into(),
             expiry_basis,
             reason,
+        }
+    }
+
+    pub(crate) fn evidence(&self, profile: impl Into<String>) -> RuntimeLimitEvidence {
+        RuntimeLimitEvidence {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            profile: profile.into(),
+            expires_at: self.expires_at.clone(),
+            expiry_basis: self.expiry_basis,
+            reason: self.reason,
         }
     }
 }
@@ -1131,20 +1158,22 @@ pub(crate) mod test_support {
 
     #[derive(Debug, Clone)]
     pub(crate) struct FakeBursarClient {
-        result: Result<StatusReport>,
+        result: Rc<RefCell<Result<StatusReport>>>,
         snapshot: Result<RosterSnapshot>,
         observe_result: Result<()>,
         observations: Rc<RefCell<Vec<ObservationRequest>>>,
+        apply_observations_to_status: bool,
     }
 
     impl FakeBursarClient {
         fn from_result(result: Result<StatusReport>) -> Self {
             let snapshot = fake_roster_snapshot(result.as_ref().ok());
             Self {
-                result,
+                result: Rc::new(RefCell::new(result)),
                 snapshot,
                 observe_result: Ok(()),
                 observations: Rc::new(RefCell::new(Vec::new())),
+                apply_observations_to_status: false,
             }
         }
 
@@ -1237,6 +1266,11 @@ pub(crate) mod test_support {
             self
         }
 
+        pub(crate) fn with_observation_writeback(mut self) -> Self {
+            self.apply_observations_to_status = true;
+            self
+        }
+
         pub(crate) fn observations(&self) -> Vec<ObservationRequest> {
             self.observations.borrow().clone()
         }
@@ -1244,7 +1278,7 @@ pub(crate) mod test_support {
 
     impl BursarClient for FakeBursarClient {
         fn status(&self) -> Result<StatusReport> {
-            self.result.clone()
+            self.result.borrow().clone()
         }
 
         fn roster_snapshot(&self) -> Result<RosterSnapshot> {
@@ -1253,7 +1287,20 @@ pub(crate) mod test_support {
 
         fn observe(&self, request: &ObservationRequest) -> Result<()> {
             self.observations.borrow_mut().push(request.clone());
-            self.observe_result.clone()
+            self.observe_result.clone()?;
+            if self.apply_observations_to_status {
+                if let Ok(report) = &mut *self.result.borrow_mut() {
+                    if let Some(status) = report.providers.get_mut(&request.provider) {
+                        status.availability = Availability::Exhausted;
+                        status.source = "conductor-runtime".to_string();
+                        status.checked_at = Utc::now().to_rfc3339();
+                        status.expires_at = Some(request.expires_at.clone());
+                        status.windows.clear();
+                        status.reason = Some(request.reason.label().to_string());
+                    }
+                }
+            }
+            Ok(())
         }
     }
 }

@@ -13,7 +13,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use crate::bd::{BdClient, Issue};
 use crate::bursar::{
     self, BudgetAction, BudgetDecision, BursarClient, ObservationExpiryBasis, ObservationRequest,
-    RuntimeLimitReason,
+    RuntimeLimitEvidence, RuntimeLimitReason,
 };
 use crate::config::{Backend, Ceiling, Config, Cost, CostPolicy, RosterEntry, Tier};
 use crate::deck::{self, CalloutLevel, LiveUpdate, ReportStatus};
@@ -675,10 +675,11 @@ struct WorkerAttempt {
     roster: RosterEntry,
     result: dispatch::DispatchResult,
     attempts: u64,
+    provider_limit: Option<RuntimeLimitEvidence>,
 }
 
 enum WorkerChainOutcome {
-    Ran(WorkerAttempt),
+    Ran(Box<WorkerAttempt>),
     Deferred { summary: String, attempts: u64 },
 }
 
@@ -2203,6 +2204,13 @@ fn dispatch_one<
             });
         }
     };
+    if let Some(evidence) = worker_attempt.provider_limit.as_ref() {
+        let _ = bd.comment(
+            &repo_path,
+            &item.issue_id,
+            &provider_limit_diagnostic(cycle_id, &run_artifacts.manifest().run_id, item, evidence),
+        );
+    }
     complete_worker_verification(
         cfg,
         bd,
@@ -2225,7 +2233,7 @@ fn dispatch_one<
         &extracted,
         before_head,
         run_artifacts,
-        worker_attempt,
+        *worker_attempt,
     )
 }
 
@@ -3550,6 +3558,7 @@ fn resume_promoted_work<
             stderr_bytes: 0,
         },
         attempts: 0,
+        provider_limit: None,
     };
     complete_worker_verification(
         cfg,
@@ -4794,6 +4803,7 @@ where
                             outcome: Some(format!(
                                 "worker_state_uncertain; recovery required: {error}"
                             )),
+                            ..EventInput::default()
                         },
                     );
                     return Err(DispatchCycleError::recovery_required(format!(
@@ -4808,6 +4818,7 @@ where
                             profile_id: Some(roster.name.clone()),
                             artifact_refs,
                             outcome: Some(format!("dispatch_error: {error}")),
+                            ..EventInput::default()
                         },
                     )
                     .map_err(run_artifact_error)?;
@@ -4819,6 +4830,23 @@ where
         let mut artifact_refs = capture_dispatch_result(run_artifacts, &attempt_id, &result)?;
         let mut outcome_label = dispatch_status_label(&result.status);
         let mut worker_succeeded = matches!(result.status, dispatch::DispatchStatus::Success);
+        let provider_limit_observation = retryable_failure_reason(&result)?.map(|failure| {
+            runtime_observation(
+                roster,
+                &failure,
+                cfg.budgets.unknown_429_cooldown_mins,
+                Utc::now(),
+            )
+        });
+        let provider_limit_evidence = provider_limit_observation
+            .as_ref()
+            .map(|observation| observation.evidence(roster.name.clone()));
+        if let Some(evidence) = provider_limit_evidence.as_ref() {
+            outcome_label = format!(
+                "provider_limited:{}; {outcome_label}",
+                evidence.reason.label()
+            );
+        }
         if worker_succeeded {
             let worker_commit = result.worker_commit.as_deref().ok_or_else(|| {
                 DispatchCycleError::message("successful isolated worker has no observed commit")
@@ -4863,6 +4891,7 @@ where
                         outcome: Some(format!(
                             "{outcome_label}; unauthenticated commit requires recovery"
                         )),
+                        ..EventInput::default()
                     },
                 )
                 .map_err(run_artifact_error)?;
@@ -4908,6 +4937,7 @@ where
                                 outcome: Some(format!(
                                     "{outcome_label}; quarantine failed: {error}"
                                 )),
+                                provider_limit: provider_limit_evidence.clone(),
                             },
                         )
                         .map_err(run_artifact_error)?;
@@ -4943,6 +4973,7 @@ where
                 profile_id: Some(roster.name.clone()),
                 artifact_refs,
                 outcome: Some(outcome_label),
+                provider_limit: provider_limit_evidence.clone(),
             },
         ) {
             if worker_succeeded {
@@ -4954,12 +4985,13 @@ where
             return Err(run_artifact_error(error));
         }
 
-        let Some(failure) = retryable_failure_reason(&result)? else {
-            return Ok(WorkerChainOutcome::Ran(WorkerAttempt {
+        let Some(observation) = provider_limit_observation else {
+            return Ok(WorkerChainOutcome::Ran(Box::new(WorkerAttempt {
                 roster: roster.clone(),
                 result,
                 attempts,
-            }));
+                provider_limit: None,
+            })));
         };
         if cfg.budgets.use_bursar {
             append_ledger(
@@ -4973,18 +5005,14 @@ where
                 cycle_id,
                 &format!(
                     "retryable worker failure classified as {}",
-                    failure.reason.label()
+                    observation.reason.label()
                 ),
             )?;
-            let observation = runtime_observation(
-                roster,
-                &failure,
-                cfg.budgets.unknown_429_cooldown_mins,
-                Utc::now(),
-            );
             let observation_result = bursar_client.observe(&observation);
             record_runtime_observation(
                 report_path,
+                cycle_id,
+                &run_artifacts.manifest().run_id,
                 item,
                 roster,
                 &observation,
@@ -5029,13 +5057,14 @@ where
                 "implement",
                 false,
                 cycle_id,
-                &format!("{}; no eligible fallback", failure.reason.label()),
+                &format!("{}; no eligible fallback", observation.reason.label()),
             )?;
-            return Ok(WorkerChainOutcome::Ran(WorkerAttempt {
+            return Ok(WorkerChainOutcome::Ran(Box::new(WorkerAttempt {
                 roster: roster.clone(),
                 result,
                 attempts,
-            }));
+                provider_limit: provider_limit_evidence,
+            })));
         };
         append_ledger(
             ledger_path,
@@ -5046,7 +5075,7 @@ where
             "implement",
             false,
             cycle_id,
-            &format!("{}; failover to {}", failure.reason.label(), next.name),
+            &format!("{}; failover to {}", observation.reason.label(), next.name),
         )?;
         patch_live(
             live,
@@ -5287,6 +5316,7 @@ fn record_review_events(
                     profile_id: Some(review.model.clone()),
                     artifact_refs,
                     outcome: Some(review.summary.clone()),
+                    ..EventInput::default()
                 },
             )
             .map_err(run_artifact_error)?;
@@ -5997,11 +6027,32 @@ fn record_budget_decision(
             decision.summary
         ),
     )
+
     .map_err(|e| DispatchCycleError::message(format!("report budget decision: {e}")))
+}
+
+fn provider_limit_diagnostic(
+    cycle_id: &str,
+    run_id: &str,
+    item: &PlannedItem,
+    evidence: &RuntimeLimitEvidence,
+) -> String {
+    serde_json::json!({
+        "event": "provider_limit",
+        "cycle_id": cycle_id,
+        "run_id": run_id,
+        "repo": item.repo,
+        "issue_id": item.issue_id,
+        "recovery_boundary": evidence.expires_at,
+        "evidence": evidence,
+    })
+    .to_string()
 }
 
 fn record_runtime_observation(
     report_path: &Path,
+    cycle_id: &str,
+    run_id: &str,
     item: &PlannedItem,
     roster: &RosterEntry,
     observation: &ObservationRequest,
@@ -6015,25 +6066,24 @@ fn record_runtime_observation(
     } else {
         (CalloutLevel::Info, "recorded")
     };
+    let evidence = observation.evidence(roster.name.clone());
+    let diagnostic = serde_json::json!({
+        "event": "provider_limit",
+        "writeback": status,
+        "cycle_id": cycle_id,
+        "run_id": run_id,
+        "repo": item.repo,
+        "issue_id": item.issue_id,
+        "recovery_boundary": evidence.expires_at.clone(),
+        "evidence": evidence,
+    });
     deck::append_callout(
         report_path,
         level,
         "BURSAR_OBSERVE",
-        &format!(
-            "runtime provider observation {status}: {}/{}\n- roster: {}\n- provider: {}\n- model: {}\n- expires_at: {}\n- expiry_basis: {}\n- reason: {}",
-            item.repo,
-            item.issue_id,
-            roster.name,
-            observation.provider,
-            observation.model.as_deref().unwrap_or("-"),
-            observation.expires_at,
-            observation.expiry_basis.label(),
-            observation.reason.label(),
-        ),
+        &diagnostic.to_string(),
     )
-    .map_err(|error| {
-        DispatchCycleError::message(format!("report runtime observation: {error}"))
-    })
+    .map_err(|error| DispatchCycleError::message(format!("report runtime observation: {error}")))
 }
 
 fn next_eligible_roster<'a>(
@@ -6240,13 +6290,22 @@ fn retryable_failure_reason(
     ) {
         return Ok(None);
     }
-    let stderr = std::fs::read_to_string(&result.stderr_path).map_err(|e| {
+    let stderr = std::fs::read_to_string(&result.stderr_path).map_err(|error| {
         DispatchCycleError::message(format!(
-            "read worker stderr {}: {e}",
+            "read worker stderr {}: {error}",
             result.stderr_path.display()
         ))
     })?;
-    Ok(classify_retryable_failure(&stderr, Utc::now()))
+    if let Some(failure) = classify_retryable_failure(&stderr, Utc::now()) {
+        return Ok(Some(failure));
+    }
+    let stdout = std::fs::read_to_string(&result.stdout_path).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "read worker stdout {}: {error}",
+            result.stdout_path.display()
+        ))
+    })?;
+    Ok(classify_canonical_harness_session_limit(&stdout))
 }
 
 fn is_retryable_worker_stderr(stderr: &str) -> bool {
@@ -6275,6 +6334,25 @@ fn classify_runtime_limit(stderr: &str) -> Option<RuntimeLimitReason> {
         } else {
             None
         }
+    })
+}
+
+fn classify_canonical_harness_session_limit(stdout: &str) -> Option<RetryableFailure> {
+    let mut lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let line = lines.next()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    let line = line.to_ascii_lowercase();
+    (line.starts_with("you have hit your session limit")
+        && line.contains("· resets ")
+        && line.ends_with(')'))
+    .then_some(RetryableFailure {
+        reason: RuntimeLimitReason::SessionLimit,
+        provider_reset: None,
     })
 }
 
@@ -6330,14 +6408,10 @@ fn is_trusted_provider_error_line(line: &str) -> bool {
         "https/",
         "provider ",
         "provider:",
-        "quota ",
-        "rate limit",
-        "rate_limit",
         "response ",
         "response:",
         "status ",
         "status:",
-        "too many requests",
         "429 ",
         "429{",
     ]
@@ -11387,6 +11461,25 @@ provider = "codex"
             ObservationExpiryBasis::LocalCooldown
         );
         assert!(!format!("{:?}", observations[0]).contains("quota exceeded"));
+        let run_dir = single_contract_run(&state);
+        let events = crate::run::read_events(&run_dir.join("events.jsonl"))
+            .expect("read provider-limit run evidence");
+        let event = events
+            .iter()
+            .find(|event| event.provider_limit.is_some())
+            .expect("provider-limited attempt event");
+        let evidence = event.provider_limit.as_ref().expect("typed evidence");
+        assert_eq!(evidence.provider, "opencode-go");
+        assert_eq!(evidence.model.as_deref(), Some("primary-worker"));
+        assert_eq!(evidence.profile, "primary-worker");
+        assert_eq!(evidence.reason, RuntimeLimitReason::Http429);
+        assert_eq!(evidence.expiry_basis, ObservationExpiryBasis::LocalCooldown);
+        assert!(
+            event
+                .outcome
+                .as_deref()
+                .is_some_and(|outcome| outcome.starts_with("provider_limited:"))
+        );
         let report = std::fs::read_to_string(report_path(&reports, cycle_id)).expect("report");
         assert!(report.contains("writeback-failed"));
 
@@ -12389,7 +12482,7 @@ dispatch_id = "fallback-worker"
         assert!(is_retryable_worker_stderr(
             "[2026-07-13T10:00:00Z] [ERROR] quota exceeded"
         ));
-        assert!(is_retryable_worker_stderr("quota exceeded"));
+        assert!(!is_retryable_worker_stderr("quota exceeded"));
         assert!(is_retryable_worker_stderr("provider returned rate_limit"));
         assert!(is_retryable_worker_stderr("provider returned rate limit"));
         assert!(!is_retryable_worker_stderr("panicked at src/foo.rs:429:10"));
@@ -12445,7 +12538,7 @@ dispatch_id = "fallback-worker"
     fn retryable_worker_failure_classifies_timed_out_process_stderr() {
         let temp = TempDir::new("retryable-timeout");
         let stderr_path = temp.path().join("worker.err");
-        std::fs::write(&stderr_path, b"quota exceeded\n").expect("write stderr");
+        std::fs::write(&stderr_path, b"ERROR: quota exceeded\n").expect("write stderr");
         let result = dispatch::DispatchResult {
             status: dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::TimedOut),
             worker_commit: None,
@@ -12459,6 +12552,60 @@ dispatch_id = "fallback-worker"
             .expect("classify")
             .expect("timed out provider limit");
         assert_eq!(failure.reason, RuntimeLimitReason::QuotaExceeded);
+    }
+
+    #[test]
+    fn retryable_worker_failure_reads_only_canonical_harness_session_limit_output() {
+        let temp = TempDir::new("canonical-session-limit");
+        let stdout_path = temp.path().join("worker.out");
+        let stderr_path = temp.path().join("worker.err");
+        std::fs::write(
+            &stdout_path,
+            "You have hit your session limit · resets 9pm (America/Chicago)\n",
+        )
+        .expect("write canonical harness stdout");
+        std::fs::write(&stderr_path, b"").expect("write empty stderr");
+        let result = dispatch::DispatchResult {
+            status: dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::ExitNonZero {
+                code: Some(1),
+            }),
+            worker_commit: None,
+            stdout_path,
+            stderr_path,
+            stdout_bytes: 62,
+            stderr_bytes: 0,
+        };
+
+        let failure = retryable_failure_reason(&result)
+            .expect("classify")
+            .expect("canonical harness session limit");
+        assert_eq!(failure.reason.label(), "runtime session limit");
+        assert_eq!(failure.provider_reset, None);
+    }
+
+    #[test]
+    fn retryable_worker_failure_rejects_task_prose_and_ordinary_exit_one() {
+        let temp = TempDir::new("provider-limit-lookalikes");
+        let stdout_path = temp.path().join("worker.out");
+        let stderr_path = temp.path().join("worker.err");
+        std::fs::write(
+            &stdout_path,
+            "The task says: You have hit your session limit · resets 9pm (America/Chicago)\n",
+        )
+        .expect("write task prose");
+        std::fs::write(&stderr_path, b"quota exceeded\n").expect("write ordinary stderr");
+        let result = dispatch::DispatchResult {
+            status: dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::ExitNonZero {
+                code: Some(1),
+            }),
+            worker_commit: None,
+            stdout_path,
+            stderr_path,
+            stdout_bytes: 76,
+            stderr_bytes: 15,
+        };
+
+        assert_eq!(retryable_failure_reason(&result).expect("classify"), None);
     }
 
     #[test]
@@ -12493,7 +12640,7 @@ dispatch_id = "fallback-worker"
         assert!(!format!("{reset_observation:?}").contains("secret-payload"));
 
         let cooldown_failure =
-            classify_retryable_failure("quota exceeded", now).expect("classified");
+            classify_retryable_failure("ERROR: quota exceeded", now).expect("classified");
         let cooldown_observation = runtime_observation(&roster, &cooldown_failure, 15, now);
         assert_eq!(
             cooldown_observation.expiry_basis,

@@ -524,6 +524,7 @@ fn record_adversarial_reviewer_events(
                     profile_id: Some(attempt.model.clone()),
                     artifact_refs,
                     outcome: Some(adversarial_reviewer_outcome(&attempt.outcome)),
+                    ..crate::run::EventInput::default()
                 },
             )
             .map_err(|error| format!("run artifact: {error}"))?;
@@ -559,6 +560,7 @@ fn record_adversarial_terminal_events(
                     profile_id: Some(attempt.model.clone()),
                     artifact_refs,
                     outcome: Some(adversarial_judge_outcome(&attempt.outcome)),
+                    ..crate::run::EventInput::default()
                 },
             )
             .map_err(|error| format!("run artifact: {error}"))?;

@@ -17,6 +17,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use crate::bursar::RuntimeLimitEvidence;
 
 /// Schema tag stamped on every manifest written by this module.
 pub(crate) const RUN_SCHEMA: &str = "conductor/run@2";
@@ -652,6 +653,8 @@ pub(crate) struct RunEvent {
     pub(crate) artifact_refs: Vec<ArtifactRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_limit: Option<RuntimeLimitEvidence>,
 }
 
 /// Fields pinned into a new run's manifest at creation.
@@ -674,6 +677,7 @@ pub(crate) struct EventInput {
     pub(crate) profile_id: Option<String>,
     pub(crate) artifact_refs: Vec<ArtifactRef>,
     pub(crate) outcome: Option<String>,
+    pub(crate) provider_limit: Option<RuntimeLimitEvidence>,
 }
 
 /// Handle to one created (or reopened) run directory; owns the manifest and
@@ -1291,6 +1295,7 @@ impl RunHandle {
             target: self.manifest.target.clone(),
             artifact_refs: input.artifact_refs,
             outcome: input.outcome.clone(),
+            provider_limit: input.provider_limit,
         };
         append_event_line(&self.events_path(), &event)?;
         self.next_seq += 1;
@@ -1330,6 +1335,7 @@ impl RunHandle {
                 outcome: Some(outcome.into()),
                 artifact_refs,
                 profile_id: None,
+                provider_limit: None,
             },
         )
     }
