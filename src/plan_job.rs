@@ -1029,12 +1029,17 @@ fn recheck_author<C: crate::bursar::BursarClient + ?Sized>(
     {
         return Err("approved plan author is no longer exactly eligible".to_string());
     }
-    let budget = crate::bursar::evaluate_budget(bursar, &approved.provider_id, true);
-    if matches!(budget.action, crate::bursar::BudgetAction::Defer) {
-        return Err(format!(
-            "approved plan author provider is deferred: {}",
-            budget.summary
-        ));
+    let report = bursar
+        .status()
+        .map_err(|error| format!("live Bursar provider status: {error}"))?;
+    let status = report.providers.get(&approved.provider_id).ok_or_else(|| {
+        "approved plan author provider is absent from live Bursar status".to_string()
+    })?;
+    if !matches!(
+        status.availability,
+        crate::bursar::Availability::Healthy | crate::bursar::Availability::Caution
+    ) {
+        return Err("approved plan author provider is no longer available".to_string());
     }
     Ok(())
 }
@@ -1131,5 +1136,274 @@ mod tests {
         .expect_err("dangling graph edges must fail");
 
         assert!(error.contains("dependency"));
+    }
+
+    #[derive(Clone)]
+    struct FakeBursar {
+        snapshot: crate::bursar::RosterSnapshot,
+        status: crate::bursar::StatusReport,
+    }
+
+    impl crate::bursar::BursarClient for FakeBursar {
+        fn status(&self) -> crate::bursar::Result<crate::bursar::StatusReport> {
+            Ok(self.status.clone())
+        }
+
+        fn roster_snapshot(&self) -> crate::bursar::Result<crate::bursar::RosterSnapshot> {
+            Ok(self.snapshot.clone())
+        }
+    }
+
+    struct FakeAuthor(Vec<Vec<u8>>);
+
+    impl PlanAuthor for FakeAuthor {
+        fn author(&self, _request: &PlanAuthorRequest) -> Result<Vec<u8>, String> {
+            self.0
+                .first()
+                .cloned()
+                .ok_or_else(|| "fake author has no output".to_string())
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "fixture constructs the exact multi-provider authoring environment"
+    )]
+    fn plan_fixture(label: &str) -> (TestDir, PlanJobPaths, crate::config::Config, FakeBursar) {
+        let temp = TestDir::new(label);
+        let checked_at = chrono::Utc::now().to_rfc3339();
+        let providers = ["anthropic", "codex", "opencode-go"]
+            .into_iter()
+            .map(|provider| {
+                (
+                    provider.to_string(),
+                    crate::bursar::ProviderStatus {
+                        availability: crate::bursar::Availability::Healthy,
+                        source: "test".to_string(),
+                        checked_at: checked_at.clone(),
+                        data_as_of: None,
+                        expires_at: Some("2100-01-01T00:00:00Z".to_string()),
+                        windows: vec![crate::bursar::Window {
+                            label: "test".to_string(),
+                            percent: Some(1.0),
+                            reset_at: None,
+                        }],
+                        reason: None,
+                        extra: serde_json::Map::new(),
+                    },
+                )
+            })
+            .collect();
+        let provider_rows = ["anthropic", "codex", "opencode-go"]
+            .into_iter()
+            .map(|provider| {
+                serde_json::json!({
+                    "provider_id": provider, "availability_key": provider, "enabled": true,
+                    "state": "healthy", "availability": "healthy", "checked_at": checked_at,
+                    "data_as_of": null, "expires_at": "2100-01-01T00:00:00Z", "reason": null,
+                    "eligible": true, "ineligibility_reason": null
+                })
+            })
+            .collect::<Vec<_>>();
+        let profile_rows = [
+            ("planner-a", "anthropic"),
+            ("planner-b", "codex"),
+            ("planner-c", "opencode-go"),
+        ]
+        .into_iter()
+        .map(|(profile_id, provider_id)| {
+            serde_json::json!({
+                "profile_id": profile_id, "provider_id": provider_id, "model": profile_id,
+                "harness": "pi", "dispatch_id": profile_id, "reasoning_effort": null,
+                "tier": "lead", "ceiling": "XL", "efficiency": "lean", "cost": 0.0,
+                "data_policy": "standard", "enabled": true, "roles": ["planner"],
+                "state": "healthy", "eligible": true, "ineligibility_reason": null
+            })
+        })
+        .collect::<Vec<_>>();
+        let roster = serde_json::json!({
+            "schema": "bursar/roster@2",
+            "generated_at": checked_at,
+            "source_artifact": {"path": "/fixture/roster.toml", "sha256": "a".repeat(64)},
+            "policy_sha256": "b".repeat(64),
+            "providers": provider_rows,
+            "profiles": profile_rows
+        });
+        let snapshot = crate::bursar::parse_roster_snapshot(roster.to_string().as_bytes())
+            .expect("strict fixture roster");
+        let config = crate::config::parse_str(
+            r#"
+[[role_binding]]
+role = "planner"
+profile_id = "planner-a"
+weight = 1
+enabled = true
+
+[[role_binding]]
+role = "planner"
+profile_id = "planner-b"
+weight = 1
+enabled = true
+
+[[role_binding]]
+role = "planner"
+profile_id = "planner-c"
+weight = 1
+enabled = true
+"#,
+        )
+        .expect("planner config");
+        (
+            temp,
+            PlanJobPaths {
+                state_dir: std::env::temp_dir().join(format!(
+                    "conductor-plan-state-{label}-{}",
+                    std::process::id()
+                )),
+                reports_home: std::env::temp_dir().join(format!(
+                    "conductor-plan-reports-{label}-{}",
+                    std::process::id()
+                )),
+            },
+            config,
+            FakeBursar {
+                snapshot,
+                status: crate::bursar::StatusReport {
+                    schema: "bursar/status@2".to_string(),
+                    checked_at,
+                    providers,
+                },
+            },
+        )
+    }
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "conductor-plan-test-{label}-{}-{}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().expect("nanos")
+            ));
+            std::fs::create_dir_all(&path).expect("temp dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn initialized_repo(temp: &TestDir) -> PathBuf {
+        let repo = temp.0.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        git(&repo, &["init"]);
+        git(&repo, &["config", "user.email", "test@example.invalid"]);
+        git(&repo, &["config", "user.name", "Conductor Test"]);
+        std::fs::write(repo.join("README"), "immutable").expect("input");
+        git(&repo, &["add", "README"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        repo
+    }
+
+    fn approve(paths: &PlanJobPaths, run_id: &str) {
+        let report_dir =
+            crate::deck::report_run_dir(&paths.reports_home, run_id).expect("report dir");
+        std::fs::write(
+            report_dir.join("responses.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "responses": {"dispatch-plan": {"value": "approved", "at": "2100-01-01T00:00:00Z"}}
+            }))
+            .expect("responses"),
+        )
+        .expect("write responses");
+    }
+
+    #[test]
+    fn artifact_implementation_plan_authoring_ends_at_awaiting_peer_without_repo_mutation() {
+        let (temp, paths, config, bursar) = plan_fixture("artifact");
+        let repo = initialized_repo(&temp);
+        let before = git_output(&repo, ["rev-parse", "HEAD"]).expect("head");
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo: repo.clone(),
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 0,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let author = FakeAuthor(vec![br#"{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()]);
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("dispatch");
+        assert_eq!(
+            status(&paths, &prepared.run_id).expect("status"),
+            "awaiting_peer"
+        );
+        assert_eq!(
+            git_output(&repo, ["rev-parse", "HEAD"]).expect("head"),
+            before
+        );
+    }
+
+    #[test]
+    fn bead_spec_with_open_questions_terminates_needs_input_without_target_mutation() {
+        let (temp, paths, config, bursar) = plan_fixture("bead");
+        let repo = initialized_repo(&temp);
+        let before = git_output(&repo, ["rev-parse", "HEAD"]).expect("head");
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo: repo.clone(),
+                input: PlanPrepareInput::Bead {
+                    bead_id: "conductor-plan-job".to_string(),
+                    bytes: b"{\"title\":\"plan\"}".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::Spec,
+                max_plan_revisions: 0,
+                require_second_opinion: true,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let author = FakeAuthor(vec![br#"{"schema":"conductor/plan-document@1","kind":"spec","title":"Spec","context":"Context","goals":["Goal"],"constraints":["Invariant"],"requirements":["Requirement"],"acceptance":["Acceptance"],"verification":["cargo test"],"non_goals":[],"risks":[],"assumptions":[],"open_questions":["Needs operator answer"]}"#.to_vec()]);
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("dispatch");
+        assert_eq!(
+            status(&paths, &prepared.run_id).expect("status"),
+            "needs_input"
+        );
+        assert_eq!(
+            git_output(&repo, ["rev-parse", "HEAD"]).expect("head"),
+            before
+        );
     }
 }
