@@ -3067,6 +3067,128 @@ enabled = true
         drop(temp);
     }
     #[test]
+    fn unbound_peer_candidate_exhaustion_finishes_blocked_without_degraded_success() {
+        let (temp, paths, config, fake) = plan_fixture("unbound-peer-exhaustion");
+        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let executor = ScriptedExecutor::new(
+            vec![Ok(implementation_document())],
+            Vec::new(),
+            vec![Err("simulated unbound peer crash".to_string())],
+            Vec::new(),
+        );
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert!(matches!(
+            run.plan().expect("plan").progress,
+            crate::run::PlanProgress::AwaitingPeer { peer: None, .. }
+        ));
+        for provider in ["anthropic", "codex", "opencode-go"] {
+            bursar.exhaust(provider);
+        }
+        let calls_before = executor.calls.lock().expect("calls").len();
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let events = crate::run::read_events(&run.events_path()).expect("events");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.outcome.as_deref() == Some("peer_provider_diversity_degraded"))
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event.kind == crate::run::EventKind::AttemptFinished
+                    && event
+                        .plan_invocation
+                        .as_ref()
+                        .is_some_and(|evidence| evidence.stage == crate::run::PlanStage::PeerReview)
+            }),
+            "the exhausted unbound peer must not produce a successful review invocation"
+        );
+    }
+
+    #[test]
+    fn unbound_second_opinion_candidate_exhaustion_finishes_blocked_without_call() {
+        let (temp, paths, config, fake) = plan_fixture("unbound-second-exhaustion");
+        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::Spec,
+                max_plan_revisions: 1,
+                require_second_opinion: true,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let executor = ScriptedExecutor::new(
+            vec![Ok(spec_document())],
+            Vec::new(),
+            vec![Ok(peer_approve())],
+            vec![Err("simulated unbound second-opinion crash".to_string())],
+        );
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert!(matches!(
+            run.plan().expect("plan").progress,
+            crate::run::PlanProgress::AwaitingSecondOpinion { .. }
+        ));
+        for provider in ["anthropic", "codex", "opencode-go"] {
+            bursar.exhaust(provider);
+        }
+        let calls_before = executor.calls.lock().expect("calls").len();
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert!(
+            !crate::run::read_events(&run.events_path())
+                .expect("events")
+                .iter()
+                .any(|event| {
+                    event.kind == crate::run::EventKind::AttemptFinished
+                        && event.plan_invocation.as_ref().is_some_and(|evidence| {
+                            evidence.stage == crate::run::PlanStage::SecondOpinion
+                        })
+                }),
+            "the exhausted unbound second opinion must not produce a successful invocation"
+        );
+    }
+
+    #[test]
     fn loss_of_a_bound_peer_blocks_without_replacement() {
         let (temp, paths, config, fake) = plan_fixture("bound-peer-loss");
         let bursar = StatusSwitchBursar::from_fake(&fake);
