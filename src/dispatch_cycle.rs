@@ -6077,12 +6077,21 @@ fn record_runtime_observation(
         "recovery_boundary": evidence.expires_at.clone(),
         "evidence": evidence,
     });
-    deck::append_callout(
-        report_path,
-        level,
-        "BURSAR_OBSERVE",
-        &diagnostic.to_string(),
-    )
+    let markdown = format!(
+        "runtime provider observation {status}: {}/{}\n- roster: {}\n- provider: {}\n- model: {}\n- reason: {}\n- recovery boundary: {}\n- expiry basis: {}\n- cycle: {}\n- run: {}\n\n```json\n{}\n```",
+        item.repo,
+        item.issue_id,
+        roster.name,
+        observation.provider,
+        observation.model.as_deref().unwrap_or("-"),
+        observation.reason.label(),
+        observation.expires_at,
+        observation.expiry_basis.label(),
+        cycle_id,
+        run_id,
+        diagnostic,
+    );
+    deck::append_callout(report_path, level, "BURSAR_OBSERVE", &markdown)
     .map_err(|error| DispatchCycleError::message(format!("report runtime observation: {error}")))
 }
 
@@ -11481,7 +11490,24 @@ provider = "codex"
                 .is_some_and(|outcome| outcome.starts_with("provider_limited:"))
         );
         let report = std::fs::read_to_string(report_path(&reports, cycle_id)).expect("report");
-        assert!(report.contains("writeback-failed"));
+        let report: serde_json::Value = serde_json::from_str(&report).expect("report json");
+        let markdown = report["blocks"]
+            .as_array()
+            .expect("report blocks")
+            .iter()
+            .find(|block| {
+                block["type"] == "callout"
+                    && block["tag"] == "BURSAR_OBSERVE"
+                    && block["markdown"].as_str().is_some_and(|markdown| {
+                        markdown.contains("runtime provider observation writeback-failed")
+                    })
+            })
+            .and_then(|block| block["markdown"].as_str())
+            .expect("human-readable Bursar observation callout");
+        assert!(markdown.contains("\n- provider: opencode-go"));
+        assert!(markdown.contains("\n- recovery boundary: "));
+        assert!(markdown.contains("\n```json\n"));
+        assert!(markdown.ends_with("\n```"));
 
         let ledger_line = std::fs::read_to_string(&ledger).expect("ledger exists");
         let rows: Vec<serde_json::Value> = ledger_line
@@ -11515,6 +11541,62 @@ provider = "codex"
         );
         assert_eq!(rows[3]["model"], "fallback-worker");
         assert_eq!(rows[3]["verify_passed"], true);
+    }
+
+    #[test]
+    fn terminal_provider_limit_writes_exact_bead_diagnostic_and_releases_claim() {
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let fixture = run_terminal_provider_limit_case("bead-diagnostic", &bd);
+
+        assert_eq!(fixture.result.failed, 1);
+        assert_eq!(bd.release_count(), 1);
+        assert_eq!(bd.show(&fixture.repo, "sandbox-1").unwrap().status, "open");
+
+        let run_dir = single_contract_run(&fixture.state);
+        let events = crate::run::read_events(&run_dir.join("events.jsonl"))
+            .expect("read terminal provider-limit evidence");
+        let event = events
+            .iter()
+            .find(|event| event.provider_limit.is_some())
+            .expect("provider-limited terminal attempt");
+        let evidence = event.provider_limit.as_ref().expect("typed evidence");
+
+        let comment = bd
+            .comments()
+            .into_iter()
+            .find_map(|comment| {
+                serde_json::from_str::<serde_json::Value>(&comment)
+                    .ok()
+                    .filter(|value| value["event"] == "provider_limit")
+            })
+            .expect("provider-limit bead diagnostic");
+        assert_eq!(comment["run_id"], event.run_id);
+        assert_eq!(comment["repo"], "sandbox-repo");
+        assert_eq!(comment["issue_id"], "sandbox-1");
+        assert_eq!(comment["recovery_boundary"], evidence.expires_at);
+        assert_eq!(comment["evidence"]["provider"], "opencode-go");
+        assert_eq!(comment["evidence"]["model"], "primary-worker");
+        assert_eq!(comment["evidence"]["profile"], "primary-worker");
+    }
+
+    #[test]
+    fn terminal_provider_limit_comment_failure_keeps_terminal_evidence_and_claim_release() {
+        let bd = RecordingBdClient::new(sandbox_issue()).with_comment_failure();
+        let fixture = run_terminal_provider_limit_case("bead-comment-failure", &bd);
+
+        assert_eq!(fixture.result.failed, 1);
+        assert_eq!(bd.release_count(), 1);
+        assert_eq!(bd.show(&fixture.repo, "sandbox-1").unwrap().status, "open");
+        assert!(!bd.comments().iter().any(|comment| {
+            serde_json::from_str::<serde_json::Value>(comment)
+                .ok()
+                .is_some_and(|value| value["event"] == "provider_limit")
+        }));
+
+        let run_dir = single_contract_run(&fixture.state);
+        let events = crate::run::read_events(&run_dir.join("events.jsonl"))
+            .expect("read terminal provider-limit evidence");
+        assert!(events.iter().any(|event| event.provider_limit.is_some()));
     }
 
     #[test]
@@ -13424,6 +13506,95 @@ dispatch_id = "fake-worker"
         runs.pop().expect("one run")
     }
 
+    struct TerminalProviderLimitCase {
+        _temp: TempDir,
+        repo: PathBuf,
+        state: PathBuf,
+        result: DispatchCycleResult,
+    }
+
+    fn run_terminal_provider_limit_case(
+        label: &str,
+        bd: &RecordingBdClient,
+    ) -> TerminalProviderLimitCase {
+        let temp = TempDir::new(&format!("terminal-provider-limit-{label}"));
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+use_bursar = true
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "primary-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "primary-worker"
+provider = "opencode-go"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger/model-bench.jsonl");
+        let cycle_id = format!("cycle-terminal-provider-limit-{label}");
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            &cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "primary-worker",
+            &["primary-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, &cycle_id);
+        write_response(&reports, &cycle_id, "approved");
+        let bursar =
+            FakeBursarClient::with_provider_availability("opencode-go", Availability::Healthy);
+        let result = run_dispatch_cycle(
+            &cfg,
+            bd,
+            &FallbackExec::with_bursar(bursar.clone()),
+            &GitCommitProbe,
+            &reports,
+            &state,
+            &ledger,
+            &cycle_id,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            &RecordingLiveSink::new(true),
+            &bursar,
+        )
+        .expect("terminal provider limit is isolated to the item");
+        TerminalProviderLimitCase {
+            _temp: temp,
+            repo,
+            state,
+            result,
+        }
+    }
+
     fn assert_qualitative_contract_run(state: &Path, expected_review_events: usize) {
         let run_dir = single_contract_run(state);
         let events = crate::run::read_events(&run_dir.join("events.jsonl"))
@@ -13841,6 +14012,7 @@ dispatch_id = "fake-worker"
         /// pre-lease read and the reclaim's in-lease re-fetch. `None` disables
         /// the behavior.
         close_after_shows: RefCell<Option<usize>>,
+        comment_failures: RefCell<usize>,
     }
 
     impl RecordingBdClient {
@@ -13859,11 +14031,17 @@ dispatch_id = "fake-worker"
                 events: RefCell::new(Vec::new()),
                 claim_title: RefCell::new(None),
                 close_after_shows: RefCell::new(None),
+                comment_failures: RefCell::new(0),
             }
         }
 
         fn with_claim_title(self, title: &str) -> Self {
             *self.claim_title.borrow_mut() = Some(title.to_string());
+            self
+        }
+
+        fn with_comment_failure(self) -> Self {
+            *self.comment_failures.borrow_mut() = 1;
             self
         }
 
@@ -13895,6 +14073,17 @@ dispatch_id = "fake-worker"
                 .iter()
                 .filter(|event| matches!(event, BdEvent::Claim { .. }))
                 .count()
+        }
+
+        fn comments(&self) -> Vec<String> {
+            self.events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    BdEvent::Comment { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
         }
 
         fn set_title(&self, title: &str) {
@@ -13998,6 +14187,11 @@ dispatch_id = "fake-worker"
         }
 
         fn comment(&self, _repo: &Path, id: &str, text: &str) -> crate::bd::Result<Comment> {
+            let mut failures = self.comment_failures.borrow_mut();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(BdError::new("fixture comment failure"));
+            }
             self.events.borrow_mut().push(BdEvent::Comment {
                 id: id.to_string(),
                 text: text.to_string(),
