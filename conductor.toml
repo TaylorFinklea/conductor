@@ -103,8 +103,14 @@ enabled = true
 
 [[role_binding]]
 role = "plan"
-profile_id = "opencode-go--omp--kimi-k3--max"
-weight = 20
+profile_id = "ollama-cloud--omp--glm-5.2--max"
+weight = 10
+enabled = true
+
+[[role_binding]]
+role = "plan"
+profile_id = "ollama-cloud--omp--minimax-m3--max"
+weight = 10
 enabled = true
 
 [adversarial_review]

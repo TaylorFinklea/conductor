@@ -2129,6 +2129,21 @@ mod tests {
         let cfg = parse_str(include_str!("../conductor.toml"))
             .expect("checked-in conductor.toml must parse");
         assert!(cfg.roster.is_empty());
+        let plan_bindings: Vec<(&str, u32)> = cfg
+            .role_bindings
+            .iter()
+            .filter(|binding| binding.role == "plan")
+            .map(|binding| (binding.profile_id.as_str(), binding.weight.get()))
+            .collect();
+        assert_eq!(
+            plan_bindings,
+            [
+                ("openai-codex--omp--gpt-5.6-sol--xhigh", 60),
+                ("anthropic--omp--claude-opus-4-8--max", 20),
+                ("ollama-cloud--omp--glm-5.2--max", 10),
+                ("ollama-cloud--omp--minimax-m3--max", 10),
+            ]
+        );
         assert_eq!(cfg.job_fallbacks.len(), 20);
         assert_eq!(
             cfg.job_fallbacks[0].profile_id,

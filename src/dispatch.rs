@@ -2060,6 +2060,33 @@ mod tests {
     }
 
     #[test]
+    fn omp_backend_preserves_exact_ollama_cloud_model_aliases() {
+        for dispatch_id in ["ollama-cloud/glm-5.2", "ollama-cloud/minimax-m3"] {
+            assert_eq!(
+                argv_for_backend(
+                    Backend::Omp,
+                    dispatch_id,
+                    Some(ReasoningEffort::Max),
+                    PROMPT,
+                    Path::new("/tmp/repo"),
+                )
+                .expect("OMP argv"),
+                vec![
+                    "omp",
+                    "--model",
+                    dispatch_id,
+                    "--thinking",
+                    "max",
+                    "--auto-approve",
+                    "--no-session",
+                    "-p",
+                    PROMPT,
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn timeout_path_sends_term_then_waits_grace_then_kills() {
         let temp = TempDir::new("timeout");
         let repo = temp.path().join("repo");

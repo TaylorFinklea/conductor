@@ -1849,7 +1849,8 @@ mod tests {
             BTreeMap::from([
                 ("openai-codex--omp--gpt-5.6-sol--xhigh", 60),
                 ("anthropic--omp--claude-opus-4-8--max", 20),
-                ("opencode-go--omp--kimi-k3--max", 20),
+                ("ollama-cloud--omp--glm-5.2--max", 10),
+                ("ollama-cloud--omp--minimax-m3--max", 10),
             ])
         );
     }
