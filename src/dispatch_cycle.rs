@@ -51,6 +51,8 @@ pub(crate) struct DispatchCycleOptions {
     interrupt_before_review: bool,
     #[cfg(test)]
     promotion_interruption: Option<PromotionInterruption>,
+    #[cfg(test)]
+    fail_legacy_adoption_event_write: bool,
 }
 
 #[cfg(test)]
@@ -78,6 +80,8 @@ impl DispatchCycleOptions {
             interrupt_before_review: false,
             #[cfg(test)]
             promotion_interruption: None,
+            #[cfg(test)]
+            fail_legacy_adoption_event_write: false,
         }
     }
 
@@ -89,6 +93,7 @@ impl DispatchCycleOptions {
             resume: false,
             interrupt_before_review: false,
             promotion_interruption: None,
+            fail_legacy_adoption_event_write: false,
         }
     }
 
@@ -107,6 +112,12 @@ impl DispatchCycleOptions {
     #[cfg(test)]
     const fn interrupt_promotion_at(mut self, boundary: PromotionInterruption) -> Self {
         self.promotion_interruption = Some(boundary);
+        self
+    }
+
+    #[cfg(test)]
+    const fn fail_legacy_adoption_event_write(mut self) -> Self {
+        self.fail_legacy_adoption_event_write = true;
         self
     }
 }
@@ -1879,7 +1890,28 @@ fn dispatch_one<
                 // evidence, and the retry dispatched below must be able to
                 // reuse this capture rather than it being archived and
                 // forgotten.
-                run_artifacts
+                #[cfg(test)]
+                let coverage_event = if options.fail_legacy_adoption_event_write {
+                    Err(DispatchCycleError::message(
+                        "injected legacy-adoption coverage event write failure",
+                    ))
+                } else {
+                    run_artifacts
+                        .append_event(
+                            EventKind::CoverageGap,
+                            EventInput {
+                                artifact_refs: capture.artifact.clone().into_iter().collect(),
+                                outcome: Some(format!(
+                                    "legacy_dirty_repo_adopted: {}",
+                                    capture.summary()
+                                )),
+                                ..EventInput::default()
+                            },
+                        )
+                        .map_err(run_artifact_error)
+                };
+                #[cfg(not(test))]
+                let coverage_event = run_artifacts
                     .append_event(
                         EventKind::CoverageGap,
                         EventInput {
@@ -1891,7 +1923,17 @@ fn dispatch_one<
                             ..EventInput::default()
                         },
                     )
-                    .map_err(run_artifact_error)?;
+                    .map_err(run_artifact_error);
+                if let Err(error) = coverage_event {
+                    return Err(finish_and_release_claim(
+                        bd,
+                        &repo_path,
+                        &item.issue_id,
+                        &mut run_artifacts,
+                        "legacy_adoption_event_error",
+                        error,
+                    ));
+                }
                 legacy_capture = Some(capture);
             }
             Ok(_) => {}
@@ -1939,7 +1981,6 @@ fn dispatch_one<
         Ok(outcome) => outcome,
         Err(error) if error.preserves_claim() => return Err(error),
         Err(error) => {
-            let _ = bd.release(&repo_path, &item.issue_id);
             let _ = bd.comment(
                 &repo_path,
                 &item.issue_id,
@@ -1959,16 +2000,19 @@ fn dispatch_one<
                 cycle_id,
                 &format!("worker spawn failed: {error}"),
             );
-            run_artifacts
-                .finish("dispatch_error")
-                .map_err(run_artifact_error)?;
-            return Err(DispatchCycleError::message(format!("dispatch: {error}")));
+            return Err(finish_and_release_claim(
+                bd,
+                &repo_path,
+                &item.issue_id,
+                &mut run_artifacts,
+                "dispatch_error",
+                DispatchCycleError::message(format!("dispatch: {error}")),
+            ));
         }
     };
     let worker_attempt = match worker_outcome {
         WorkerChainOutcome::Ran(worker_attempt) => worker_attempt,
         WorkerChainOutcome::Deferred { summary, attempts } => {
-            let _ = bd.release(&repo_path, &item.issue_id);
             let disposition = if attempts == 0 {
                 format!("budget deferred: {summary}")
             } else {
@@ -1979,9 +2023,13 @@ fn dispatch_one<
                 &item.issue_id,
                 &format!("conductor: {cycle_id} {} {disposition}", item.issue_id),
             );
-            run_artifacts
-                .finish("deferred")
-                .map_err(run_artifact_error)?;
+            finish_work_run_then_release_claim(
+                bd,
+                &repo_path,
+                &item.issue_id,
+                &mut run_artifacts,
+                "deferred",
+            )?;
             append_ledger(
                 ledger_path,
                 roster,
@@ -5246,6 +5294,20 @@ fn run_artifact_error(error: crate::run::RunError) -> DispatchCycleError {
     DispatchCycleError::message(format!("run artifact: {}", error.into_message()))
 }
 
+fn finish_work_run_then_release_claim<B: BdClient + ?Sized>(
+    bd: &B,
+    repo_path: &Path,
+    issue_id: &str,
+    run_artifacts: &mut RunHandle,
+    outcome: &str,
+) -> std::result::Result<(), DispatchCycleError> {
+    run_artifacts.finish(outcome).map_err(run_artifact_error)?;
+    bd.release(repo_path, issue_id).map_err(|error| {
+        DispatchCycleError::message(format!("claim release after dispatch failure: {error}"))
+    })?;
+    Ok(())
+}
+
 fn finish_and_release_claim<B: BdClient + ?Sized>(
     bd: &B,
     repo_path: &Path,
@@ -5254,11 +5316,9 @@ fn finish_and_release_claim<B: BdClient + ?Sized>(
     outcome: &str,
     error: DispatchCycleError,
 ) -> DispatchCycleError {
-    let finish_error = run_artifacts.finish(outcome).err().map(run_artifact_error);
-    let release_error = bd.release(repo_path, issue_id).err().map(|error| {
-        DispatchCycleError::message(format!("claim release after dispatch failure: {error}"))
-    });
-    finish_error.or(release_error).unwrap_or(error)
+    finish_work_run_then_release_claim(bd, repo_path, issue_id, run_artifacts, outcome)
+        .err()
+        .unwrap_or(error)
 }
 
 /// A work run's heartbeat must go quiet for at least this long before its bd
@@ -6572,6 +6632,169 @@ mod tests {
         assert_eq!(bd.release_count(), 1);
         assert!(exec.spawns().is_empty());
         assert!(report_json_string(&reports, cycle_id).contains("REPLAN_REQUIRED"));
+    }
+
+    #[test]
+    fn post_claim_head_failure_releases_without_creating_a_resumable_run() {
+        let temp = TempDir::new("post-claim-head-failure");
+        let repo = temp.path().join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+        let cfg = config::parse_str(fixture_config(temp.path())).expect("config parses");
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+        let cycle_id = "cycle-post-claim-head-failure";
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = SandboxExec::new();
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &FailFirstHeadProbe::new(),
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            &RecordingLiveSink::new(true),
+            &FakeBursarClient::unavailable(),
+        )
+        .expect("head lookup failure is isolated to its approved item");
+
+        assert_eq!(result.dispatched, 0);
+        assert_eq!(result.failed, 1);
+        assert_eq!(bd.claim_count(), 1);
+        assert_eq!(bd.release_count(), 1);
+        assert_eq!(bd.show(&repo, "sandbox-1").unwrap().status, "open");
+        assert!(exec.spawns().is_empty());
+        assert!(
+            !crate::run::runs_dir(&state).exists(),
+            "a failed pre-run head lookup must not leave a resumable run"
+        );
+    }
+
+    #[test]
+    fn post_claim_legacy_adoption_event_failure_finishes_and_releases_before_worker_starts() {
+        let temp = TempDir::new("legacy-adoption-event-failure");
+        let repo = temp.path().join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+        let canonical_repo = std::fs::canonicalize(&repo)
+            .expect("canonicalize repo")
+            .display()
+            .to_string();
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+
+        let mut stranded_run = RunHandle::create_at(
+            &state,
+            RunJob::Work,
+            NewRun {
+                target: RunTarget {
+                    repo: canonical_repo,
+                    bead: Some("sandbox-1".to_string()),
+                },
+                approved_profiles: vec!["fake-worker".to_string()],
+                bursar_roster_artifact: None,
+                roster_snapshot: None,
+                limits: RunLimits::default(),
+                verifier: RunVerifier::default(),
+                work: Some(WorkState {
+                    cycle_id: "cycle-legacy-original".to_string(),
+                    authorization_sha256: "a".repeat(64),
+                    before_head: None,
+                    owner_pid: None,
+                    worker_pgid: None,
+                    worker_profile: None,
+                    worker_commit: None,
+                    mechanical: None,
+                    stage: WorkStage::Implementing,
+                }),
+                approval: None,
+            },
+            Utc::now(),
+        )
+        .expect("create stranded legacy run");
+        let stranded_run_id = stranded_run.run_id().to_string();
+        stranded_run.finish("failed").expect("finish stranded legacy run");
+
+        let mut cfg = config::parse_str(fixture_config(temp.path())).expect("config parses");
+        cfg.budgets
+            .authorized_legacy_run_ids
+            .push(stranded_run_id.clone());
+        std::fs::write(repo.join("README.md"), b"sandbox\nlegacy dirty edit\n")
+            .expect("dirty tracked file");
+
+        let cycle_id = "cycle-legacy-adoption-event-failure";
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = SandboxExec::new();
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &GitCommitProbe,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1))
+                .fail_legacy_adoption_event_write(),
+            &RecordingLiveSink::new(true),
+            &FakeBursarClient::unavailable(),
+        )
+        .expect("post-claim event write failure is isolated to its approved item");
+
+        assert_eq!(result.dispatched, 0);
+        assert_eq!(result.failed, 1);
+        assert_eq!(bd.claim_count(), 1);
+        assert_eq!(bd.release_count(), 1);
+        assert_eq!(bd.show(&repo, "sandbox-1").unwrap().status, "open");
+        assert!(exec.spawns().is_empty());
+
+        let new_run_dir = std::fs::read_dir(crate::run::runs_dir(&state))
+            .expect("runs dir")
+            .map(|entry| entry.expect("run entry").path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name != stranded_run_id)
+            })
+            .expect("failed attempt run exists");
+        let manifest = crate::run::read_manifest(&new_run_dir.join("manifest.json"))
+            .expect("read terminal run manifest");
+        assert_eq!(manifest.lifecycle, crate::run::RunLifecycle::Finished);
+        assert_eq!(
+            manifest.outcome.as_deref(),
+            Some("legacy_adoption_event_error")
+        );
     }
 
     #[test]
@@ -12915,6 +13138,52 @@ dispatch_id = "fake-worker"
             _commit: &str,
         ) -> crate::dispatch::Result<Option<String>> {
             panic!("commit probe should not run")
+        }
+    }
+
+    struct FailFirstHeadProbe {
+        failed: RefCell<bool>,
+    }
+
+    impl FailFirstHeadProbe {
+        fn new() -> Self {
+            Self {
+                failed: RefCell::new(false),
+            }
+        }
+    }
+
+    impl CommitProbe for FailFirstHeadProbe {
+        fn head(&self, repo: &Path) -> crate::dispatch::Result<Option<String>> {
+            let mut failed = self.failed.borrow_mut();
+            if !*failed {
+                *failed = true;
+                return Err(crate::dispatch::DispatchError::new(
+                    "injected post-claim head failure",
+                ));
+            }
+            GitCommitProbe.head(repo)
+        }
+
+        fn is_clean(&self, repo: &Path) -> crate::dispatch::Result<bool> {
+            GitCommitProbe.is_clean(repo)
+        }
+
+        fn is_direct_child(
+            &self,
+            repo: &Path,
+            before: Option<&str>,
+            commit: &str,
+        ) -> crate::dispatch::Result<bool> {
+            GitCommitProbe.is_direct_child(repo, before, commit)
+        }
+
+        fn committer_email(
+            &self,
+            repo: &Path,
+            commit: &str,
+        ) -> crate::dispatch::Result<Option<String>> {
+            GitCommitProbe.committer_email(repo, commit)
         }
     }
 
