@@ -5,7 +5,7 @@
 use std::fmt;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -104,6 +104,27 @@ pub(crate) struct VerifyOutcome {
     pub(crate) review_attempts: Vec<ReviewRecord>,
 }
 
+/// A post-terminal Bead mutation that callers must apply only after the
+/// review evidence and terminal run state are durable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeferredReviewAction {
+    Close {
+        reason: String,
+    },
+    Release {
+        metadata_key: String,
+        metadata_value: String,
+        comment: String,
+    },
+}
+
+/// A qualitative verdict with no Bead mutation performed yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeferredReviewOutcome {
+    pub(crate) outcome: VerifyOutcome,
+    pub(crate) action: Option<DeferredReviewAction>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MechanicalOutcome {
     Passed { worker_commit: String },
@@ -194,6 +215,29 @@ pub(crate) fn run_mechanical<B: BdClient + ?Sized, E: Exec + ?Sized, C: CommitPr
     run_mechanical_with_backoff(bd, exec, commits, request, ORCHESTRA_RETRY_BACKOFF)
 }
 
+/// Runs every mechanical verifier subprocess within the caller-owned item
+/// deadline instead of granting each verifier a new full stage timeout.
+pub(crate) fn run_mechanical_until<
+    B: BdClient + ?Sized,
+    E: Exec + ?Sized,
+    C: CommitProbe + ?Sized,
+>(
+    bd: &B,
+    exec: &E,
+    commits: &C,
+    request: &VerifyRequest,
+    deadline: Instant,
+) -> Result<MechanicalOutcome> {
+    run_mechanical_with_backoff_deadline(
+        bd,
+        exec,
+        commits,
+        request,
+        ORCHESTRA_RETRY_BACKOFF,
+        Some(deadline),
+    )
+}
+
 pub(crate) fn run_review_stage<B: BdClient + ?Sized, E: Exec + ?Sized>(
     bd: &B,
     exec: &E,
@@ -204,12 +248,132 @@ pub(crate) fn run_review_stage<B: BdClient + ?Sized, E: Exec + ?Sized>(
     review_or_pass(bd, exec, request, Some(review), timeout)
 }
 
+/// Runs qualitative review without mutating its Bead. The caller must first
+/// persist `outcome` and the returned action as terminal run evidence, then
+/// replay the action exactly once.
+pub(crate) fn run_review_stage_deferred<E: Exec + ?Sized>(
+    exec: &E,
+    request: &VerifyRequest,
+    review: &ReviewSettings,
+    timeout: Duration,
+) -> Result<DeferredReviewOutcome> {
+    run_review_stage_deferred_until(exec, request, review, Instant::now() + timeout)
+}
+
+/// Same as [`run_review_stage_deferred`], but every review and repair spawn
+/// receives only the time left before one caller-owned absolute deadline.
+pub(crate) fn run_review_stage_deferred_until<E: Exec + ?Sized>(
+    exec: &E,
+    request: &VerifyRequest,
+    review: &ReviewSettings,
+    deadline: Instant,
+) -> Result<DeferredReviewOutcome> {
+    let decision = run_review_until(exec, request, review, deadline)?;
+    match decision {
+        ReviewDecision::NotNeeded => {
+            let reason = format!(
+                "conductor {}: verified via {}",
+                request.cycle_id, request.verify_cmd
+            );
+            Ok(DeferredReviewOutcome {
+                outcome: VerifyOutcome {
+                    decision: VerifyDecision::Passed,
+                    verify_passed: true,
+                    summary: reason.clone(),
+                    review_dispatches: 0,
+                    review: None,
+                    review_attempts: Vec::new(),
+                },
+                action: Some(DeferredReviewAction::Close { reason }),
+            })
+        }
+        ReviewDecision::Ship { record, attempts } => {
+            let reason = format!(
+                "conductor {}: verified via {}",
+                request.cycle_id, request.verify_cmd
+            );
+            Ok(DeferredReviewOutcome {
+                outcome: VerifyOutcome {
+                    decision: VerifyDecision::Passed,
+                    verify_passed: true,
+                    summary: reason.clone(),
+                    review_dispatches: attempts.len() as u64,
+                    review: Some(record),
+                    review_attempts: attempts,
+                },
+                action: Some(DeferredReviewAction::Close { reason }),
+            })
+        }
+        ReviewDecision::Revise {
+            record,
+            findings,
+            attempts,
+        } => {
+            let summary = review_findings_summary(&findings);
+            let metadata_key = CONDUCTOR_REVISE_FINDINGS_METADATA_KEY.to_string();
+            let metadata_value = review_findings_metadata_value(&findings);
+            let comment = format!(
+                "conductor: {} {} qualitative review requested revisions:\n{}",
+                request.cycle_id,
+                request.issue.id,
+                review_findings_bullets(&findings)
+            );
+            Ok(DeferredReviewOutcome {
+                outcome: VerifyOutcome {
+                    decision: VerifyDecision::Failed,
+                    verify_passed: false,
+                    summary,
+                    review_dispatches: attempts.len() as u64,
+                    review: Some(record),
+                    review_attempts: attempts,
+                },
+                action: Some(DeferredReviewAction::Release {
+                    metadata_key,
+                    metadata_value,
+                    comment,
+                }),
+            })
+        }
+        ReviewDecision::InfrastructureFailure {
+            dispatches,
+            record,
+            attempts,
+            summary,
+        } => Ok(DeferredReviewOutcome {
+            outcome: VerifyOutcome {
+                decision: VerifyDecision::PendingReview,
+                verify_passed: false,
+                summary,
+                review_dispatches: dispatches,
+                review: record,
+                review_attempts: attempts,
+            },
+            action: None,
+        }),
+    }
+}
+
 fn run_mechanical_with_backoff<B: BdClient + ?Sized, E: Exec + ?Sized, C: CommitProbe + ?Sized>(
     bd: &B,
     exec: &E,
     commits: &C,
     request: &VerifyRequest,
     retry_backoff: Duration,
+) -> Result<MechanicalOutcome> {
+    run_mechanical_with_backoff_deadline(bd, exec, commits, request, retry_backoff, None)
+}
+
+fn run_mechanical_with_backoff_deadline<
+    B: BdClient + ?Sized,
+    E: Exec + ?Sized,
+    C: CommitProbe + ?Sized,
+>(
+    bd: &B,
+    exec: &E,
+    commits: &C,
+    request: &VerifyRequest,
+    retry_backoff: Duration,
+    deadline: Option<Instant>,
 ) -> Result<MechanicalOutcome> {
     if let Some(summary) = worker_failure_summary(&request.worker_status) {
         return fail(bd, request, VerifyDecision::Failed, summary).map(MechanicalOutcome::Failed);
@@ -234,7 +398,30 @@ fn run_mechanical_with_backoff<B: BdClient + ?Sized, E: Exec + ?Sized, C: Commit
         .clone()
         .expect("worker commit check requires authenticated commit");
 
-    let verify_run = run_spawn(exec, &verify_spawn(request)?)?;
+    let verify_run = match deadline {
+        Some(deadline) => {
+            let Some(timeout) = deadline_remaining(deadline) else {
+                return fail(
+                    bd,
+                    request,
+                    VerifyDecision::Failed,
+                    "mechanical verifier budget exhausted before spawn".to_string(),
+                )
+                .map(MechanicalOutcome::Failed);
+            };
+            run_spawn_with_timeout(exec, &verify_spawn(request)?, timeout)?
+        }
+        None => run_spawn(exec, &verify_spawn(request)?)?,
+    };
+    if verify_run.timed_out {
+        return fail(
+            bd,
+            request,
+            VerifyDecision::Failed,
+            "mechanical verifier timed out".to_string(),
+        )
+        .map(MechanicalOutcome::Failed);
+    }
     if !verify_run.status.success() {
         return fail(
             bd,
@@ -249,7 +436,7 @@ fn run_mechanical_with_backoff<B: BdClient + ?Sized, E: Exec + ?Sized, C: Commit
     }
 
     if should_run_orchestra(request) {
-        match run_orchestra_with_retry(exec, request, retry_backoff)? {
+        match run_orchestra_with_retry(exec, request, retry_backoff, deadline)? {
             OrchestraDecision::Passed => Ok(MechanicalOutcome::Passed { worker_commit }),
             OrchestraDecision::Failed(summary) => {
                 fail(bd, request, VerifyDecision::Failed, summary).map(MechanicalOutcome::Failed)
@@ -426,6 +613,12 @@ fn run_spawn_with_timeout<E: Exec + ?Sized>(
         stderr_path,
         timed_out: false,
     })
+}
+
+fn deadline_remaining(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
 }
 
 fn verify_spawn(request: &VerifyRequest) -> Result<SpawnRequest> {
@@ -652,15 +845,24 @@ fn review_revise<B: BdClient + ?Sized>(
     })
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "keeps qualitative review attempts and bounded repair flow together"
-)]
 fn run_review<E: Exec + ?Sized>(
     exec: &E,
     request: &VerifyRequest,
     settings: &ReviewSettings,
     timeout: Duration,
+) -> Result<ReviewDecision> {
+    run_review_until(exec, request, settings, Instant::now() + timeout)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps qualitative review attempts and bounded repair flow together"
+)]
+fn run_review_until<E: Exec + ?Sized>(
+    exec: &E,
+    request: &VerifyRequest,
+    settings: &ReviewSettings,
+    deadline: Instant,
 ) -> Result<ReviewDecision> {
     let reviewer = match reviewer_for(settings) {
         ReviewerSelection::NotNeeded => return Ok(ReviewDecision::NotNeeded),
@@ -675,6 +877,14 @@ fn run_review<E: Exec + ?Sized>(
                 ),
             });
         }
+    };
+    let Some(timeout) = deadline_remaining(deadline) else {
+        return Ok(ReviewDecision::InfrastructureFailure {
+            dispatches: 0,
+            record: None,
+            attempts: Vec::new(),
+            summary: "qualitative review budget exhausted before spawn".to_string(),
+        });
     };
     let prompt = review_prompt(request, settings, reviewer);
     let run = run_spawn_with_timeout(exec, &review_spawn(request, reviewer, &prompt)?, timeout)?;
@@ -716,11 +926,19 @@ fn run_review<E: Exec + ?Sized>(
                 false,
                 &format!("qualitative review initial attempt: {summary}"),
             );
+            let Some(repair_timeout) = deadline_remaining(deadline) else {
+                return Ok(ReviewDecision::InfrastructureFailure {
+                    dispatches: 1,
+                    record: Some(initial_record.clone()),
+                    attempts: vec![initial_record],
+                    summary: "qualitative review budget exhausted before repair spawn".to_string(),
+                });
+            };
             let repair_prompt = review_repair_prompt(&prompt, &run.stdout_path);
             let repair_run = run_spawn_with_timeout(
                 exec,
                 &review_repair_spawn(request, reviewer, &repair_prompt)?,
-                timeout,
+                repair_timeout,
             )?;
             if repair_run.timed_out {
                 let repair_summary = "qualitative review repair timed out".to_string();
@@ -1041,16 +1259,26 @@ fn run_orchestra_with_retry<E: Exec + ?Sized>(
     exec: &E,
     request: &VerifyRequest,
     retry_backoff: Duration,
+    deadline: Option<Instant>,
 ) -> Result<OrchestraDecision> {
-    match run_orchestra_attempt(exec, request, "orchestra")? {
+    match run_orchestra_attempt(exec, request, "orchestra", deadline)? {
         OrchestraAttempt::Passed => Ok(OrchestraDecision::Passed),
         OrchestraAttempt::Failed(summary) => Ok(OrchestraDecision::Failed(summary)),
         OrchestraAttempt::HardError(summary) => Ok(OrchestraDecision::HardError(summary)),
         OrchestraAttempt::Wedged => {
             if !retry_backoff.is_zero() {
-                std::thread::sleep(retry_backoff);
+                if let Some(deadline) = deadline {
+                    let Some(remaining) = deadline_remaining(deadline) else {
+                        return Ok(OrchestraDecision::Failed(
+                            "orchestra verifier budget exhausted before retry spawn".to_string(),
+                        ));
+                    };
+                    std::thread::sleep(retry_backoff.min(remaining));
+                } else {
+                    std::thread::sleep(retry_backoff);
+                }
             }
-            match run_orchestra_attempt(exec, request, "orchestra-retry")? {
+            match run_orchestra_attempt(exec, request, "orchestra-retry", deadline)? {
                 OrchestraAttempt::Passed => Ok(OrchestraDecision::Passed),
                 OrchestraAttempt::Failed(summary) => Ok(OrchestraDecision::Failed(summary)),
                 OrchestraAttempt::HardError(summary) => Ok(OrchestraDecision::HardError(summary)),
@@ -1066,8 +1294,24 @@ fn run_orchestra_attempt<E: Exec + ?Sized>(
     exec: &E,
     request: &VerifyRequest,
     suffix: &str,
+    deadline: Option<Instant>,
 ) -> Result<OrchestraAttempt> {
-    let run = run_spawn(exec, &orchestra_spawn(request, suffix)?)?;
+    let run = match deadline {
+        Some(deadline) => {
+            let Some(timeout) = deadline_remaining(deadline) else {
+                return Ok(OrchestraAttempt::Failed(
+                    "orchestra verifier budget exhausted before spawn".to_string(),
+                ));
+            };
+            run_spawn_with_timeout(exec, &orchestra_spawn(request, suffix)?, timeout)?
+        }
+        None => run_spawn(exec, &orchestra_spawn(request, suffix)?)?,
+    };
+    if run.timed_out {
+        return Ok(OrchestraAttempt::Failed(
+            "orchestra verifier timed out".to_string(),
+        ));
+    }
     classify_orchestra(&run)
 }
 
@@ -1465,6 +1709,87 @@ mod tests {
             .expect("repair prompt");
         assert!(repair_prompt.contains("Verdict: ship with evidence"));
         assert!(repair_prompt.contains("UNTRUSTED PREVIOUS REVIEW OUTPUT"));
+    }
+
+    #[test]
+    fn deferred_review_records_ship_without_closing_the_bead() {
+        let temp = TempDir::new("deferred-review-ship");
+        let request = request(
+            temp.path(),
+            issue(false),
+            verify_config(false),
+            Some("before"),
+        );
+        let roster = review_roster();
+        let exec = FakeExec::new(vec![Process::exit(
+            0,
+            r#"{"verdict":"ship","findings":[]}"#,
+            "",
+        )]);
+        let settings = ReviewSettings {
+            config: ReviewConfig {
+                enabled: true,
+                min_tier_gap: 1,
+            },
+            roster: roster.clone(),
+            dispatched_model: roster[0].clone(),
+            item_tier_floor: Tier::Junior,
+        };
+
+        let deferred = run_review_stage_deferred(
+            &exec,
+            &request,
+            &settings,
+            Duration::from_secs(1),
+        )
+        .expect("review verdict is recorded without a Bead write");
+
+        assert_eq!(deferred.outcome.decision, VerifyDecision::Passed);
+        assert_eq!(
+            deferred.action,
+            Some(DeferredReviewAction::Close {
+                reason: format!(
+                    "conductor {}: verified via {}",
+                    request.cycle_id, request.verify_cmd
+                ),
+            })
+        );
+        assert_eq!(exec.spawns().len(), 1);
+    }
+
+    #[test]
+    fn deferred_review_leaves_verified_work_pending_when_deadline_is_exhausted_before_spawn() {
+        let temp = TempDir::new("deferred-review-deadline");
+        let request = request(
+            temp.path(),
+            issue(false),
+            verify_config(false),
+            Some("before"),
+        );
+        let roster = review_roster();
+        let exec = FakeExec::new(Vec::new());
+        let settings = ReviewSettings {
+            config: ReviewConfig {
+                enabled: true,
+                min_tier_gap: 1,
+            },
+            roster: roster.clone(),
+            dispatched_model: roster[0].clone(),
+            item_tier_floor: Tier::Junior,
+        };
+
+        let deferred =
+            run_review_stage_deferred_until(&exec, &request, &settings, Instant::now())
+                .expect("deadline exhaustion is a resumable review result");
+
+        assert_eq!(deferred.outcome.decision, VerifyDecision::PendingReview);
+        assert_eq!(deferred.outcome.review_dispatches, 0);
+        assert_eq!(
+            deferred.outcome.summary,
+            "qualitative review budget exhausted before spawn"
+        );
+        assert_eq!(deferred.action, None);
+        assert!(exec.spawns().is_empty());
     }
 
     #[test]

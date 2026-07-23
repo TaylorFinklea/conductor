@@ -12,6 +12,7 @@ use std::fmt;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,7 @@ use sha2::{Digest, Sha256};
 pub(crate) const RUN_SCHEMA: &str = "conductor/run@2";
 /// Schema tag stamped on every event line written by this module.
 pub(crate) const EVENT_SCHEMA: &str = "conductor/event@2";
+const TERMINAL_TRANSITION_PATH: &str = "artifacts/terminal-transition.json";
 
 pub(crate) type Result<T> = std::result::Result<T, RunError>;
 
@@ -187,6 +189,36 @@ pub(crate) struct MechanicalVerification {
     pub(crate) artifact_refs: Vec<ArtifactRef>,
 }
 
+/// The one Bead mutation a terminal work run may still owe after its durable
+/// evidence is complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TerminalTransitionAction {
+    Close,
+    Release,
+}
+
+/// Metadata that must be applied before a released review revision is made
+/// eligible for another approved cycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TerminalTransitionMetadata {
+    pub(crate) key: String,
+    pub(crate) value: String,
+}
+
+/// Content-addressed intent for the Bead mutation following `run_finished`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TerminalTransition {
+    pub(crate) action: TerminalTransitionAction,
+    pub(crate) reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) metadata: Option<TerminalTransitionMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) comment: Option<String>,
+}
+
 /// Work-only progress persisted inside the canonical run manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -231,6 +263,11 @@ pub(crate) struct WorkState {
     pub(crate) worker_commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mechanical: Option<MechanicalVerification>,
+    /// A fresh review-only allowance that an operator policy explicitly
+    /// approved for a `--resume` invocation. It is written before any resumed
+    /// reviewer can spawn; absent means recovery may revalidate only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) review_resume_budget_secs: Option<u64>,
     pub(crate) stage: WorkStage,
 }
 
@@ -845,7 +882,7 @@ impl RunHandle {
     pub(crate) fn open(state_dir: &Path, run_id: &str) -> Result<Self> {
         validate_run_id(run_id)?;
         let dir = runs_dir(state_dir).join(run_id);
-        let manifest = read_manifest(&dir.join("manifest.json"))?;
+        let mut manifest = read_manifest(&dir.join("manifest.json"))?;
         if manifest.run_id != run_id {
             return Err(RunError::new(format!(
                 "manifest run_id {:?} does not match directory {run_id:?}",
@@ -869,6 +906,12 @@ impl RunHandle {
             }
         }
         let last = events.last().expect("non-empty events checked above");
+        if matches!(last.kind, EventKind::RunFinished) {
+            validate_terminal_event(last)?;
+            if !matches!(manifest.lifecycle, RunLifecycle::Finished) {
+                reconcile_terminal_manifest(&dir, &mut manifest, last)?;
+            }
+        }
         if matches!(manifest.lifecycle, RunLifecycle::Finished)
             != matches!(last.kind, EventKind::RunFinished)
         {
@@ -1009,6 +1052,78 @@ impl RunHandle {
         })
     }
 
+    /// Persists the exact post-terminal Bead mutation before the transition is
+    /// attached to the terminal event. Repeating the same intent after a crash
+    /// is harmless; a different intent fails closed.
+    pub(crate) fn write_terminal_transition(
+        &self,
+        transition: &TerminalTransition,
+    ) -> Result<ArtifactRef> {
+        if matches!(self.manifest.lifecycle, RunLifecycle::Finished) {
+            return Err(RunError::new(
+                "cannot write a terminal transition on a finished run",
+            ));
+        }
+        validate_terminal_transition(transition)?;
+        let mut bytes = serde_json::to_vec_pretty(transition).map_err(|error| {
+            RunError::new(format!("failed to serialize terminal transition: {error}"))
+        })?;
+        bytes.push(b'\n');
+        let relative = Path::new(TERMINAL_TRANSITION_PATH);
+        let path = self.dir.join(relative);
+        match std::fs::read(&path) {
+            Ok(existing) if existing == bytes => Ok(artifact_ref(relative, &bytes)),
+            Ok(_) => Err(RunError::new(
+                "terminal transition already exists with different contents",
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                write_new_file(&path, &bytes)?;
+                Ok(artifact_ref(relative, &bytes))
+            }
+            Err(error) => Err(RunError::new(format!(
+                "failed to read terminal transition {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Reads the content-addressed Bead transition pinned to this run's final
+    /// event. An unreferenced transition file is deliberately ignored: it was
+    /// not made terminal evidence before the process stopped.
+    pub(crate) fn terminal_transition(&self) -> Result<Option<TerminalTransition>> {
+        if !matches!(self.manifest.lifecycle, RunLifecycle::Finished) {
+            return Ok(None);
+        }
+        let events = read_events(&self.events_path())?;
+        let terminal = events
+            .last()
+            .filter(|event| event.kind == EventKind::RunFinished)
+            .ok_or_else(|| RunError::new("finished run has no terminal event"))?;
+        validate_terminal_event(terminal)?;
+        if !terminal
+            .artifact_refs
+            .iter()
+            .any(|artifact| artifact.path == TERMINAL_TRANSITION_PATH)
+        {
+            return Ok(None);
+        }
+        let path = self.dir.join(TERMINAL_TRANSITION_PATH);
+        let bytes = std::fs::read(&path).map_err(|error| {
+            RunError::new(format!(
+                "failed to read terminal transition {}: {error}",
+                path.display()
+            ))
+        })?;
+        let transition = serde_json::from_slice(&bytes).map_err(|error| {
+            RunError::new(format!(
+                "failed to parse terminal transition {}: {error}",
+                path.display()
+            ))
+        })?;
+        validate_terminal_transition(&transition)?;
+        Ok(Some(transition))
+    }
+
     /// Copies an existing output into this run using create-new semantics and
     /// returns its content-addressed identity.
     pub(crate) fn capture_artifact(
@@ -1089,6 +1204,26 @@ impl RunHandle {
                 ..EventInput::default()
             },
         )
+    }
+
+    /// Records a policy-approved fresh budget before resuming a verifier or
+    /// review. The manifest write is deliberately before any resumed spawn.
+    pub(crate) fn record_review_resume_budget(&mut self, budget: Duration) -> Result<()> {
+        let seconds = budget.as_secs();
+        if seconds == 0 {
+            return Err(RunError::new(
+                "review resume budget must include at least one whole second",
+            ));
+        }
+        let work = self.work_mut("recording review resume budget")?;
+        if !matches!(work.stage, WorkStage::Implementing | WorkStage::PendingReview) {
+            return Err(RunError::new(
+                "review resume budget requires resumable work",
+            ));
+        }
+        work.review_resume_budget_secs = Some(seconds);
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()
     }
 
     /// Repairs the event-journal half of a checkpoint if the process stopped
@@ -1234,6 +1369,77 @@ impl RunHandle {
         bytes.push(b'\n');
         atomic_replace(&self.manifest_path(), &bytes)
     }
+}
+
+fn validate_terminal_event(event: &RunEvent) -> Result<()> {
+    let outcome = event
+        .outcome
+        .as_deref()
+        .filter(|outcome| !outcome.trim().is_empty())
+        .ok_or_else(|| RunError::new("terminal event has no outcome"))?;
+    if outcome != outcome.trim() {
+        return Err(RunError::new("terminal event outcome has surrounding whitespace"));
+    }
+    if event.profile_id.is_some() {
+        return Err(RunError::new("terminal event must not name a profile"));
+    }
+    Ok(())
+}
+
+fn validate_terminal_transition(transition: &TerminalTransition) -> Result<()> {
+    if transition.reason.trim().is_empty() || transition.reason != transition.reason.trim() {
+        return Err(RunError::new(
+            "terminal transition must have a non-empty trimmed reason",
+        ));
+    }
+    if let Some(metadata) = transition.metadata.as_ref() {
+        if metadata.key.trim().is_empty()
+            || metadata.value.trim().is_empty()
+            || metadata.key != metadata.key.trim()
+        {
+            return Err(RunError::new(
+                "terminal transition metadata must have a non-empty key and value",
+            ));
+        }
+    }
+    if let Some(comment) = transition.comment.as_deref() {
+        if comment.trim().is_empty() {
+            return Err(RunError::new(
+                "terminal transition comment must not be empty",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_terminal_manifest(
+    dir: &Path,
+    manifest: &mut RunManifest,
+    terminal: &RunEvent,
+) -> Result<()> {
+    if manifest.outcome.is_some() && manifest.outcome != terminal.outcome {
+        return Err(RunError::new(
+            "unfinished manifest outcome conflicts with terminal event outcome",
+        ));
+    }
+    if let RunDetails::Work {
+        state: Some(work),
+    } = &mut manifest.details
+    {
+        work.stage = WorkStage::Completed;
+    }
+    for artifact in &terminal.artifact_refs {
+        if !manifest.artifacts.contains(artifact) {
+            manifest.artifacts.push(artifact.clone());
+        }
+    }
+    manifest.lifecycle = RunLifecycle::Finished;
+    manifest.outcome.clone_from(&terminal.outcome);
+    manifest.updated_at = Utc::now().to_rfc3339();
+    let mut bytes = serde_json::to_vec_pretty(manifest)
+        .map_err(|error| RunError::new(format!("failed to serialize recovered manifest: {error}")))?;
+    bytes.push(b'\n');
+    atomic_replace(&dir.join("manifest.json"), &bytes)
 }
 
 fn work_state(manifest: &RunManifest) -> Option<&WorkState> {
@@ -2080,7 +2286,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::process::{Command, Stdio};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     struct TempDir(PathBuf);
 
@@ -2378,16 +2584,16 @@ mod tests {
     fn run_event_resume_repairs_interrupted_pending_review_checkpoint() {
         let temp = TempDir::new("resume-pending-review-event");
         let mut request = new_run_request();
-        request.work = Some(WorkState {
-            cycle_id: "cycle-20260717-015903".to_string(),
-            authorization_sha256: "b".repeat(64),
-            before_head: Some("d".repeat(40)),
-            owner_pid: None,
-            worker_pgid: None,
-            worker_profile: None,
-            worker_commit: None,
-            mechanical: None,
-            stage: WorkStage::Implementing,
+        request.work = Some(WorkState { cycle_id: "cycle-20260717-015903".to_string(),
+        authorization_sha256: "b".repeat(64),
+        before_head: Some("d".repeat(40)),
+        owner_pid: None,
+        worker_pgid: None,
+        worker_profile: None,
+        worker_commit: None,
+        mechanical: None,
+        stage: WorkStage::Implementing,
+        review_resume_budget_secs: None,
         });
         let mut handle = RunHandle::create_at(temp.path(), RunJob::Work, request, fixed_now())
             .expect("create work run");
@@ -2428,12 +2634,23 @@ mod tests {
 
         let mut reopened = RunHandle::open(temp.path(), &run_id)
             .expect("manifest checkpoint survives missing event");
+
         reopened
             .ensure_pending_review_event()
             .expect("repair verifier event");
         reopened
             .ensure_pending_review_event()
             .expect("repair is idempotent");
+        reopened
+            .record_review_resume_budget(Duration::from_secs(17))
+            .expect("record an explicitly approved review-resume budget");
+        assert_eq!(
+            reopened
+                .work()
+                .and_then(|work| work.review_resume_budget_secs),
+            Some(17),
+            "a resumed review may use only a budget durably recorded in its manifest",
+        );
 
         let events = read_events(&events_path).expect("read repaired events");
         let verify_events = events
@@ -2443,6 +2660,76 @@ mod tests {
         assert_eq!(verify_events.len(), 1);
         assert_eq!(verify_events[0].outcome.as_deref(), Some("passed"));
         assert_eq!(verify_events[0].artifact_refs, vec![artifact]);
+    }
+    #[test]
+    fn run_event_terminal_transition_is_hashed_and_read_only_after_finish() {
+        let temp = TempDir::new("terminal-transition");
+        let mut handle =
+            RunHandle::create_at(temp.path(), RunJob::Work, new_run_request(), fixed_now())
+                .expect("create run");
+        let transition = TerminalTransition {
+            action: TerminalTransitionAction::Close,
+            reason: "conductor cycle-1: verified via cargo test".to_string(),
+            metadata: None,
+            comment: None,
+        };
+        let artifact = handle
+            .write_terminal_transition(&transition)
+            .expect("persist terminal transition before the terminal event");
+        handle
+            .finish_with_artifacts("verified", vec![artifact])
+            .expect("finish run with transition evidence");
+        let run_id = handle.run_id().to_string();
+        drop(handle);
+
+        let reopened = RunHandle::open(temp.path(), &run_id).expect("open finished run");
+        assert_eq!(
+            reopened.terminal_transition().expect("read transition"),
+            Some(transition)
+        );
+        assert!(reopened
+            .write_terminal_transition(&TerminalTransition {
+                action: TerminalTransitionAction::Close,
+                reason: "different reason".to_string(),
+                metadata: None,
+                comment: None,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn run_event_open_recovers_authenticated_terminal_event_before_manifest_rewrite() {
+        let temp = TempDir::new("terminal-event-before-manifest");
+        let mut handle =
+            RunHandle::create_at(temp.path(), RunJob::Work, new_run_request(), fixed_now())
+                .expect("create run");
+        handle
+            .finish("verified")
+            .expect("append terminal evidence before the simulated crash");
+        let run_id = handle.run_id().to_string();
+        let manifest_path = handle.manifest_path();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
+        manifest["lifecycle"] = serde_json::json!("running");
+        manifest["outcome"] = serde_json::Value::Null;
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize interrupted manifest"),
+        )
+        .expect("persist interrupted manifest");
+        drop(handle);
+
+        let reopened =
+            RunHandle::open(temp.path(), &run_id).expect("recover authenticated terminal event");
+        assert_eq!(reopened.manifest().lifecycle, RunLifecycle::Finished);
+        assert_eq!(reopened.manifest().outcome.as_deref(), Some("verified"));
+        drop(reopened);
+
+        let reopened_again =
+            RunHandle::open(temp.path(), &run_id).expect("terminal recovery is idempotent");
+        assert_eq!(reopened_again.manifest().lifecycle, RunLifecycle::Finished);
+        assert_eq!(reopened_again.manifest().outcome.as_deref(), Some("verified"));
     }
 
     #[test]
@@ -2602,16 +2889,16 @@ mod tests {
 
     fn implementing_request_with_worker_pgid(worker_pgid: Option<u32>) -> NewRun {
         let mut request = new_run_request();
-        request.work = Some(WorkState {
-            cycle_id: "cycle-1".to_string(),
-            authorization_sha256: "b".repeat(64),
-            before_head: None,
-            owner_pid: None,
-            worker_pgid,
-            worker_profile: None,
-            worker_commit: None,
-            mechanical: None,
-            stage: WorkStage::Implementing,
+        request.work = Some(WorkState { cycle_id: "cycle-1".to_string(),
+        authorization_sha256: "b".repeat(64),
+        before_head: None,
+        owner_pid: None,
+        worker_pgid,
+        worker_profile: None,
+        worker_commit: None,
+        mechanical: None,
+        stage: WorkStage::Implementing,
+        review_resume_budget_secs: None,
         });
         request
     }
@@ -2794,16 +3081,16 @@ mod tests {
         let make_request = |bead: &str| {
             let mut request = new_run_request();
             request.target.bead = Some(bead.to_string());
-            request.work = Some(WorkState {
-                cycle_id: cycle_id.to_string(),
-                authorization_sha256: "b".repeat(64),
-                before_head: None,
-                owner_pid: None,
-                worker_pgid: None,
-                worker_profile: None,
-                worker_commit: None,
-                mechanical: None,
-                stage: WorkStage::Implementing,
+            request.work = Some(WorkState { cycle_id: cycle_id.to_string(),
+            authorization_sha256: "b".repeat(64),
+            before_head: None,
+            owner_pid: None,
+            worker_pgid: None,
+            worker_profile: None,
+            worker_commit: None,
+            mechanical: None,
+            stage: WorkStage::Implementing,
+            review_resume_budget_secs: None,
             });
             request
         };
@@ -2845,16 +3132,16 @@ mod tests {
         let make_request = || {
             let mut request = new_run_request();
             request.target.bead = Some("gen-bead".to_string());
-            request.work = Some(WorkState {
-                cycle_id: cycle_id.to_string(),
-                authorization_sha256: "b".repeat(64),
-                before_head: Some("d".repeat(40)),
-                owner_pid: Some(123),
-                worker_pgid: Some(456),
-                worker_profile: None,
-                worker_commit: None,
-                mechanical: None,
-                stage: WorkStage::Implementing,
+            request.work = Some(WorkState { cycle_id: cycle_id.to_string(),
+            authorization_sha256: "b".repeat(64),
+            before_head: Some("d".repeat(40)),
+            owner_pid: Some(123),
+            worker_pgid: Some(456),
+            worker_profile: None,
+            worker_commit: None,
+            mechanical: None,
+            stage: WorkStage::Implementing,
+            review_resume_budget_secs: None,
             });
             request
         };
@@ -2918,16 +3205,16 @@ mod tests {
         let make_request = || {
             let mut request = new_run_request();
             request.target.bead = Some("conflict-bead".to_string());
-            request.work = Some(WorkState {
-                cycle_id: cycle_id.to_string(),
-                authorization_sha256: "b".repeat(64),
-                before_head: None,
-                owner_pid: None,
-                worker_pgid: None,
-                worker_profile: None,
-                worker_commit: None,
-                mechanical: None,
-                stage: WorkStage::Implementing,
+            request.work = Some(WorkState { cycle_id: cycle_id.to_string(),
+            authorization_sha256: "b".repeat(64),
+            before_head: None,
+            owner_pid: None,
+            worker_pgid: None,
+            worker_profile: None,
+            worker_commit: None,
+            mechanical: None,
+            stage: WorkStage::Implementing,
+            review_resume_budget_secs: None,
             });
             request
         };

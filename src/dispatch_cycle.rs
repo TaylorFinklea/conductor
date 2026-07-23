@@ -27,7 +27,8 @@ use crate::plan::{
 use crate::quarantine;
 use crate::run::{
     EventInput, EventKind, NewRun, RosterSnapshotInput, RunHandle, RunJob, RunLimits, RunTarget,
-    RunVerifier, WorkStage, WorkState,
+    RunVerifier, TerminalTransition, TerminalTransitionAction, TerminalTransitionMetadata,
+    WorkStage, WorkState,
 };
 use crate::triage::{self, CandidateRejection};
 use crate::verify::{self, ReviewSettings, VerifyDecision, VerifyRequest};
@@ -46,6 +47,7 @@ pub(crate) enum ApprovalGate {
 pub(crate) struct DispatchCycleOptions {
     item_timeout: Duration,
     heartbeat_interval: Duration,
+    review_resume_budget: Option<Duration>,
     resume: bool,
     #[cfg(test)]
     interrupt_before_review: bool,
@@ -53,6 +55,28 @@ pub(crate) struct DispatchCycleOptions {
     promotion_interruption: Option<PromotionInterruption>,
     #[cfg(test)]
     fail_legacy_adoption_event_write: bool,
+}
+
+/// One monotonic ceiling for every spawn in a fresh dispatch invocation.
+/// Recovery creates a new instance only after `--resume` has explicitly
+/// authorized another loop budget.
+#[derive(Debug, Clone, Copy)]
+struct ItemDeadline {
+    instant: Instant,
+}
+
+impl ItemDeadline {
+    fn start(timeout: Duration) -> Self {
+        Self {
+            instant: Instant::now() + timeout,
+        }
+    }
+
+    fn remaining(self) -> Option<Duration> {
+        self.instant
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+    }
 }
 
 #[cfg(test)]
@@ -75,6 +99,10 @@ impl DispatchCycleOptions {
         Self {
             item_timeout: Duration::from_secs(u64::from(cfg.budgets.item_wall_clock_mins) * 60),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            review_resume_budget: cfg
+                .budgets
+                .review_resume_budget_mins
+                .map(|minutes| Duration::from_secs(u64::from(minutes) * 60)),
             resume,
             #[cfg(test)]
             interrupt_before_review: false,
@@ -90,6 +118,7 @@ impl DispatchCycleOptions {
         Self {
             item_timeout: Duration::from_secs(30),
             heartbeat_interval,
+            review_resume_budget: Some(Duration::from_secs(30)),
             resume: false,
             interrupt_before_review: false,
             promotion_interruption: None,
@@ -1650,6 +1679,7 @@ fn dispatch_one<
     bursar: &U,
     roster_snapshot: &RosterSnapshotInput,
 ) -> std::result::Result<DispatchOneResult, DispatchCycleError> {
+    let deadline = ItemDeadline::start(options.item_timeout);
     let repo_path = repo_path(cfg, &item.repo)?;
     let canonical_repo = std::fs::canonicalize(&repo_path)
         .map_err(|error| {
@@ -1679,6 +1709,21 @@ fn dispatch_one<
             });
         }
     };
+    if options.resume
+        && recover_terminal_claim_transition(
+            bd,
+            state_dir,
+            cycle_id,
+            &canonical_repo,
+            &repo_path,
+            &item.issue_id,
+        )?
+    {
+        return Ok(DispatchOneResult {
+            decision: None,
+            dispatches: 0,
+        });
+    }
     if let Some(run_id) =
         find_unauthenticated_recovery_run(state_dir, cycle_id, &canonical_repo, &item.issue_id)?
     {
@@ -2073,6 +2118,7 @@ fn dispatch_one<
         ledger_path,
         cycle_id,
         options,
+        deadline,
         live,
         report_path,
         cycle_start,
@@ -2168,6 +2214,7 @@ fn dispatch_one<
         ledger_path,
         cycle_id,
         options,
+        deadline,
         live,
         report_path,
         cycle_start,
@@ -2203,6 +2250,7 @@ fn complete_worker_verification<
     ledger_path: &Path,
     cycle_id: &str,
     options: &DispatchCycleOptions,
+    deadline: ItemDeadline,
     live: &L,
     report_path: &Path,
     cycle_start: Instant,
@@ -2251,7 +2299,8 @@ fn complete_worker_verification<
         dispatched_model: active_roster.clone(),
         item_tier_floor: extracted.routing.tier_floor,
     };
-    let mechanical = match verify::run_mechanical(bd, exec, commits, &verify_request) {
+    let mechanical =
+        match verify::run_mechanical_until(bd, exec, commits, &verify_request, deadline.instant) {
         Ok(outcome) => outcome,
         Err(error) => {
             return Err(DispatchCycleError::recovery_required(format!(
@@ -2369,9 +2418,14 @@ fn complete_worker_verification<
         ));
     }
     verify_request.issue = review_issue;
-    let outcome =
-        verify::run_review_stage(bd, exec, &verify_request, &review, options.item_timeout)
-            .map_err(|error| DispatchCycleError::message(format!("review: {error}")))?;
+    let deferred = verify::run_review_stage_deferred_until(
+        exec,
+        &verify_request,
+        &review,
+        deadline.instant,
+    )
+    .map_err(|error| DispatchCycleError::message(format!("review: {error}")))?;
+    let outcome = deferred.outcome;
     record_review_events(
         &mut run_artifacts,
         state_dir,
@@ -2379,22 +2433,6 @@ fn complete_worker_verification<
         &item.issue_id,
         &outcome,
     )?;
-    if verify_request.preserve_claim_on_failure
-        && matches!(
-            outcome.decision,
-            VerifyDecision::Failed | VerifyDecision::HardError
-        )
-    {
-        return Err(DispatchCycleError::recovery_required(format!(
-            "promoted worker qualitative review did not pass ({}); exact promotion receipt and claim retained for dispatch --resume",
-            outcome.summary
-        )));
-    }
-    if outcome.decision != VerifyDecision::PendingReview {
-        run_artifacts
-            .finish(verify_decision_label(outcome.decision))
-            .map_err(run_artifact_error)?;
-    }
     if outcome.decision == VerifyDecision::PendingReview {
         append_review_ledger(
             cfg,
@@ -2406,6 +2444,10 @@ fn complete_worker_verification<
             &outcome,
         )?;
     } else {
+        let action = deferred.action.as_ref().ok_or_else(|| {
+            DispatchCycleError::message("terminal qualitative review has no Bead transition")
+        })?;
+        let transition = finish_review_run(&mut run_artifacts, &outcome, action)?;
         append_outcome_ledger(
             cfg,
             ledger_path,
@@ -2416,6 +2458,7 @@ fn complete_worker_verification<
             cycle_id,
             &outcome,
         )?;
+        apply_terminal_transition(bd, repo_path, &item.issue_id, &transition)?;
     }
     Ok(DispatchOneResult {
         decision: Some(outcome.decision),
@@ -3373,6 +3416,15 @@ fn resume_promoted_work<
             },
         )?;
     let mut run_artifacts = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
+    let Some(resume_budget) = options.review_resume_budget else {
+        return Err(DispatchCycleError::recovery_required(
+            "promoted-work resume has no policy-approved review budget; run retained",
+        ));
+    };
+    run_artifacts
+        .record_review_resume_budget(resume_budget)
+        .map_err(run_artifact_error)?;
+    let deadline = ItemDeadline::start(resume_budget);
     let mut promotion = read_promotion_record(run_artifacts.dir())?.ok_or_else(|| {
         DispatchCycleError::message("promoted worker run lost its promotion record")
     })?;
@@ -3503,6 +3555,7 @@ fn resume_promoted_work<
         ledger_path,
         cycle_id,
         options,
+        deadline,
         live,
         report_path,
         cycle_start,
@@ -4296,6 +4349,15 @@ fn resume_pending_review<
     run_artifacts
         .ensure_pending_review_event()
         .map_err(run_artifact_error)?;
+    let Some(resume_budget) = options.review_resume_budget else {
+        return Err(DispatchCycleError::recovery_required(
+            "pending-review resume has no policy-approved review budget; checkpoint retained",
+        ));
+    };
+    run_artifacts
+        .record_review_resume_budget(resume_budget)
+        .map_err(run_artifact_error)?;
+    let deadline = ItemDeadline::start(resume_budget);
 
     patch_live(
         live,
@@ -4322,13 +4384,18 @@ fn resume_pending_review<
         dispatched_model: active_roster.clone(),
         item_tier_floor: extracted.routing.tier_floor,
     };
-    let outcome =
-        verify::run_review_stage(bd, exec, &verify_request, &review, options.item_timeout)
-            .map_err(|error| {
-                DispatchCycleError::recovery_required(format!(
-                    "promoted worker review resume infrastructure failed ({error}); claim and pending-review checkpoint retained"
-                ))
-            })?;
+    let deferred = verify::run_review_stage_deferred_until(
+        exec,
+        &verify_request,
+        &review,
+        deadline.instant,
+    )
+    .map_err(|error| {
+        DispatchCycleError::recovery_required(format!(
+            "promoted worker review resume infrastructure failed ({error}); claim and pending-review checkpoint retained"
+        ))
+    })?;
+    let outcome = deferred.outcome;
     record_review_events(
         &mut run_artifacts,
         state_dir,
@@ -4336,20 +4403,6 @@ fn resume_pending_review<
         &item.issue_id,
         &outcome,
     )?;
-    if matches!(
-        outcome.decision,
-        VerifyDecision::Failed | VerifyDecision::HardError
-    ) {
-        return Err(DispatchCycleError::recovery_required(format!(
-            "promoted worker qualitative review did not pass ({}); claim and pending-review checkpoint retained",
-            outcome.summary
-        )));
-    }
-    if outcome.decision != VerifyDecision::PendingReview {
-        run_artifacts
-            .finish(verify_decision_label(outcome.decision))
-            .map_err(run_artifact_error)?;
-    }
     if outcome.decision == VerifyDecision::PendingReview {
         append_review_ledger(
             cfg,
@@ -4361,6 +4414,10 @@ fn resume_pending_review<
             &outcome,
         )?;
     } else {
+        let action = deferred.action.as_ref().ok_or_else(|| {
+            DispatchCycleError::message("terminal resumed review has no Bead transition")
+        })?;
+        let transition = finish_review_run(&mut run_artifacts, &outcome, action)?;
         append_outcome_ledger(
             cfg,
             ledger_path,
@@ -4371,6 +4428,7 @@ fn resume_pending_review<
             cycle_id,
             &outcome,
         )?;
+        apply_terminal_transition(bd, repo_path, &item.issue_id, &transition)?;
     }
     Ok(DispatchOneResult {
         decision: Some(outcome.decision),
@@ -4522,6 +4580,7 @@ fn run_worker_chain<E, C, L, U>(
     ledger_path: &Path,
     cycle_id: &str,
     options: &DispatchCycleOptions,
+    deadline: ItemDeadline,
     live: &L,
     report_path: &Path,
     cycle_start: Instant,
@@ -4620,6 +4679,21 @@ where
                 | BudgetAction::StaticCaps => {}
             }
         }
+        let Some(worker_timeout) = deadline.remaining() else {
+            run_artifacts
+                .append_event(
+                    EventKind::CoverageGap,
+                    EventInput {
+                        outcome: Some("worker_budget_exhausted_before_spawn".to_string()),
+                        ..EventInput::default()
+                    },
+                )
+                .map_err(run_artifact_error)?;
+            return Ok(WorkerChainOutcome::Deferred {
+                summary: "item deadline exhausted before worker spawn".to_string(),
+                attempts,
+            });
+        };
 
         attempts += 1;
         let attempt_id = format!("{attempts:03}-{}", sanitize_artifact_piece(&roster.name));
@@ -4689,7 +4763,7 @@ where
                 commits,
                 &request,
                 state_dir,
-                options.item_timeout,
+                worker_timeout,
                 options.heartbeat_interval,
                 &mut hooks,
             )
@@ -5039,16 +5113,16 @@ fn create_work_run(
                 mechanical: Some(verify_cmd.to_string()),
                 qualitative: qualitative_verifier_label(cfg),
             },
-            work: Some(WorkState {
-                cycle_id: cycle_id.to_string(),
-                authorization_sha256: item.authorization_sha256.clone(),
-                before_head: before_head.map(str::to_string),
-                owner_pid: Some(std::process::id()),
-                worker_pgid: None,
-                worker_profile: None,
-                worker_commit: None,
-                mechanical: None,
-                stage: WorkStage::Implementing,
+            work: Some(WorkState { cycle_id: cycle_id.to_string(),
+            authorization_sha256: item.authorization_sha256.clone(),
+            before_head: before_head.map(str::to_string),
+            owner_pid: Some(std::process::id()),
+            worker_pgid: None,
+            worker_profile: None,
+            worker_commit: None,
+            mechanical: None,
+            stage: WorkStage::Implementing,
+            review_resume_budget_secs: None,
             }),
             approval: Some(approval),
         },
@@ -5163,12 +5237,18 @@ fn record_review_events(
     bead_id: &str,
     outcome: &verify::VerifyOutcome,
 ) -> std::result::Result<(), DispatchCycleError> {
+    let review_budget_exhausted = outcome.summary.starts_with("qualitative review budget exhausted");
     if outcome.review_attempts.is_empty() {
+        let coverage_outcome = if review_budget_exhausted {
+            "qualitative_review_budget_exhausted_before_spawn"
+        } else {
+            "qualitative_review_not_required"
+        };
         run_artifacts
             .append_event(
                 EventKind::CoverageGap,
                 EventInput {
-                    outcome: Some("qualitative_review_not_required".to_string()),
+                    outcome: Some(coverage_outcome.to_string()),
                     ..EventInput::default()
                 },
             )
@@ -5198,6 +5278,19 @@ fn record_review_events(
                     profile_id: Some(review.model.clone()),
                     artifact_refs,
                     outcome: Some(review.summary.clone()),
+                },
+            )
+            .map_err(run_artifact_error)?;
+    }
+    if review_budget_exhausted {
+        run_artifacts
+            .append_event(
+                EventKind::CoverageGap,
+                EventInput {
+                    outcome: Some(
+                        "qualitative_review_budget_exhausted_before_repair_spawn".to_string(),
+                    ),
+                    ..EventInput::default()
                 },
             )
             .map_err(run_artifact_error)?;
@@ -5413,11 +5506,19 @@ fn finish_work_run_then_release_claim<B: BdClient + ?Sized>(
     run_artifacts: &mut RunHandle,
     outcome: &str,
 ) -> std::result::Result<(), DispatchCycleError> {
-    run_artifacts.finish(outcome).map_err(run_artifact_error)?;
-    bd.release(repo_path, issue_id).map_err(|error| {
-        DispatchCycleError::message(format!("claim release after dispatch failure: {error}"))
-    })?;
-    Ok(())
+    let transition = TerminalTransition {
+        action: TerminalTransitionAction::Release,
+        reason: format!("conductor terminal outcome: {outcome}"),
+        metadata: None,
+        comment: None,
+    };
+    let artifact = run_artifacts
+        .write_terminal_transition(&transition)
+        .map_err(run_artifact_error)?;
+    run_artifacts
+        .finish_with_artifacts(outcome, vec![artifact])
+        .map_err(run_artifact_error)?;
+    apply_terminal_transition(bd, repo_path, issue_id, &transition)
 }
 
 fn finish_and_release_claim<B: BdClient + ?Sized>(
@@ -5431,6 +5532,142 @@ fn finish_and_release_claim<B: BdClient + ?Sized>(
     finish_work_run_then_release_claim(bd, repo_path, issue_id, run_artifacts, outcome)
         .err()
         .unwrap_or(error)
+}
+
+fn terminal_transition_from_review_action(
+    action: &verify::DeferredReviewAction,
+) -> TerminalTransition {
+    match action {
+        verify::DeferredReviewAction::Close { reason } => TerminalTransition {
+            action: TerminalTransitionAction::Close,
+            reason: reason.clone(),
+            metadata: None,
+            comment: None,
+        },
+        verify::DeferredReviewAction::Release {
+            metadata_key,
+            metadata_value,
+            comment,
+        } => TerminalTransition {
+            action: TerminalTransitionAction::Release,
+            reason: "qualitative review requested revisions".to_string(),
+            metadata: Some(TerminalTransitionMetadata {
+                key: metadata_key.clone(),
+                value: metadata_value.clone(),
+            }),
+            comment: Some(comment.clone()),
+        },
+    }
+}
+
+fn finish_review_run(
+    run_artifacts: &mut RunHandle,
+    outcome: &verify::VerifyOutcome,
+    action: &verify::DeferredReviewAction,
+) -> std::result::Result<TerminalTransition, DispatchCycleError> {
+    let transition = terminal_transition_from_review_action(action);
+    let artifact = run_artifacts
+        .write_terminal_transition(&transition)
+        .map_err(run_artifact_error)?;
+    run_artifacts
+        .finish_with_artifacts(verify_decision_label(outcome.decision), vec![artifact])
+        .map_err(run_artifact_error)?;
+    Ok(transition)
+}
+
+fn apply_terminal_transition<B: BdClient + ?Sized>(
+    bd: &B,
+    repo_path: &Path,
+    issue_id: &str,
+    transition: &TerminalTransition,
+) -> std::result::Result<(), DispatchCycleError> {
+    let current = bd.show(repo_path, issue_id).map_err(|error| {
+        DispatchCycleError::recovery_required(format!(
+            "terminal Bead transition cannot re-read {issue_id}: {error}"
+        ))
+    })?;
+    match transition.action {
+        TerminalTransitionAction::Close => {
+            if current.status == "closed" {
+                return Ok(());
+            }
+            if current.status != "in_progress"
+                || current.assignee.as_deref() != Some("conductor")
+            {
+                return Err(DispatchCycleError::recovery_required(
+                    "terminal close refuses to mutate a Bead no longer claimed by conductor",
+                ));
+            }
+            bd.close(repo_path, issue_id, &transition.reason)
+                .map_err(|error| {
+                    DispatchCycleError::recovery_required(format!(
+                        "terminal close after durable run evidence failed: {error}"
+                    ))
+                })?;
+        }
+        TerminalTransitionAction::Release => {
+            if current.status == "open" {
+                return Ok(());
+            }
+            if current.status != "in_progress"
+                || current.assignee.as_deref() != Some("conductor")
+            {
+                return Err(DispatchCycleError::recovery_required(
+                    "terminal release refuses to mutate a Bead no longer claimed by conductor",
+                ));
+            }
+            if let Some(metadata) = transition.metadata.as_ref() {
+                bd.set_metadata(repo_path, issue_id, &metadata.key, &metadata.value)
+                    .map_err(|error| {
+                        DispatchCycleError::recovery_required(format!(
+                            "terminal release could not persist review findings: {error}"
+                        ))
+                    })?;
+            }
+            bd.release(repo_path, issue_id).map_err(|error| {
+                DispatchCycleError::recovery_required(format!(
+                    "terminal release after durable run evidence failed: {error}"
+                ))
+            })?;
+            if let Some(comment) = transition.comment.as_deref() {
+                let _ = bd.comment(repo_path, issue_id, comment);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn recover_terminal_claim_transition<B: BdClient + ?Sized>(
+    bd: &B,
+    state_dir: &Path,
+    cycle_id: &str,
+    canonical_repo: &str,
+    repo_path: &Path,
+    issue_id: &str,
+) -> std::result::Result<bool, DispatchCycleError> {
+    let Some(crate::run::ReclaimCandidate::FinishedLatest(run_id)) =
+        crate::run::find_reclaimable_work_run(state_dir, cycle_id, canonical_repo, issue_id)
+            .map_err(run_artifact_error)?
+    else {
+        return Ok(false);
+    };
+    let run = RunHandle::open(state_dir, &run_id).map_err(run_artifact_error)?;
+    let transition = match run.terminal_transition().map_err(run_artifact_error)? {
+        Some(transition) => transition,
+        None => match run.manifest().outcome.as_deref() {
+            Some("verified") => TerminalTransition {
+                action: TerminalTransitionAction::Close,
+                reason: format!(
+                    "conductor {cycle_id}: recovered verified terminal run {run_id}"
+                ),
+                metadata: None,
+                comment: None,
+            },
+            _ => return Ok(false),
+        },
+    };
+    apply_terminal_transition(bd, repo_path, issue_id, &transition)?;
+    Ok(true)
 }
 
 /// A work run's heartbeat must go quiet for at least this long before its bd
@@ -6825,16 +7062,16 @@ mod tests {
                 roster_snapshot: None,
                 limits: RunLimits::default(),
                 verifier: RunVerifier::default(),
-                work: Some(WorkState {
-                    cycle_id: "cycle-legacy-original".to_string(),
-                    authorization_sha256: "a".repeat(64),
-                    before_head: None,
-                    owner_pid: None,
-                    worker_pgid: None,
-                    worker_profile: None,
-                    worker_commit: None,
-                    mechanical: None,
-                    stage: WorkStage::Implementing,
+                work: Some(WorkState { cycle_id: "cycle-legacy-original".to_string(),
+                authorization_sha256: "a".repeat(64),
+                before_head: None,
+                owner_pid: None,
+                worker_pgid: None,
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                stage: WorkStage::Implementing,
+                review_resume_budget_secs: None,
                 }),
                 approval: None,
             },
@@ -9845,16 +10082,16 @@ exit 0
                 mechanical: Some("test -f worker.txt".to_string()),
                 qualitative: Some("tiered-qualitative-review:min_tier_gap=1".to_string()),
             },
-            work: Some(WorkState {
-                cycle_id: cycle_id.to_string(),
-                authorization_sha256: "a".repeat(64),
-                before_head: before_head.map(str::to_string),
-                owner_pid,
-                worker_pgid,
-                worker_profile: None,
-                worker_commit: None,
-                mechanical: None,
-                stage: WorkStage::Implementing,
+            work: Some(WorkState { cycle_id: cycle_id.to_string(),
+            authorization_sha256: "a".repeat(64),
+            before_head: before_head.map(str::to_string),
+            owner_pid,
+            worker_pgid,
+            worker_profile: None,
+            worker_commit: None,
+            mechanical: None,
+            stage: WorkStage::Implementing,
+            review_resume_budget_secs: None,
             }),
             approval: Some(serde_json::json!({"schema": "test/approval@1"})),
         }
@@ -11476,16 +11713,16 @@ provider = "codex"
                 roster_snapshot: None,
                 limits: RunLimits::default(),
                 verifier: RunVerifier::default(),
-                work: Some(WorkState {
-                    cycle_id: "cycle-legacy-original".to_string(),
-                    authorization_sha256: "a".repeat(64),
-                    before_head: None,
-                    owner_pid: None,
-                    worker_pgid: None,
-                    worker_profile: None,
-                    worker_commit: None,
-                    mechanical: None,
-                    stage: WorkStage::Implementing,
+                work: Some(WorkState { cycle_id: "cycle-legacy-original".to_string(),
+                authorization_sha256: "a".repeat(64),
+                before_head: None,
+                owner_pid: None,
+                worker_pgid: None,
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                stage: WorkStage::Implementing,
+                review_resume_budget_secs: None,
                 }),
                 approval: None,
             },
@@ -11747,16 +11984,16 @@ dispatch_id = "fake-worker"
                 roster_snapshot: None,
                 limits: RunLimits::default(),
                 verifier: RunVerifier::default(),
-                work: Some(WorkState {
-                    cycle_id: "cycle-legacy-original".to_string(),
-                    authorization_sha256: "a".repeat(64),
-                    before_head: None,
-                    owner_pid: None,
-                    worker_pgid: None,
-                    worker_profile: None,
-                    worker_commit: None,
-                    mechanical: None,
-                    stage: WorkStage::Implementing,
+                work: Some(WorkState { cycle_id: "cycle-legacy-original".to_string(),
+                authorization_sha256: "a".repeat(64),
+                before_head: None,
+                owner_pid: None,
+                worker_pgid: None,
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                stage: WorkStage::Implementing,
+                review_resume_budget_secs: None,
                 }),
                 approval: None,
             },

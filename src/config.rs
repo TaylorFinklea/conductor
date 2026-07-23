@@ -344,6 +344,10 @@ pub(crate) struct Budgets {
     pub(crate) use_bursar: bool,
     pub(crate) unknown_429_cooldown_mins: u32,
     pub(crate) item_wall_clock_mins: u32,
+    /// A fresh review-only budget available to an explicitly resumed
+    /// pending-review run. `None` is fail-closed: resume may inspect but not
+    /// spawn a reviewer.
+    pub(crate) review_resume_budget_mins: Option<u32>,
     pub(crate) cycle_wall_clock_mins: u32,
     /// `run_id`s an operator has explicitly reviewed and approved for
     /// one-time legacy dirty-repo adoption when the stranded run predates
@@ -363,6 +367,7 @@ impl Default for Budgets {
             use_bursar: true,
             unknown_429_cooldown_mins: 15,
             item_wall_clock_mins: 45,
+            review_resume_budget_mins: None,
             cycle_wall_clock_mins: 90,
             authorized_legacy_run_ids: Vec::new(),
         }
@@ -1089,6 +1094,15 @@ fn parse_budgets(node: Option<&Node>) -> Result<Budgets> {
             }
             "item_wall_clock_mins" => {
                 b.item_wall_clock_mins = expect_u32("budgets.item_wall_clock_mins", val)?;
+            }
+            "review_resume_budget_mins" => {
+                let minutes = expect_u32("budgets.review_resume_budget_mins", val)?;
+                if minutes == 0 {
+                    return Err(ConfigError::new(
+                        "budgets.review_resume_budget_mins must be greater than zero minutes",
+                    ));
+                }
+                b.review_resume_budget_mins = Some(minutes);
             }
             "cycle_wall_clock_mins" => {
                 b.cycle_wall_clock_mins = expect_u32("budgets.cycle_wall_clock_mins", val)?;
