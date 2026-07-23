@@ -496,6 +496,8 @@ pub(crate) enum PlanProgress {
         author: ApprovedExecution,
         #[serde(skip_serializing_if = "Option::is_none")]
         peer: Option<ApprovedExecution>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_binding_run_id: Option<String>,
         artifact: ArtifactRef,
         revisions: RevisionLimit,
     },
@@ -510,6 +512,8 @@ pub(crate) enum PlanProgress {
         peer: ApprovedExecution,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         second: Option<Box<ApprovedExecution>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        second_binding_run_id: Option<String>,
         artifact: ArtifactRef,
         revisions: RevisionLimit,
     },
@@ -582,9 +586,48 @@ impl PlanProgress {
         *self = Self::AwaitingPeer {
             author: author.clone(),
             peer: None,
+            peer_binding_run_id: None,
             artifact,
             revisions: RevisionLimit::new(0)?,
         };
+        Ok(())
+    }
+    pub(crate) fn bind_peer(
+        &mut self,
+        peer: ApprovedExecution,
+        binding_run_id: String,
+    ) -> Result<()> {
+        let Self::AwaitingPeer {
+            author,
+            peer: bound_peer,
+            peer_binding_run_id: bound_binding_run_id,
+            ..
+        } = self
+        else {
+            return Err(RunError::new(
+                "peer can bind only while awaiting peer review",
+            ));
+        };
+        if peer.execution_key == author.execution_key {
+            return Err(RunError::new(
+                "peer binding must use a distinct exact execution from immutable author",
+            ));
+        }
+        if let Some(bound) = bound_peer {
+            if bound != &peer {
+                return Err(RunError::new(
+                    "peer binding cannot change after reservation",
+                ));
+            }
+            if bound_binding_run_id.as_deref() != Some(binding_run_id.as_str()) {
+                return Err(RunError::new(
+                    "peer binding reservation cannot change after reservation",
+                ));
+            }
+        } else {
+            *bound_peer = Some(peer);
+            *bound_binding_run_id = Some(binding_run_id);
+        }
         Ok(())
     }
 
@@ -598,6 +641,7 @@ impl PlanProgress {
             peer: bound_peer,
             artifact,
             revisions,
+            ..
         } = self
         else {
             return Err(RunError::new(
@@ -624,6 +668,7 @@ impl PlanProgress {
                 author,
                 peer,
                 second: None,
+                second_binding_run_id: None,
                 artifact,
                 revisions,
             },
@@ -654,16 +699,22 @@ impl PlanProgress {
         *self = Self::AwaitingPeer {
             author,
             peer: Some(peer),
+            peer_binding_run_id: None,
             artifact,
             revisions,
         };
         Ok(())
     }
-    pub(crate) fn bind_second_opinion(&mut self, second: ApprovedExecution) -> Result<()> {
+    pub(crate) fn bind_second_opinion(
+        &mut self,
+        second: ApprovedExecution,
+        binding_run_id: String,
+    ) -> Result<()> {
         let Self::AwaitingSecondOpinion {
             author,
             peer,
             second: bound,
+            second_binding_run_id: bound_binding_run_id,
             ..
         } = self
         else {
@@ -689,8 +740,14 @@ impl PlanProgress {
                     "second opinion binding cannot change after reservation",
                 ));
             }
+            if bound_binding_run_id.as_deref() != Some(binding_run_id.as_str()) {
+                return Err(RunError::new(
+                    "second opinion reservation cannot change after reservation",
+                ));
+            }
         } else {
             *bound = Some(Box::new(second));
+            *bound_binding_run_id = Some(binding_run_id);
         }
         Ok(())
     }
@@ -1807,13 +1864,30 @@ impl RunHandle {
             },
         )
     }
+    /// Persists the exact peer identity before its first invocation so a later
+    /// resume cannot select a different reviewer.
+    pub(crate) fn bind_plan_peer(
+        &mut self,
+        peer: ApprovedExecution,
+        binding_run_id: String,
+    ) -> Result<()> {
+        self.plan_mut("binding plan peer")?
+            .progress
+            .bind_peer(peer, binding_run_id)?;
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()
+    }
 
     /// Persists the exact pairwise-distinct second-opinion identity before its
     /// first invocation so a later resume cannot select a different reviewer.
-    pub(crate) fn bind_plan_second_opinion(&mut self, second: ApprovedExecution) -> Result<()> {
+    pub(crate) fn bind_plan_second_opinion(
+        &mut self,
+        second: ApprovedExecution,
+        binding_run_id: String,
+    ) -> Result<()> {
         self.plan_mut("binding plan second opinion")?
             .progress
-            .bind_second_opinion(second)?;
+            .bind_second_opinion(second, binding_run_id)?;
         self.manifest.updated_at = Utc::now().to_rfc3339();
         self.write_manifest()
     }
@@ -4679,6 +4753,15 @@ mod tests {
             "peer must be provider-distinct from the author"
         );
         progress
+            .bind_peer(peer.clone(), "peer-bind".to_string())
+            .expect("persist peer before its first invocation");
+        assert!(
+            progress
+                .bind_peer(different_peer.clone(), "peer-bind".to_string())
+                .is_err(),
+            "a persisted peer binding cannot change after a crash boundary"
+        );
+        progress
             .record_peer_verdict(peer.clone(), PeerVerdict::Revise)
             .expect("peer requests revision");
         progress
@@ -4706,7 +4789,7 @@ mod tests {
             .expect("same peer approves");
         let second = execution("second", "opencode-go");
         progress
-            .bind_second_opinion(second.clone())
+            .bind_second_opinion(second.clone(), "second-bind".to_string())
             .expect("persist pairwise-distinct second opinion");
         progress
             .record_second_opinion(&second, SecondOpinionVerdict::Accept)

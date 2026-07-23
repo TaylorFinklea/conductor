@@ -1,12 +1,12 @@
 //! Native approval-gated plan-job lifecycle.
 
+use chrono::Utc;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use chrono::Utc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -584,6 +584,7 @@ pub(crate) fn prepare<C: crate::bursar::BursarClient + ?Sized>(
     let router =
         crate::role_routing::RoleRouter::with_pinned_snapshot(&paths.state_dir, policy, snapshot)
             .map_err(|error| format!("role router: {error}"))?;
+    reconcile_plan_reservations(&router, &paths.state_dir)?;
     let role = crate::role_routing::RoleId::new("plan")
         .map_err(|error| format!("planner role: {error}"))?;
     router
@@ -632,71 +633,286 @@ pub(crate) fn prepare<C: crate::bursar::BursarClient + ?Sized>(
         revision_limit,
         stage_attempt_limit,
     };
-    let handle = crate::run::RunHandle::create_plan(
-        &paths.state_dir,
-        crate::run::NewPlanRun {
-            run_id: run_id.clone(),
-            target: crate::run::RunTarget {
-                repo: repo.to_string_lossy().into_owned(),
-                bead: plan_bead(&details.target.input),
+    let mut created_run = None;
+    let result = (|| -> Result<PathBuf, String> {
+        let handle = crate::run::RunHandle::create_plan(
+            &paths.state_dir,
+            crate::run::NewPlanRun {
+                run_id: run_id.clone(),
+                target: crate::run::RunTarget {
+                    repo: repo.to_string_lossy().into_owned(),
+                    bead: plan_bead(&details.target.input),
+                },
+                details,
+                approved_profiles: prepared
+                    .audited_pool
+                    .iter()
+                    .filter(|candidate| candidate.eligible)
+                    .map(|candidate| candidate.execution.profile_id.clone())
+                    .collect(),
+                bursar_roster_artifact: Some(crate::run::ArtifactRef {
+                    path: source_artifact.path,
+                    sha256: source_artifact.sha256,
+                }),
+                roster_snapshot: crate::run::RosterSnapshotInput {
+                    bytes: roster_bytes,
+                    policy_sha256,
+                },
+                limits: crate::run::RunLimits {
+                    item_wall_clock_mins: Some(u64::from(config.budgets.item_wall_clock_mins)),
+                    max_attempts: Some(2),
+                },
+                verifier: crate::run::RunVerifier {
+                    mechanical: Some("conductor/plan-document@1 validation".to_string()),
+                    qualitative: None,
+                },
+                approval: serde_json::to_value(&approval)
+                    .map_err(|error| format!("plan approval serialization: {error}"))?,
+                input_bytes,
             },
-            details,
-            approved_profiles: prepared
-                .audited_pool
-                .iter()
-                .filter(|candidate| candidate.eligible)
-                .map(|candidate| candidate.execution.profile_id.clone())
-                .collect(),
-            bursar_roster_artifact: Some(crate::run::ArtifactRef {
-                path: source_artifact.path,
-                sha256: source_artifact.sha256,
-            }),
-            roster_snapshot: crate::run::RosterSnapshotInput {
-                bytes: roster_bytes,
-                policy_sha256,
-            },
-            limits: crate::run::RunLimits {
-                item_wall_clock_mins: Some(u64::from(config.budgets.item_wall_clock_mins)),
-                max_attempts: Some(2),
-            },
-            verifier: crate::run::RunVerifier {
-                mechanical: Some("conductor/plan-document@1 validation".to_string()),
-                qualitative: None,
-            },
-            approval: serde_json::to_value(&approval)
-                .map_err(|error| format!("plan approval serialization: {error}"))?,
-            input_bytes,
-        },
-    )
-    .map_err(|error| format!("plan run artifact: {error}"))?;
-    let report = crate::deck::Report::new(
-        &run_id,
-        format!("Plan approval: {run_id}"),
-        approval_watermark,
-        crate::deck::ReportStatus::AwaitingReview,
-        vec![
-            crate::deck::Block::metrics(
-                "Plan",
-                vec![
-                    crate::deck::Metric::new("Output", request.output_kind.label()),
-                    crate::deck::Metric::new("Planner", prepared.selected.profile_id),
-                ],
-                Vec::new(),
-            ),
-            crate::deck::Block::approval(
-                approval.approval_block_id.clone(),
-                "Approve this exact immutable plan authorization before model dispatch.",
-            ),
-        ],
-    )
-    .map_err(|error| format!("plan approval report: {error}"))?;
-    let report_path = crate::deck::write_report(&paths.reports_home, &report)
+        )
+        .map_err(|error| format!("plan run artifact: {error}"))?;
+        created_run = Some(handle);
+        let report = crate::deck::Report::new(
+            &run_id,
+            format!("Plan approval: {run_id}"),
+            approval_watermark,
+            crate::deck::ReportStatus::AwaitingReview,
+            vec![
+                crate::deck::Block::metrics(
+                    "Plan",
+                    vec![
+                        crate::deck::Metric::new("Output", request.output_kind.label()),
+                        crate::deck::Metric::new("Planner", prepared.selected.profile_id),
+                    ],
+                    Vec::new(),
+                ),
+                crate::deck::Block::approval(
+                    approval.approval_block_id.clone(),
+                    "Approve this exact immutable plan authorization before model dispatch.",
+                ),
+            ],
+        )
         .map_err(|error| format!("plan approval report: {error}"))?;
-    let _ = handle;
-    Ok(PreparedPlan {
-        run_id,
-        report_path,
-    })
+        let report_path = crate::deck::write_report(&paths.reports_home, &report)
+            .map_err(|error| format!("plan approval report: {error}"))?;
+        Ok(report_path)
+    })();
+    match result {
+        Ok(report_path) => Ok(PreparedPlan {
+            run_id,
+            report_path,
+        }),
+        Err(error) => {
+            let mut cleanup_errors = Vec::new();
+            if let Err(cleanup) = router.cancel(&prepared.reservation) {
+                cleanup_errors.push(format!("planner reservation cleanup: {cleanup}"));
+            }
+            if let Some(handle) = created_run {
+                if let Err(cleanup) = std::fs::remove_dir_all(handle.dir()) {
+                    cleanup_errors.push(format!("plan run cleanup: {cleanup}"));
+                }
+            }
+            if cleanup_errors.is_empty() {
+                Err(error)
+            } else {
+                Err(format!("{error}; {}", cleanup_errors.join("; ")))
+            }
+        }
+    }
+}
+
+/// Reconciles reservation capacity against fully readable plan manifests before
+/// any new planner or reviewer selection. Planner reservations stay pending
+/// until approval; a reviewer binding already persisted in a manifest is
+/// promoted to committed so a crash cannot consume capacity indefinitely.
+fn reconcile_plan_reservations(
+    router: &crate::role_routing::RoleRouter,
+    state_dir: &Path,
+) -> Result<(), String> {
+    let role = crate::role_routing::RoleId::new("plan").map_err(|error| error.to_string())?;
+    let mut planner_links = Vec::new();
+    let mut peer_links = Vec::new();
+    let mut second_links = Vec::new();
+    let entries = match std::fs::read_dir(crate::run::runs_dir(state_dir)) {
+        Ok(entries) => entries,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(format!("plan reservation reconciliation: {error}")),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("plan reservation reconciliation: {error}"))?;
+        if !entry
+            .file_type()
+            .map_err(|error| format!("plan reservation reconciliation: {error}"))?
+            .is_dir()
+        {
+            continue;
+        }
+        let Some(run_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(run) = crate::run::RunHandle::open(state_dir, &run_id) else {
+            continue;
+        };
+        let Ok(plan) = run.plan() else {
+            continue;
+        };
+        planner_links.push(
+            crate::role_routing::RunId::new(run.run_id().to_string())
+                .map_err(|error| format!("plan reservation reconciliation: {error}"))?,
+        );
+        if let crate::run::PlanProgress::AwaitingPeer {
+            peer: Some(_),
+            peer_binding_run_id,
+            ..
+        } = &plan.progress
+        {
+            peer_links.push(
+                peer_binding_run_id
+                    .as_deref()
+                    .map(|binding| {
+                        crate::role_routing::RunId::new(binding.to_string())
+                            .map_err(|error| format!("plan reservation reconciliation: {error}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(reviewer_binding_run_id(
+                        run.run_id(),
+                        crate::role_routing::PlanStage::PeerReview,
+                    )?),
+            );
+        }
+        if let crate::run::PlanProgress::AwaitingSecondOpinion {
+            second: Some(_),
+            second_binding_run_id,
+            ..
+        } = &plan.progress
+        {
+            second_links.push(
+                second_binding_run_id
+                    .as_deref()
+                    .map(|binding| {
+                        crate::role_routing::RunId::new(binding.to_string())
+                            .map_err(|error| format!("plan reservation reconciliation: {error}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(reviewer_binding_run_id(
+                        run.run_id(),
+                        crate::role_routing::PlanStage::SecondOpinion,
+                    )?),
+            );
+        }
+    }
+    reconcile_reservation_stage(
+        router,
+        &role,
+        crate::role_routing::PlanStage::Planner,
+        &planner_links,
+        false,
+    )?;
+    reconcile_reservation_stage(
+        router,
+        &role,
+        crate::role_routing::PlanStage::PeerReview,
+        &peer_links,
+        true,
+    )?;
+    reconcile_reservation_stage(
+        router,
+        &role,
+        crate::role_routing::PlanStage::SecondOpinion,
+        &second_links,
+        true,
+    )
+}
+
+fn reconcile_reservation_stage(
+    router: &crate::role_routing::RoleRouter,
+    role: &crate::role_routing::RoleId,
+    stage: crate::role_routing::PlanStage,
+    linked: &[crate::role_routing::RunId],
+    commit_bound: bool,
+) -> Result<(), String> {
+    router
+        .reconcile_orphans(role, stage, linked)
+        .map_err(|error| format!("plan reservation reconciliation: {error}"))?;
+    if !commit_bound {
+        return Ok(());
+    }
+    for run_id in linked {
+        let Some(reservation) = router
+            .reservation(role, stage, run_id)
+            .map_err(|error| format!("plan reservation reconciliation: {error}"))?
+        else {
+            continue;
+        };
+        if matches!(
+            reservation.state,
+            crate::role_routing::ReservationState::PendingApproval
+        ) {
+            router
+                .commit(&reservation)
+                .map_err(|error| format!("plan reviewer reservation reconciliation: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn reviewer_binding_run_id(
+    run_id: &str,
+    stage: crate::role_routing::PlanStage,
+) -> Result<crate::role_routing::RunId, String> {
+    let stage = match stage {
+        crate::role_routing::PlanStage::Planner => {
+            return Err("planner has no delayed reviewer binding".to_string());
+        }
+        crate::role_routing::PlanStage::PeerReview => "peer-review",
+        crate::role_routing::PlanStage::SecondOpinion => "second-opinion",
+    };
+    crate::role_routing::RunId::new(format!("{run_id}-{stage}-bind"))
+        .map_err(|error| format!("reviewer binding run id: {error}"))
+}
+
+/// Chooses the first unused durable generation for a reviewer binding. A
+/// canceled generation is historical score evidence, never a binding that may
+/// be revived; a pending or committed generation is retained for its matching
+/// manifest/recovery path.
+fn next_reviewer_binding_run_id(
+    router: &crate::role_routing::RoleRouter,
+    role: &crate::role_routing::RoleId,
+    run_id: &str,
+    stage: crate::role_routing::PlanStage,
+) -> Result<crate::role_routing::RunId, String> {
+    let base = reviewer_binding_run_id(run_id, stage)?;
+    let mut generation = 0_u64;
+    loop {
+        let candidate = if generation == 0 {
+            base.clone()
+        } else {
+            crate::role_routing::RunId::new(format!("{}-retry-{generation}", base.as_str()))
+                .map_err(|error| format!("reviewer binding retry run id: {error}"))?
+        };
+        match router
+            .reservation(role, stage, &candidate)
+            .map_err(|error| format!("reviewer binding retry lookup: {error}"))?
+        {
+            Some(crate::role_routing::Reservation {
+                state: crate::role_routing::ReservationState::Canceled,
+                ..
+            }) => {
+                generation = generation
+                    .checked_add(1)
+                    .ok_or_else(|| "reviewer binding retry generation overflow".to_string())?;
+            }
+            _ => return Ok(candidate),
+        }
+    }
 }
 
 fn canonical_repo(path: &Path) -> Result<PathBuf, String> {
@@ -1018,6 +1234,7 @@ where
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| format!("plan run guard: {error}"))?;
+    reconcile_plan_reservations(&router, &paths.state_dir)?;
     if matches!(
         run.plan().map_err(|error| error.to_string())?.progress,
         crate::run::PlanProgress::AwaitingPeer { .. }
@@ -1320,10 +1537,9 @@ where
                         (bound, false)
                     }
                     None => match select_reviewer(
+                        run,
                         router,
-                        run.run_id(),
                         bursar,
-                        run.plan().map_err(|error| error.to_string())?,
                         snapshot,
                         crate::run::PlanStage::PeerReview,
                         &author,
@@ -1422,10 +1638,8 @@ where
                             "started",
                         )?;
                         recheck_author(bursar, snapshot, &reviewer)?;
-                        let repair = match with_isolated_worktree(
-                            repo,
-                            &approval.target_head,
-                            |worktree| {
+                        let repair =
+                            match with_isolated_worktree(repo, &approval.target_head, |worktree| {
                                 executor.peer_review(&PlanPeerReviewRequest {
                                     worktree: worktree.to_path_buf(),
                                     target: run
@@ -1438,25 +1652,24 @@ where
                                     execution: reviewer.clone(),
                                     profile: profile.clone(),
                                 })
-                            },
-                        ) {
-                            Ok(output) => output,
-                            Err(error) => {
-                                append_plan_invocation(
-                                    run,
-                                    ledger_path,
-                                    crate::run::EventKind::AttemptFinished,
-                                    crate::run::PlanStage::PeerReview,
-                                    &reviewer,
-                                    &profile,
-                                    &canonical_plan,
-                                    None,
-                                    repair_attempt,
-                                    "failed",
-                                )?;
-                                return Err(error);
-                            }
-                        };
+                            }) {
+                                Ok(output) => output,
+                                Err(error) => {
+                                    append_plan_invocation(
+                                        run,
+                                        ledger_path,
+                                        crate::run::EventKind::AttemptFinished,
+                                        crate::run::PlanStage::PeerReview,
+                                        &reviewer,
+                                        &profile,
+                                        &canonical_plan,
+                                        None,
+                                        repair_attempt,
+                                        "failed",
+                                    )?;
+                                    return Err(error);
+                                }
+                            };
                         let (verdict, findings) = match parse_peer_review(&repair) {
                             Ok(parsed) => parsed,
                             Err(second_error) => {
@@ -1688,10 +1901,9 @@ where
                     *bound
                 } else {
                     let (bound, _) = select_reviewer(
+                        run,
                         router,
-                        run.run_id(),
                         bursar,
-                        run.plan().map_err(|error| error.to_string())?,
                         snapshot,
                         crate::run::PlanStage::SecondOpinion,
                         &author,
@@ -1701,8 +1913,6 @@ where
                         let _ = run.finish_plan_blocked();
                         format!("plan blocked after second-opinion candidate exhaustion: {error}")
                     })?;
-                    run.bind_plan_second_opinion(bound.clone())
-                        .map_err(|error| format!("plan second-opinion binding: {error}"))?;
                     bound
                 };
                 let profile = profile_for_execution(snapshot, &reviewer)?;
@@ -1946,23 +2156,19 @@ fn peer_rubric(kind: PlanOutputKind) -> String {
 }
 
 #[expect(
-    clippy::too_many_arguments,
-    reason = "reviewer selection joins the persisted route with the live roster and bound identities"
-)]
-#[expect(
     clippy::too_many_lines,
     reason = "all fail-closed review eligibility gates are deliberately visible at the bind boundary"
 )]
 fn select_reviewer<C: crate::bursar::BursarClient + ?Sized>(
+    run: &mut crate::run::RunHandle,
     router: &crate::role_routing::RoleRouter,
-    run_id: &str,
     bursar: &C,
-    plan: &crate::run::PlanRunDetails,
     snapshot: &crate::bursar::RosterSnapshot,
     stage: crate::run::PlanStage,
     author: &crate::run::ApprovedExecution,
     peer: Option<&crate::run::ApprovedExecution>,
 ) -> Result<(crate::run::ApprovedExecution, bool), String> {
+    let plan = run.plan().map_err(|error| error.to_string())?;
     let route = plan
         .routes
         .stages
@@ -2049,19 +2255,8 @@ fn select_reviewer<C: crate::bursar::BursarClient + ?Sized>(
         1 => crate::config::Tier::Senior,
         _ => crate::config::Tier::Lead,
     };
-    let binding_attempt = match stage {
-        crate::run::PlanStage::Planner => plan.stage_attempts.planner,
-        crate::run::PlanStage::PeerReview => plan.stage_attempts.peer_review,
-        crate::run::PlanStage::SecondOpinion => plan.stage_attempts.second_opinion,
-    };
-    let binding_run_id = format!(
-        "{run_id}-{}-bind-{binding_attempt}",
-        match stage {
-            crate::run::PlanStage::Planner => "planner",
-            crate::run::PlanStage::PeerReview => "peer-review",
-            crate::run::PlanStage::SecondOpinion => "second-opinion",
-        }
-    );
+    let role = crate::role_routing::RoleId::new("plan").map_err(|error| error.to_string())?;
+    let binding_run_id = next_reviewer_binding_run_id(router, &role, run.run_id(), stage)?;
     let mut constraints = planner_constraints(snapshot, minimum_tier)?;
     constraints.allowed_profile_ids = live
         .iter()
@@ -2080,8 +2275,8 @@ fn select_reviewer<C: crate::bursar::BursarClient + ?Sized>(
         .collect();
     let prepared = router
         .bind_reviewer(
-            crate::role_routing::RunId::new(binding_run_id).map_err(|error| error.to_string())?,
-            crate::role_routing::RoleId::new("plan").map_err(|error| error.to_string())?,
+            binding_run_id,
+            role,
             stage,
             author.clone(),
             peer.cloned(),
@@ -2089,10 +2284,30 @@ fn select_reviewer<C: crate::bursar::BursarClient + ?Sized>(
             constraints,
         )
         .map_err(|error| format!("reviewer scheduler binding: {error}"))?;
+    let selected = prepared.route.selected.clone();
+    let binding_evidence = prepared.route.reservation.run_id.as_str().to_string();
+    let bind_result = match stage {
+        crate::run::PlanStage::Planner => {
+            return Err("planner has no delayed reviewer binding".to_string());
+        }
+        crate::run::PlanStage::PeerReview => run.bind_plan_peer(selected.clone(), binding_evidence),
+        crate::run::PlanStage::SecondOpinion => {
+            run.bind_plan_second_opinion(selected.clone(), binding_evidence)
+        }
+    };
+    if let Err(error) = bind_result {
+        let cancellation = router.cancel(&prepared.route.reservation);
+        return match cancellation {
+            Ok(_) => Err(format!("plan reviewer binding: {error}")),
+            Err(cleanup) => Err(format!(
+                "plan reviewer binding: {error}; reviewer reservation cleanup: {cleanup}"
+            )),
+        };
+    }
     router
         .commit(&prepared.route.reservation)
         .map_err(|error| format!("reviewer reservation: {error}"))?;
-    Ok((prepared.route.selected, degraded))
+    Ok((selected, degraded))
 }
 
 fn execution_tier(
@@ -2804,6 +3019,343 @@ enabled = true
         repo
     }
 
+    fn implementation_request(repo: PathBuf) -> PlanPrepareRequest {
+        PlanPrepareRequest {
+            repo,
+            input: PlanPrepareInput::Artifact {
+                bytes: b"author this".to_vec(),
+                tier: crate::run::PlanTier::Lead,
+                complexity: crate::run::PlanComplexity::XL,
+            },
+            output_kind: PlanOutputKind::ImplementationPlan,
+            max_plan_revisions: 1,
+            require_second_opinion: false,
+        }
+    }
+
+    #[test]
+    fn repeated_prepare_create_plan_failures_cancel_capacity_without_rewinding_scores() {
+        let (temp, paths, config, bursar) = plan_fixture("prepare-create-failure");
+        let repo = initialized_repo(&temp);
+        std::fs::create_dir_all(&paths.state_dir).expect("state dir");
+        std::fs::write(paths.state_dir.join("runs-v2"), b"not a directory")
+            .expect("block plan run creation");
+
+        for _ in 0..4 {
+            assert!(
+                prepare(
+                    &paths,
+                    &config,
+                    &bursar,
+                    implementation_request(repo.clone())
+                )
+                .is_err(),
+                "a failed RunHandle::create_plan must surface to the caller"
+            );
+        }
+
+        std::fs::remove_file(paths.state_dir.join("runs-v2")).expect("unblock run creation");
+        let prepared = prepare(&paths, &config, &bursar, implementation_request(repo))
+            .expect("failed preparation must not consume every profile's in-flight capacity");
+        let approval = load_approval(
+            &crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run"),
+        )
+        .expect("approval");
+        assert_eq!(
+            approval.reservation.sequence, 5,
+            "cancellation preserves irreversible scheduling score history"
+        );
+    }
+
+    #[test]
+    fn repeated_prepare_report_write_failures_cancel_capacity_and_remove_unpublished_runs() {
+        let (temp, paths, config, bursar) = plan_fixture("prepare-report-failure");
+        let repo = initialized_repo(&temp);
+        std::fs::create_dir_all(&paths.reports_home).expect("reports home");
+        std::fs::write(paths.reports_home.join(".harness"), b"not a directory")
+            .expect("block report write");
+
+        for _ in 0..4 {
+            assert!(
+                prepare(
+                    &paths,
+                    &config,
+                    &bursar,
+                    implementation_request(repo.clone())
+                )
+                .is_err(),
+                "a failed approval report must surface to the caller"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read_dir(crate::run::runs_dir(&paths.state_dir))
+                .expect("run root")
+                .count(),
+            0,
+            "a plan without its approval report is not a durable dispatchable run"
+        );
+        std::fs::remove_file(paths.reports_home.join(".harness")).expect("unblock report write");
+        let prepared = prepare(&paths, &config, &bursar, implementation_request(repo))
+            .expect("failed report writes must not consume every profile's in-flight capacity");
+        let approval = load_approval(
+            &crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run"),
+        )
+        .expect("approval");
+        assert_eq!(approval.reservation.sequence, 5);
+    }
+
+    #[test]
+    fn restart_reconciliation_cancels_an_unlinked_reviewer_binding_without_rewinding() {
+        let (temp, paths, config, bursar) = plan_fixture("unlinked-reviewer-binding");
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            implementation_request(initialized_repo(&temp)),
+        )
+        .expect("prepare");
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let approval = load_approval(&run).expect("approval");
+        let router = crate::role_routing::RoleRouter::with_pinned_snapshot(
+            &paths.state_dir,
+            crate::role_routing::RoutingPolicy::from_config(&config, &bursar.snapshot)
+                .expect("routing policy"),
+            bursar.snapshot.clone(),
+        )
+        .expect("router");
+        let reservation = router
+            .bind_reviewer(
+                crate::role_routing::RunId::new("orphan-peer-review-bind").expect("binding run id"),
+                crate::role_routing::RoleId::new("plan").expect("role"),
+                crate::role_routing::PlanStage::PeerReview,
+                approval.author,
+                None,
+                true,
+                planner_constraints(&bursar.snapshot, crate::config::Tier::Lead)
+                    .expect("constraints"),
+            )
+            .expect("reservation before simulated bind crash")
+            .route
+            .reservation;
+
+        reconcile_plan_reservations(&router, &paths.state_dir)
+            .expect("production restart reconciliation");
+
+        assert!(matches!(
+            router
+                .reservation(
+                    &crate::role_routing::RoleId::new("plan").expect("role"),
+                    crate::role_routing::PlanStage::PeerReview,
+                    &reservation.run_id,
+                )
+                .expect("reservation lookup"),
+            Some(crate::role_routing::Reservation {
+                state: crate::role_routing::ReservationState::Canceled,
+                sequence: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn peer_bind_crash_retries_with_a_fresh_durable_generation() {
+        let (temp, paths, config, bursar) = plan_fixture("peer-bind-crash-retry");
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            implementation_request(initialized_repo(&temp)),
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let mut run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let approval = load_approval(&run).expect("approval");
+        run.start_plan_authoring(approval.author.clone())
+            .expect("author binding");
+        let artifact = run
+            .capture_plan_artifact(
+                Path::new("artifacts/plan-document.json"),
+                &implementation_document(),
+            )
+            .expect("artifact");
+        run.await_plan_peer(artifact).expect("await peer");
+        drop(run);
+        let router = crate::role_routing::RoleRouter::with_pinned_snapshot(
+            &paths.state_dir,
+            crate::role_routing::RoutingPolicy::from_config(&config, &bursar.snapshot)
+                .expect("routing policy"),
+            bursar.snapshot.clone(),
+        )
+        .expect("router");
+        let role = crate::role_routing::RoleId::new("plan").expect("role");
+        let stale_id =
+            reviewer_binding_run_id(&prepared.run_id, crate::role_routing::PlanStage::PeerReview)
+                .expect("stable binding id");
+        router
+            .bind_reviewer(
+                stale_id.clone(),
+                role.clone(),
+                crate::role_routing::PlanStage::PeerReview,
+                approval.author,
+                None,
+                true,
+                planner_constraints(&bursar.snapshot, crate::config::Tier::Lead)
+                    .expect("constraints"),
+            )
+            .expect("fault-window reservation");
+
+        let executor =
+            ScriptedExecutor::new(Vec::new(), Vec::new(), vec![Ok(peer_approve())], Vec::new());
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor)
+            .expect("restart retries after canceling the unlinked peer reservation");
+
+        assert!(matches!(
+            router
+                .reservation(&role, crate::role_routing::PlanStage::PeerReview, &stale_id)
+                .expect("stale reservation"),
+            Some(crate::role_routing::Reservation {
+                state: crate::role_routing::ReservationState::Canceled,
+                ..
+            })
+        ));
+        let retry_id = crate::role_routing::RunId::new(format!(
+            "{}-peer-review-bind-retry-1",
+            prepared.run_id
+        ))
+        .expect("retry binding id");
+        assert!(matches!(
+            router
+                .reservation(&role, crate::role_routing::PlanStage::PeerReview, &retry_id)
+                .expect("retry reservation"),
+            Some(crate::role_routing::Reservation {
+                state: crate::role_routing::ReservationState::Committed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the regression constructs the exact second-opinion bind crash window"
+    )]
+    fn second_opinion_bind_crash_retries_with_a_fresh_durable_generation() {
+        let (temp, paths, config, bursar) = plan_fixture("second-bind-crash-retry");
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo: initialized_repo(&temp),
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::Spec,
+                max_plan_revisions: 1,
+                require_second_opinion: true,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let mut run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let approval = load_approval(&run).expect("approval");
+        run.start_plan_authoring(approval.author.clone())
+            .expect("author binding");
+        let artifact = run
+            .capture_plan_artifact(Path::new("artifacts/plan-document.json"), &spec_document())
+            .expect("artifact");
+        run.await_plan_peer(artifact).expect("await peer");
+        let peer = run
+            .plan()
+            .expect("plan")
+            .routes
+            .stages
+            .iter()
+            .find(|route| route.stage == crate::run::PlanStage::PeerReview)
+            .and_then(|route| {
+                route
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.provider_id != approval.author.provider_id)
+            })
+            .cloned()
+            .expect("provider-distinct peer");
+        run.record_plan_peer_verdict(peer.clone(), crate::run::PeerVerdict::Approve, true)
+            .expect("peer approval");
+        drop(run);
+        let router = crate::role_routing::RoleRouter::with_pinned_snapshot(
+            &paths.state_dir,
+            crate::role_routing::RoutingPolicy::from_config(&config, &bursar.snapshot)
+                .expect("routing policy"),
+            bursar.snapshot.clone(),
+        )
+        .expect("router");
+        let role = crate::role_routing::RoleId::new("plan").expect("role");
+        let stale_id = reviewer_binding_run_id(
+            &prepared.run_id,
+            crate::role_routing::PlanStage::SecondOpinion,
+        )
+        .expect("stable binding id");
+        router
+            .bind_reviewer(
+                stale_id.clone(),
+                role.clone(),
+                crate::role_routing::PlanStage::SecondOpinion,
+                approval.author,
+                Some(peer),
+                true,
+                planner_constraints(&bursar.snapshot, crate::config::Tier::Lead)
+                    .expect("constraints"),
+            )
+            .expect("fault-window reservation");
+
+        let executor = ScriptedExecutor::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![Ok(
+                br#"{"schema":"conductor/plan-second-opinion@1","verdict":"accept"}"#.to_vec(),
+            )],
+        );
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor)
+            .expect("restart retries after canceling the unlinked opinion reservation");
+
+        assert!(matches!(
+            router
+                .reservation(
+                    &role,
+                    crate::role_routing::PlanStage::SecondOpinion,
+                    &stale_id,
+                )
+                .expect("stale reservation"),
+            Some(crate::role_routing::Reservation {
+                state: crate::role_routing::ReservationState::Canceled,
+                ..
+            })
+        ));
+        let retry_id = crate::role_routing::RunId::new(format!(
+            "{}-second-opinion-bind-retry-1",
+            prepared.run_id
+        ))
+        .expect("retry binding id");
+        assert!(matches!(
+            router
+                .reservation(
+                    &role,
+                    crate::role_routing::PlanStage::SecondOpinion,
+                    &retry_id,
+                )
+                .expect("retry reservation"),
+            Some(crate::role_routing::Reservation {
+                state: crate::role_routing::ReservationState::Committed,
+                ..
+            })
+        ));
+    }
+
     fn approve(paths: &PlanJobPaths, run_id: &str) {
         let report_dir =
             crate::deck::report_run_dir(&paths.reports_home, run_id).expect("report dir");
@@ -2833,7 +3385,11 @@ enabled = true
         assert_eq!(rows.len(), 3);
         assert_eq!(
             rows.iter()
-                .map(|row| (row["role"].as_str(), row["job"].as_str(), row["stage"].as_str()))
+                .map(|row| (
+                    row["role"].as_str(),
+                    row["job"].as_str(),
+                    row["stage"].as_str()
+                ))
                 .collect::<Vec<_>>(),
             vec![
                 (Some("plan"), Some("plan"), Some("planner")),
@@ -2845,8 +3401,12 @@ enabled = true
             row["profile"].as_str().is_some()
                 && row["execution_key"].as_str().is_some()
                 && row["provider"].as_str().is_some()
-                && row["input_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
-                && row["output_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
+                && row["input_sha256"]
+                    .as_str()
+                    .is_some_and(|digest| digest.len() == 64)
+                && row["output_sha256"]
+                    .as_str()
+                    .is_some_and(|digest| digest.len() == 64)
                 && row["attempt"] == 1
                 && row["outcome"] == "returned"
                 && row["duration_ms"].is_null()
@@ -2860,7 +3420,10 @@ enabled = true
             .filter_map(|event| event.plan_invocation.as_ref())
             .collect::<Vec<_>>();
         assert_eq!(
-            invocations.iter().map(|evidence| evidence.stage).collect::<Vec<_>>(),
+            invocations
+                .iter()
+                .map(|evidence| evidence.stage)
+                .collect::<Vec<_>>(),
             vec![
                 crate::run::PlanStage::Planner,
                 crate::run::PlanStage::PeerReview,
@@ -2898,8 +3461,12 @@ enabled = true
             ]
         );
         assert!(rows.iter().all(|row| {
-            row["input_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
-                && row["output_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
+            row["input_sha256"]
+                .as_str()
+                .is_some_and(|digest| digest.len() == 64)
+                && row["output_sha256"]
+                    .as_str()
+                    .is_some_and(|digest| digest.len() == 64)
                 && row["duration_ms"].is_null()
                 && row["tokens"].is_null()
         }));
@@ -3658,6 +4225,10 @@ enabled = true
         drop(temp);
     }
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the regression covers malformed repair and durable peer crash-resume boundaries"
+    )]
     fn malformed_peer_repair_and_crash_resume_use_only_pinned_candidates() {
         let (temp, paths, config, fake) = plan_fixture("peer-repair-resume");
         let bursar = StatusSwitchBursar::from_fake(&fake);
@@ -3730,36 +4301,69 @@ enabled = true
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("ledger row"))
             .collect::<Vec<_>>();
-        assert_eq!(failed_rows.len(), 2, "author and failed peer call are durable");
+        assert_eq!(
+            failed_rows.len(),
+            2,
+            "author and failed peer call are durable"
+        );
         assert_eq!(failed_rows[1]["outcome"], "failed");
         assert!(failed_rows[1]["output_sha256"].is_null());
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
-        let author_provider = match run.plan().expect("plan").progress {
-            crate::run::PlanProgress::AwaitingPeer { ref author, .. } => author.provider_id.clone(),
-            ref other => panic!("expected persisted peer boundary after crash, got {other:?}"),
+        let progress = run.plan().expect("plan").progress.clone();
+        let bound_peer = match &progress {
+            crate::run::PlanProgress::AwaitingPeer {
+                peer: Some(peer), ..
+            } => peer.clone(),
+            other => panic!("peer crash must persist one bound reviewer, got {other:?}"),
         };
-        for provider in ["anthropic", "codex", "opencode-go"] {
-            if provider != author_provider {
-                bursar.exhaust(provider);
-            }
-        }
+        let snapshot = crate::bursar::parse_roster_snapshot(
+            &std::fs::read(run.dir().join("roster.json")).expect("captured roster"),
+        )
+        .expect("captured roster");
+        let router = crate::role_routing::RoleRouter::with_pinned_snapshot(
+            &paths.state_dir,
+            crate::role_routing::RoutingPolicy::from_config(&config, &snapshot)
+                .expect("routing policy"),
+            snapshot,
+        )
+        .expect("router");
+        let binding_id =
+            crate::role_routing::RunId::new(format!("{}-peer-review-bind", prepared.run_id))
+                .expect("stable peer binding id");
+        assert!(matches!(
+            router
+                .reservation(
+                    &crate::role_routing::RoleId::new("plan").expect("role"),
+                    crate::role_routing::PlanStage::PeerReview,
+                    &binding_id,
+                )
+                .expect("reservation lookup"),
+            Some(crate::role_routing::Reservation {
+                state: crate::role_routing::ReservationState::Committed,
+                ..
+            })
+        ));
 
         dispatch(&paths, &config, &bursar, &prepared.run_id, &resumed)
-            .expect("unbound peer may use recorded same-provider degraded contingency");
+            .expect("resume must use the durable peer binding");
         assert_eq!(
             status(&paths, &prepared.run_id).expect("status"),
             "accepted"
         );
-        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
-        assert!(crate::run::read_events(&run.events_path())
-            .expect("events")
+        let peer_calls = resumed
+            .calls
+            .lock()
+            .expect("calls")
             .iter()
-            .any(|event| event.outcome.as_deref() == Some("peer_provider_diversity_degraded")));
+            .filter(|(stage, _)| stage == "peer")
+            .map(|(_, execution)| execution.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(peer_calls, vec![bound_peer.clone(), bound_peer]);
         drop(temp);
     }
     #[test]
-    fn unbound_peer_candidate_exhaustion_finishes_blocked_without_degraded_success() {
-        let (temp, paths, config, fake) = plan_fixture("unbound-peer-exhaustion");
+    fn bound_peer_loss_after_crash_finishes_blocked_without_replacement() {
+        let (temp, paths, config, fake) = plan_fixture("bound-peer-loss-after-crash");
         let bursar = StatusSwitchBursar::from_fake(&fake);
         let repo = initialized_repo(&temp);
         let prepared = prepare(
@@ -3783,7 +4387,7 @@ enabled = true
         let executor = ScriptedExecutor::new(
             vec![Ok(implementation_document())],
             Vec::new(),
-            vec![Err("simulated unbound peer crash".to_string())],
+            vec![Err("simulated bound peer crash".to_string())],
             Vec::new(),
         );
 
@@ -3791,7 +4395,7 @@ enabled = true
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         assert!(matches!(
             run.plan().expect("plan").progress,
-            crate::run::PlanProgress::AwaitingPeer { peer: None, .. }
+            crate::run::PlanProgress::AwaitingPeer { peer: Some(_), .. }
         ));
         for provider in ["anthropic", "codex", "opencode-go"] {
             bursar.exhaust(provider);
@@ -3815,7 +4419,7 @@ enabled = true
                         .as_ref()
                         .is_some_and(|evidence| evidence.stage == crate::run::PlanStage::PeerReview)
             }),
-            "the exhausted unbound peer must not produce a successful review invocation"
+            "the unavailable bound peer must not be replaced or produce a successful review"
         );
     }
 
