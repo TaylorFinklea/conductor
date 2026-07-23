@@ -423,6 +423,9 @@ pub(crate) enum PlanTerminalVerdict {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum PlanProgress {
+    Blocked {
+        cancellable: bool,
+    },
     Prepared,
     Authoring {
         author: ApprovedExecution,
@@ -465,6 +468,32 @@ impl PlanProgress {
             author,
             attempts: 0,
         };
+        Ok(())
+    }
+
+    pub(crate) fn block_before_authoring(&mut self) -> Result<()> {
+        if !matches!(self, Self::Prepared) {
+            return Err(RunError::new(
+                "only an unstarted plan can become cancellably blocked",
+            ));
+        }
+        *self = Self::Blocked { cancellable: true };
+        Ok(())
+    }
+
+    pub(crate) fn replace_author_before_artifact(
+        &mut self,
+        author: ApprovedExecution,
+    ) -> Result<()> {
+        let Self::Authoring {
+            author: persisted, ..
+        } = self
+        else {
+            return Err(RunError::new(
+                "plan author fallback requires active authoring",
+            ));
+        };
+        *persisted = author;
         Ok(())
     }
 
@@ -1446,6 +1475,54 @@ impl RunHandle {
         )
     }
 
+    pub(crate) fn replace_plan_author_before_artifact(
+        &mut self,
+        author: ApprovedExecution,
+    ) -> Result<()> {
+        self.plan_mut("replacing unavailable plan author")?
+            .progress
+            .replace_author_before_artifact(author.clone())?;
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()?;
+        self.append_event(
+            EventKind::AttemptStarted,
+            EventInput {
+                profile_id: Some(author.profile_id),
+                outcome: Some("planner_fallback".to_string()),
+                ..EventInput::default()
+            },
+        )
+    }
+
+    pub(crate) fn block_plan_before_authoring(&mut self) -> Result<()> {
+        self.plan_mut("blocking unstarted plan")?
+            .progress
+            .block_before_authoring()?;
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()?;
+        self.append_event(
+            EventKind::AttemptFinished,
+            EventInput {
+                outcome: Some("planner_unavailable_before_start".to_string()),
+                ..EventInput::default()
+            },
+        )
+    }
+
+    pub(crate) fn finish_plan_blocked(&mut self) -> Result<()> {
+        if !matches!(self.plan()?.progress, PlanProgress::Authoring { .. }) {
+            return Err(RunError::new(
+                "terminal plan block requires active authoring",
+            ));
+        }
+        self.plan_mut("blocking started plan")?.progress = PlanProgress::Terminal {
+            verdict: PlanTerminalVerdict::Blocked,
+        };
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()?;
+        self.finish("blocked")
+    }
+
     /// Persists each author invocation before the harness starts, so a crash
     /// can resume only within the approved bounded attempt budget.
     pub(crate) fn record_plan_author_attempt(&mut self) -> Result<()> {
@@ -1477,9 +1554,13 @@ impl RunHandle {
         )
     }
 
-    /// Ends an unstarted plan run and never rewinds its scheduler rotation.
+    /// Ends an unstarted or explicitly cancellable blocked plan without
+    /// rewinding its scheduler rotation.
     pub(crate) fn cancel_prepared_plan(&mut self) -> Result<()> {
-        if !matches!(self.plan()?.progress, PlanProgress::Prepared) {
+        if !matches!(
+            self.plan()?.progress,
+            PlanProgress::Prepared | PlanProgress::Blocked { cancellable: true }
+        ) {
             return Err(RunError::new(
                 "plan cancellation is allowed only before authoring begins",
             ));
@@ -2434,9 +2515,10 @@ fn validate_plan_progress(path: &Path, progress: &PlanProgress) -> Result<()> {
         PlanProgress::AwaitingPeer { artifact, .. }
         | PlanProgress::Revising { artifact, .. }
         | PlanProgress::AwaitingSecondOpinion { artifact, .. } => Some(artifact),
-        PlanProgress::Prepared | PlanProgress::Authoring { .. } | PlanProgress::Terminal { .. } => {
-            None
-        }
+        PlanProgress::Prepared
+        | PlanProgress::Blocked { .. }
+        | PlanProgress::Authoring { .. }
+        | PlanProgress::Terminal { .. } => None,
     };
     if let Some(artifact) = artifact {
         validate_artifact_ref(artifact, "plan progress artifact")?;
@@ -4317,6 +4399,20 @@ mod tests {
         ));
         assert!(RevisionLimit::new(4).is_err());
         assert!(StageAttemptLimit::new(0).is_err());
+    }
+
+    #[test]
+    fn unstarted_provider_block_is_explicitly_cancellable() {
+        let mut progress = PlanProgress::Prepared;
+
+        progress
+            .block_before_authoring()
+            .expect("block before an author invocation");
+
+        assert!(matches!(
+            progress,
+            PlanProgress::Blocked { cancellable: true }
+        ));
     }
 
     #[test]

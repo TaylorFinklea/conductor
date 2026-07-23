@@ -381,6 +381,7 @@ pub(crate) struct PlanAuthorRequest {
     pub(crate) input: Vec<u8>,
     pub(crate) output_kind: PlanOutputKind,
     pub(crate) execution: crate::run::ApprovedExecution,
+    pub(crate) profile: crate::bursar::RosterProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -748,12 +749,15 @@ fn planned_routes(prepared: &crate::role_routing::PreparedPlanner) -> crate::run
         .filter(|candidate| candidate.eligible)
         .map(|candidate| candidate.execution.clone())
         .collect::<Vec<_>>();
+    let planner_candidates = std::iter::once(prepared.selected.clone())
+        .chain(prepared.fallbacks.iter().cloned())
+        .collect::<Vec<_>>();
     crate::run::PlanRoutes {
         stages: vec![
             crate::run::PlanStageRoute {
                 stage: crate::run::PlanStage::Planner,
                 capability_role: "plan".to_string(),
-                candidates: candidates.clone(),
+                candidates: planner_candidates,
                 provider_distinct_from: Vec::new(),
             },
             crate::run::PlanStageRoute {
@@ -838,7 +842,7 @@ where
     let router = crate::role_routing::RoleRouter::with_pinned_snapshot(
         &paths.state_dir,
         policy,
-        captured_snapshot,
+        captured_snapshot.clone(),
     )
     .map_err(|error| format!("role router: {error}"))?;
     let _run_guard = router
@@ -847,6 +851,7 @@ where
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| format!("plan run guard: {error}"))?;
+    let planner_candidates = planner_candidates(run.plan().map_err(|error| error.to_string())?)?;
     let selected = match run
         .plan()
         .map_err(|error| error.to_string())?
@@ -854,23 +859,56 @@ where
         .clone()
     {
         crate::run::PlanProgress::Prepared => {
-            recheck_author(bursar, &approval.author)?;
+            let selected = match available_planner(bursar, &planner_candidates, None) {
+                Ok(selected) => selected,
+                Err(error) => {
+                    run.block_plan_before_authoring()
+                        .map_err(|error| format!("plan blocked checkpoint: {error}"))?;
+                    return Err(error);
+                }
+            };
             router
                 .commit(&approval.reservation)
                 .map_err(|error| format!("planner reservation: {error}"))?;
-            run.start_plan_authoring(approval.author.clone())
+            run.start_plan_authoring(selected.clone())
                 .map_err(|error| format!("plan author checkpoint: {error}"))?;
-            approval.author.clone()
+            selected
         }
         crate::run::PlanProgress::Authoring { author, .. } => {
-            if author != approval.author {
-                return Err("persisted plan author differs from immutable approval".to_string());
+            if !planner_candidates.contains(&author) {
+                return Err(
+                    "persisted plan author is outside immutable approved planner route".to_string(),
+                );
             }
-            recheck_author(bursar, &author)?;
-            author
+            match recheck_author(bursar, &author) {
+                Ok(()) => author,
+                Err(current_error) => {
+                    match available_planner(bursar, &planner_candidates, Some(&author)) {
+                        Ok(replacement) => {
+                            run.replace_plan_author_before_artifact(replacement.clone())
+                                .map_err(|error| format!("plan fallback checkpoint: {error}"))?;
+                            replacement
+                        }
+                        Err(fallback_error) => {
+                            run.finish_plan_blocked()
+                                .map_err(|error| format!("plan blocked checkpoint: {error}"))?;
+                            return Err(format!(
+                                "approved plan author is unavailable ({current_error}); no approved planner fallback is eligible ({fallback_error})"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        crate::run::PlanProgress::Blocked { .. } => {
+            return Err(
+                "plan is blocked before authoring; cancel or prepare a new authorization"
+                    .to_string(),
+            );
         }
         _ => return Err("plan dispatch state is not resumable authoring".to_string()),
     };
+    let profile = profile_for_execution(&captured_snapshot, &selected)?;
     run.record_plan_author_attempt()
         .map_err(|error| format!("plan author attempt: {error}"))?;
     let output = with_isolated_worktree(&repo, &approval.target_head, |worktree| {
@@ -879,6 +917,7 @@ where
             input: input_bytes.clone(),
             output_kind: approval.output_kind,
             execution: selected.clone(),
+            profile: profile.clone(),
         })
     })?;
     let document = match parse_document(approval.output_kind, &output) {
@@ -892,6 +931,7 @@ where
                     input: input_bytes.clone(),
                     output_kind: approval.output_kind,
                     execution: selected.clone(),
+                    profile: profile.clone(),
                 })
             })?;
             parse_document(approval.output_kind, &repair).map_err(|second_error| {
@@ -919,8 +959,8 @@ where
     }
 }
 
-/// Cancels only a plan that has not started authoring, releasing the pending
-/// reservation while preserving the scheduler's rotation evidence.
+/// Cancels an unstarted plan or an explicitly cancellable pre-authoring block,
+/// releasing the pending reservation while preserving scheduler rotation.
 pub(crate) fn cancel(
     paths: &PlanJobPaths,
     config: &crate::config::Config,
@@ -932,6 +972,7 @@ pub(crate) fn cancel(
     if !matches!(
         run.plan().map_err(|error| error.to_string())?.progress,
         crate::run::PlanProgress::Prepared
+            | crate::run::PlanProgress::Blocked { cancellable: true }
     ) {
         return Err("plan cancel is legal only before authoring starts".to_string());
     }
@@ -963,6 +1004,7 @@ pub(crate) fn status(paths: &PlanJobPaths, run_id: &str) -> Result<String, Strin
     let plan = run.plan().map_err(|error| error.to_string())?;
     let state = match &plan.progress {
         crate::run::PlanProgress::Prepared => "awaiting_approval",
+        crate::run::PlanProgress::Blocked { .. } => "blocked",
         crate::run::PlanProgress::Authoring { .. } => "authoring",
         crate::run::PlanProgress::AwaitingPeer { .. } => "awaiting_peer",
         crate::run::PlanProgress::Revising { .. } => "revising",
@@ -1046,6 +1088,64 @@ fn recheck_author<C: crate::bursar::BursarClient + ?Sized>(
         return Err("approved plan author provider is no longer available".to_string());
     }
     Ok(())
+}
+
+fn planner_candidates(
+    plan: &crate::run::PlanRunDetails,
+) -> Result<Vec<crate::run::ApprovedExecution>, String> {
+    let route = plan
+        .routes
+        .stages
+        .iter()
+        .find(|route| route.stage == crate::run::PlanStage::Planner)
+        .ok_or_else(|| "plan authorization omits planner route".to_string())?;
+    if route.candidates.is_empty() {
+        return Err("plan authorization has no approved planner candidates".to_string());
+    }
+    Ok(route.candidates.clone())
+}
+
+fn available_planner<C: crate::bursar::BursarClient + ?Sized>(
+    bursar: &C,
+    candidates: &[crate::run::ApprovedExecution],
+    exclude: Option<&crate::run::ApprovedExecution>,
+) -> Result<crate::run::ApprovedExecution, String> {
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        if exclude.is_some_and(|excluded| candidate == excluded) {
+            continue;
+        }
+        match recheck_author(bursar, candidate) {
+            Ok(()) => return Ok(candidate.clone()),
+            Err(error) => failures.push(format!("{}: {error}", candidate.profile_id)),
+        }
+    }
+    Err(format!(
+        "no approved planner candidate is currently eligible ({})",
+        failures.join("; ")
+    ))
+}
+
+fn profile_for_execution(
+    snapshot: &crate::bursar::RosterSnapshot,
+    execution: &crate::run::ApprovedExecution,
+) -> Result<crate::bursar::RosterProfile, String> {
+    let profile = snapshot
+        .profiles
+        .iter()
+        .find(|profile| profile.profile_id == execution.profile_id)
+        .ok_or_else(|| "approved plan author is absent from captured Bursar roster".to_string())?;
+    let provider = snapshot
+        .providers
+        .iter()
+        .find(|provider| provider.provider_id == profile.provider_id)
+        .ok_or_else(|| {
+            "approved plan author provider is absent from captured Bursar roster".to_string()
+        })?;
+    if crate::role_routing::approved_execution(profile, provider) != *execution {
+        return Err("approved plan author differs from captured Bursar execution".to_string());
+    }
+    Ok(profile.clone())
 }
 
 fn with_isolated_worktree<T>(
@@ -1173,6 +1273,55 @@ mod tests {
                 return Err("fake author has no output".to_string());
             }
             Ok(outputs.remove(0))
+        }
+    }
+
+    struct StatusSwitchBursar {
+        snapshot: crate::bursar::RosterSnapshot,
+        status: std::sync::Mutex<crate::bursar::StatusReport>,
+    }
+
+    impl StatusSwitchBursar {
+        fn from_fake(fake: &FakeBursar) -> Self {
+            Self {
+                snapshot: fake.snapshot.clone(),
+                status: std::sync::Mutex::new(fake.status.clone()),
+            }
+        }
+
+        fn exhaust(&self, provider_id: &str) {
+            self.status
+                .lock()
+                .expect("status lock")
+                .providers
+                .get_mut(provider_id)
+                .expect("provider")
+                .availability = crate::bursar::Availability::Exhausted;
+        }
+    }
+
+    impl crate::bursar::BursarClient for StatusSwitchBursar {
+        fn status(&self) -> crate::bursar::Result<crate::bursar::StatusReport> {
+            Ok(self.status.lock().expect("status lock").clone())
+        }
+
+        fn roster_snapshot(&self) -> crate::bursar::Result<crate::bursar::RosterSnapshot> {
+            Ok(self.snapshot.clone())
+        }
+    }
+
+    struct CapturingAuthor {
+        output: Vec<u8>,
+        calls: std::sync::Mutex<Vec<crate::run::ApprovedExecution>>,
+    }
+
+    impl PlanAuthor for CapturingAuthor {
+        fn author(&self, request: &PlanAuthorRequest) -> Result<Vec<u8>, String> {
+            self.calls
+                .lock()
+                .map_err(|_| "capturing author lock".to_string())?
+                .push(request.execution.clone());
+            Ok(self.output.clone())
         }
     }
 
@@ -1416,5 +1565,187 @@ enabled = true
             git_output(&repo, ["rev-parse", "HEAD"]).expect("head"),
             before
         );
+    }
+    #[test]
+    fn provider_loss_before_first_artifact_uses_only_approved_planner_fallback() {
+        let (temp, paths, config, fake) = plan_fixture("provider-fallback");
+        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let approval = load_approval(&run).expect("approval");
+        let candidates = planner_candidates(run.plan().expect("plan")).expect("route");
+        assert_eq!(candidates.first(), Some(&approval.author));
+        bursar.exhaust(&approval.author.provider_id);
+        approve(&paths, &prepared.run_id);
+        let author = CapturingAuthor {
+            output: br#"{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("fallback dispatch");
+
+        let calls = author.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 1);
+        assert_ne!(calls[0], approval.author);
+        assert!(candidates.contains(&calls[0]));
+        assert_eq!(
+            status(&paths, &prepared.run_id).expect("status"),
+            "awaiting_peer"
+        );
+    }
+
+    #[test]
+    fn malformed_output_and_schema_repair_consume_persisted_author_attempts() {
+        let (temp, paths, config, bursar) = plan_fixture("repair-attempts");
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let author = FakeAuthor::new(vec![b"not json".to_vec(), b"still not json".to_vec()]);
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert!(matches!(
+            run.plan().expect("plan").progress,
+            crate::run::PlanProgress::Authoring { attempts: 2, .. }
+        ));
+        assert!(
+            dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err(),
+            "the persisted limit rejects an extra invocation after crash/resume"
+        );
+    }
+
+    #[test]
+    fn dispatch_without_exact_later_approval_never_calls_author() {
+        let (temp, paths, config, bursar) = plan_fixture("approval-negative");
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        let author = CapturingAuthor {
+            output: b"unused".to_vec(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert!(author.calls.lock().expect("calls").is_empty());
+        assert_eq!(
+            status(&paths, &prepared.run_id).expect("status"),
+            "awaiting_approval"
+        );
+    }
+
+    #[test]
+    fn provider_block_before_authorship_is_cancellable() {
+        let (temp, paths, config, fake) = plan_fixture("blocked-cancel");
+        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        for provider in ["anthropic", "codex", "opencode-go"] {
+            bursar.exhaust(provider);
+        }
+        approve(&paths, &prepared.run_id);
+        let author = CapturingAuthor {
+            output: b"must not run".to_vec(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert!(author.calls.lock().expect("calls").is_empty());
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+        cancel(&paths, &config, &prepared.run_id).expect("cancel blocked plan");
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+    }
+
+    #[test]
+    fn cancel_is_forbidden_once_authoring_has_started() {
+        let (temp, paths, config, bursar) = plan_fixture("cancel-after-authoring");
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let author = FakeAuthor::new(vec![br#"{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()]);
+
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("dispatch");
+
+        assert!(cancel(&paths, &config, &prepared.run_id).is_err());
     }
 }

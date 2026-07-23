@@ -434,7 +434,7 @@ fn run_plan_dispatch(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let author = CommandPlanAuthor { config: &config };
+    let author = CommandPlanAuthor;
     match crate::plan_job::dispatch(
         &plan_paths(),
         &config,
@@ -453,35 +453,24 @@ fn run_plan_dispatch(args: &[String]) -> ExitCode {
     }
 }
 
-struct CommandPlanAuthor<'a> {
-    config: &'a crate::config::Config,
-}
+struct CommandPlanAuthor;
 
-impl crate::plan_job::PlanAuthor for CommandPlanAuthor<'_> {
+impl crate::plan_job::PlanAuthor for CommandPlanAuthor {
     fn author(&self, request: &crate::plan_job::PlanAuthorRequest) -> Result<Vec<u8>, String> {
-        let entry = self
-            .config
-            .roster
-            .iter()
-            .find(|entry| entry.name == request.execution.profile_id)
-            .ok_or_else(|| "approved author is absent from conductor runtime roster".to_string())?;
         let prompt = format!(
-            "Return only strict conductor/plan-document@1 {} JSON. Plan this immutable input without applying changes:\\n{}",
+            "Return only strict conductor/plan-document@1 {} JSON. Plan this immutable input without applying changes:\n{}",
             match request.output_kind {
                 crate::plan_job::PlanOutputKind::Spec => "spec",
                 crate::plan_job::PlanOutputKind::ImplementationPlan => "implementation-plan",
             },
             String::from_utf8_lossy(&request.input)
         );
-        let (program, args) = match entry.backend {
-            crate::config::Backend::Claude => ("claude", vec!["-p".to_string(), prompt]),
-            crate::config::Backend::Pi => ("pi", vec!["-p".to_string(), prompt]),
-            crate::config::Backend::Codex => ("codex", vec!["exec".to_string(), prompt]),
-            crate::config::Backend::Omp => ("omp", vec!["-p".to_string(), prompt]),
-            crate::config::Backend::Agy => ("agy", vec!["-p".to_string(), prompt]),
-        };
+        let argv = plan_author_argv(request, &prompt)?;
+        let (program, command_args) = argv
+            .split_first()
+            .ok_or_else(|| "plan author argv was empty".to_string())?;
         let output = Command::new(program)
-            .args(args)
+            .args(command_args)
             .current_dir(&request.worktree)
             .stdin(Stdio::null())
             .output()
@@ -494,6 +483,34 @@ impl crate::plan_job::PlanAuthor for CommandPlanAuthor<'_> {
         }
         Ok(output.stdout)
     }
+}
+
+fn plan_author_argv(
+    request: &crate::plan_job::PlanAuthorRequest,
+    prompt: &str,
+) -> Result<Vec<String>, String> {
+    if request.profile.profile_id != request.execution.profile_id
+        || request.profile.provider_id != request.execution.provider_id
+    {
+        return Err("plan author profile differs from approved execution".to_string());
+    }
+    let backend = crate::bursar::backend_from_harness(&request.profile.harness)
+        .map_err(|error| format!("plan author harness: {error}"))?;
+    let reasoning_effort = request
+        .profile
+        .reasoning_effort
+        .as_deref()
+        .map(str::parse::<crate::config::ReasoningEffort>)
+        .transpose()
+        .map_err(|error| format!("plan author reasoning_effort: {error}"))?;
+    crate::dispatch::readonly_argv_for_backend(
+        backend,
+        &request.profile.dispatch_id,
+        reasoning_effort,
+        prompt,
+        &request.worktree,
+    )
+    .map_err(|error| format!("plan author argv: {error}"))
 }
 fn run_adversarial(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     match it.next().as_deref() {
@@ -1873,6 +1890,71 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn plan_author_argv_uses_pinned_bursar_dispatch_identity() {
+        let profile: crate::bursar::RosterProfile = serde_json::from_value(serde_json::json!({
+            "profile_id": "planner-pi",
+            "provider_id": "opencode-go",
+            "model": "glm-5.2",
+            "harness": "pi",
+            "dispatch_id": "opencode-go/glm-5.2",
+            "reasoning_effort": null,
+            "tier": "lead",
+            "ceiling": "XL",
+            "efficiency": "lean",
+            "cost": 0.0,
+            "data_policy": "standard",
+            "enabled": true,
+            "roles": ["plan"],
+            "state": "healthy",
+            "eligible": true,
+            "ineligibility_reason": null
+        }))
+        .expect("roster profile");
+        let request = crate::plan_job::PlanAuthorRequest {
+            worktree: PathBuf::from("/tmp/plan-author"),
+            input: b"immutable input".to_vec(),
+            output_kind: crate::plan_job::PlanOutputKind::Spec,
+            execution: crate::run::ApprovedExecution {
+                profile_id: "planner-pi".to_string(),
+                provider_id: "opencode-go".to_string(),
+                availability_key: "opencode-go".to_string(),
+                execution_key: "ignored".to_string(),
+            },
+            profile,
+        };
+
+        let argv = plan_author_argv(&request, "strict prompt").expect("pinned argv");
+
+        assert_eq!(
+            argv,
+            vec![
+                "pi",
+                "--model",
+                "opencode-go/glm-5.2",
+                "--thinking",
+                "xhigh",
+                "--no-tools",
+                "-p",
+                "strict prompt",
+            ]
+        );
+    }
+    #[test]
+    fn plan_prepare_defaults_to_one_revision() {
+        let parsed = parse_plan_prepare_options(&[
+            "--repo".to_string(),
+            "/tmp/repo".to_string(),
+            "--bead".to_string(),
+            "plan-1".to_string(),
+            "--output-kind".to_string(),
+            "spec".to_string(),
+        ])
+        .expect("strict Bead prepare grammar");
+
+        assert_eq!(parsed.max_plan_revisions, 1);
     }
     #[test]
     fn adversarial_plan_and_dispatch_parsers_enforce_exact_grammar() {

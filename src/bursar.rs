@@ -493,8 +493,7 @@ impl RosterSnapshot {
         &self.source_artifact
     }
 }
-
-fn backend_from_harness(harness: &str) -> Result<crate::config::Backend> {
+pub(crate) fn backend_from_harness(harness: &str) -> Result<crate::config::Backend> {
     match harness {
         "claude-code" => Ok(crate::config::Backend::Claude),
         "pi" => Ok(crate::config::Backend::Pi),
