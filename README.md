@@ -76,6 +76,5 @@ Git, worktree management, normal cycle dispatch, target-repository writes, or
 and ledger paths. Tests inject fake execution and mutation sentinels; they do
 not make live or metered reviewer calls.
 
-This feature remains separate from normal cycle, Arena, and qualitative review
-jobs. It does not implement the later Conductor-core consolidation or migrate
-adversarial review into a `review` job.
+This feature remains separate from normal cycle and plan peer-review jobs. It
+does not yet migrate adversarial design review into the native `review` job.
