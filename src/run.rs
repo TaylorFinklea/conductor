@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -1591,7 +1591,7 @@ pub(crate) fn find_pending_work_run(
 #[derive(Debug, Default)]
 pub(crate) struct PendingWorkIndex {
     candidates: BTreeMap<PendingWorkKey, Vec<PathBuf>>,
-    malformed: Vec<MalformedManifest>,
+    malformed: BTreeMap<PendingWorkKey, Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1611,11 +1611,6 @@ impl PendingWorkKey {
     }
 }
 
-#[derive(Debug)]
-struct MalformedManifest {
-    path: PathBuf,
-    bytes: Vec<u8>,
-}
 
 impl PendingWorkIndex {
     /// Reads each lightweight manifest once. This intentionally does not
@@ -1651,11 +1646,13 @@ impl PendingWorkIndex {
         let mut index = Self::default();
         for run_dir in run_dirs {
             let path = run_dir.join("manifest.json");
-            let Ok(bytes) = std::fs::read(&path) else {
+            let Ok(bytes) = read_discovery_manifest(&path) else {
                 continue;
             };
             let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-                index.malformed.push(MalformedManifest { path, bytes });
+                if let Some(key) = partial_pending_work_key(&bytes) {
+                    index.malformed.entry(key).or_default().push(path);
+                }
                 continue;
             };
             let Some(key) = pending_work_key_from_untrusted_manifest(&value) else {
@@ -1663,10 +1660,9 @@ impl PendingWorkIndex {
             };
             index.candidates.entry(key).or_default().push(path);
         }
-        for paths in index.candidates.values_mut() {
+        for paths in index.candidates.values_mut().chain(index.malformed.values_mut()) {
             paths.sort();
         }
-        index.malformed.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(index)
     }
 
@@ -1679,16 +1675,14 @@ impl PendingWorkIndex {
         bead: &str,
     ) -> Result<Option<String>> {
         let key = PendingWorkKey::new(cycle_id, repo, bead);
-        let malformed = self
-            .malformed
-            .iter()
-            .filter(|entry| manifest_bytes_may_match(&entry.bytes, &key))
-            .map(|entry| entry.path.display().to_string())
-            .collect::<Vec<_>>();
-        if !malformed.is_empty() {
+        if let Some(paths) = self.malformed.get(&key) {
+            let paths = paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
             return Err(RunError::new(format!(
                 "pending-review evidence for {cycle_id} {repo}/{bead} is malformed: {}",
-                malformed.join(", ")
+                paths.join(", ")
             )));
         }
 
@@ -1751,9 +1745,191 @@ fn pending_work_key_from_untrusted_manifest(value: &serde_json::Value) -> Option
         .then(|| PendingWorkKey::new(cycle_id, repo, bead))
 }
 
-fn manifest_bytes_may_match(bytes: &[u8], key: &PendingWorkKey) -> bool {
-    let text = String::from_utf8_lossy(bytes);
-    text.contains(&key.cycle_id) && text.contains(&key.repo) && text.contains(&key.bead)
+const DISCOVERY_MANIFEST_MAX_BYTES: u64 = 128 * 1024;
+
+fn read_discovery_manifest(path: &Path) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(DISCOVERY_MANIFEST_MAX_BYTES)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[derive(Default)]
+struct PartialPendingWorkKey {
+    cycle_id: Option<String>,
+    repo: Option<String>,
+    bead: Option<String>,
+}
+
+impl PartialPendingWorkKey {
+    fn into_key(self) -> Option<PendingWorkKey> {
+        Some(PendingWorkKey {
+            cycle_id: self.cycle_id?,
+            repo: self.repo?,
+            bead: self.bead?,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PartialScope {
+    Root,
+    Target,
+    Details,
+    WorkState,
+    Other,
+}
+
+fn partial_pending_work_key(bytes: &[u8]) -> Option<PendingWorkKey> {
+    let mut parser = PartialJsonParser { bytes, position: 0 };
+    let mut fields = PartialPendingWorkKey::default();
+    let _ = parser.parse_object(PartialScope::Root, &mut fields);
+    fields.into_key()
+}
+
+struct PartialJsonParser<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl PartialJsonParser<'_> {
+    fn parse_object(
+        &mut self,
+        scope: PartialScope,
+        fields: &mut PartialPendingWorkKey,
+    ) -> Option<()> {
+        self.expect(b'{')?;
+        loop {
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                return Some(());
+            }
+            let key = self.parse_string()?;
+            self.expect(b':')?;
+            if let Some(child_scope) = partial_child_scope(scope, &key) {
+                self.parse_object(child_scope, fields)?;
+            } else {
+                self.parse_field(scope, &key, fields)?;
+            }
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                return Some(());
+            }
+            self.expect(b',')?;
+        }
+    }
+
+    fn parse_field(
+        &mut self,
+        scope: PartialScope,
+        key: &str,
+        fields: &mut PartialPendingWorkKey,
+    ) -> Option<()> {
+        let value = match (scope, key) {
+            (PartialScope::Target, "repo" | "bead")
+            | (PartialScope::WorkState, "cycle_id") => self.parse_string()?,
+            _ => return self.skip_value(fields),
+        };
+        match (scope, key) {
+            (PartialScope::Target, "repo") => fields.repo = Some(value),
+            (PartialScope::Target, "bead") => fields.bead = Some(value),
+            (PartialScope::WorkState, "cycle_id") => fields.cycle_id = Some(value),
+            _ => {}
+        }
+        Some(())
+    }
+
+    fn skip_value(&mut self, fields: &mut PartialPendingWorkKey) -> Option<()> {
+        self.skip_whitespace();
+        match self.peek()? {
+            b'"' => {
+                self.parse_string()?;
+                Some(())
+            }
+            b'{' => self.parse_object(PartialScope::Other, fields),
+            b'[' => self.skip_array(fields),
+            _ => {
+                let start = self.position;
+                while let Some(byte) = self.peek() {
+                    if matches!(byte, b',' | b']' | b'}') || byte.is_ascii_whitespace() {
+                        break;
+                    }
+                    self.position += 1;
+                }
+                (self.position > start).then_some(())
+            }
+        }
+    }
+
+    fn skip_array(&mut self, fields: &mut PartialPendingWorkKey) -> Option<()> {
+        self.expect(b'[')?;
+        loop {
+            self.skip_whitespace();
+            if self.consume(b']') {
+                return Some(());
+            }
+            self.skip_value(fields)?;
+            self.skip_whitespace();
+            if self.consume(b']') {
+                return Some(());
+            }
+            self.expect(b',')?;
+        }
+    }
+
+    fn parse_string(&mut self) -> Option<String> {
+        self.skip_whitespace();
+        let start = self.position;
+        self.expect(b'"')?;
+        while let Some(byte) = self.peek() {
+            match byte {
+                b'"' => {
+                    self.position += 1;
+                    return serde_json::from_slice(&self.bytes[start..self.position]).ok();
+                }
+                b'\\' => {
+                    self.position += 1;
+                    self.position += usize::from(self.peek().is_some());
+                }
+                _ => self.position += 1,
+            }
+        }
+        None
+    }
+
+    fn expect(&mut self, expected: u8) -> Option<()> {
+        self.skip_whitespace();
+        self.consume(expected).then_some(())
+    }
+
+    fn consume(&mut self, expected: u8) -> bool {
+        if self.peek() == Some(expected) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.position).copied()
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
+            self.position += 1;
+        }
+    }
+}
+
+fn partial_child_scope(scope: PartialScope, key: &str) -> Option<PartialScope> {
+    match (scope, key) {
+        (PartialScope::Root, "target") => Some(PartialScope::Target),
+        (PartialScope::Root, "details") => Some(PartialScope::Details),
+        (PartialScope::Details, "state") => Some(PartialScope::WorkState),
+        _ => None,
+    }
 }
 
 /// Finds the one unfinished work run still mid-implementation for an exact
@@ -2879,6 +3055,16 @@ mod tests {
         handle
     }
 
+    fn truncate_pending_manifest(handle: &RunHandle, cycle_id: &str, repo: &str, bead: &str) {
+        let bytes = format!(
+            r#"{{"target":{{"repo":{},"bead":{}}},"details":{{"job":"work","state":{{"cycle_id":{},"stage":"pending_review""#,
+            serde_json::to_string(repo).expect("serialize repo"),
+            serde_json::to_string(bead).expect("serialize bead"),
+            serde_json::to_string(cycle_id).expect("serialize cycle id"),
+        );
+        std::fs::write(handle.manifest_path(), bytes).expect("write truncated manifest");
+    }
+
     #[test]
     fn find_pending_work_run_ignores_an_unrelated_run_with_corrupt_artifacts() {
         let temp = TempDir::new("pending-unrelated-corrupt");
@@ -3007,6 +3193,104 @@ mod tests {
             "target-1",
         )
         .expect("pruned finished history must not block discovery");
+
+        assert_eq!(found.as_deref(), Some(matching.run_id()));
+    }
+
+    #[test]
+    fn find_pending_work_run_ignores_truncated_history_from_a_prefix_colliding_cycle() {
+        let temp = TempDir::new("pending-truncated-prefix");
+        let matching = pending_work_run(
+            &temp,
+            "cycle-20260722-120000",
+            "/repo/target",
+            "target-1",
+            "matching",
+        );
+        let colliding = pending_work_run(
+            &temp,
+            "cycle-20260722-120000-2",
+            "/repo/target",
+            "target-1",
+            "colliding",
+        );
+        truncate_pending_manifest(
+            &colliding,
+            "cycle-20260722-120000-2",
+            "/repo/target",
+            "target-1",
+        );
+
+        let found = find_pending_work_run(
+            temp.path(),
+            "cycle-20260722-120000",
+            "/repo/target",
+            "target-1",
+        )
+        .expect("prefix-colliding malformed history must remain unrelated");
+
+        assert_eq!(found.as_deref(), Some(matching.run_id()));
+    }
+
+    #[test]
+    fn find_pending_work_run_fails_closed_on_a_truncated_matching_manifest() {
+        let temp = TempDir::new("pending-truncated-matching");
+        let matching = pending_work_run(
+            &temp,
+            "cycle-20260722-120000-2",
+            "/repo/target",
+            "target-1",
+            "matching",
+        );
+        truncate_pending_manifest(
+            &matching,
+            "cycle-20260722-120000-2",
+            "/repo/target",
+            "target-1",
+        );
+
+        let error = find_pending_work_run(
+            temp.path(),
+            "cycle-20260722-120000-2",
+            "/repo/target",
+            "target-1",
+        )
+        .expect_err("matching truncated evidence must fail closed");
+
+        assert!(error.to_string().contains("is malformed"));
+    }
+
+    #[test]
+    fn find_pending_work_run_ignores_truncated_history_from_a_genuinely_unrelated_cycle() {
+        let temp = TempDir::new("pending-truncated-unrelated");
+        let matching = pending_work_run(
+            &temp,
+            "cycle-20260722-120000",
+            "/repo/target",
+            "target-1",
+            "matching",
+        );
+        let unrelated = pending_work_run(
+            &temp,
+            "cycle-20260722-120001",
+            "/repo/target",
+            "target-1",
+            "unrelated",
+        );
+        truncate_pending_manifest(
+            &unrelated,
+            "cycle-20260722-120001",
+            "/repo/target",
+            "target-1",
+        );
+
+        let found = find_pending_work_run(
+            temp.path(),
+            "cycle-20260722-120000",
+            "/repo/target",
+            "target-1",
+        )
+        .expect("genuinely unrelated malformed history must not block discovery");
 
         assert_eq!(found.as_deref(), Some(matching.run_id()));
     }
