@@ -220,7 +220,7 @@ impl LoopKernel {
             review_resume_budget_secs: None,
             stage: crate::run::WorkStage::Implementing,
         };
-        let mut run = RunHandle::create(
+        let run = RunHandle::create(
             &request.state_dir,
             RunJob::Work,
             NewRun {
@@ -244,14 +244,6 @@ impl LoopKernel {
         .map_err(run_error)?;
         let state = LoopState::new(&request.target);
         write_state(run.dir(), &state)?;
-        run.append_event(
-            EventKind::CoverageGap,
-            EventInput {
-                outcome: Some("loop_prepared".to_string()),
-                ..EventInput::default()
-            },
-        )
-        .map_err(run_error)?;
         Ok(run.run_id().to_string())
     }
 
@@ -273,6 +265,15 @@ impl LoopKernel {
         H: LoopHarness + ?Sized,
     {
         request.validate()?;
+        let lease_holder = request.resume_run_id.clone().unwrap_or_else(|| {
+            format!("loop-pending-{}", &authorization_hash(request)[..16])
+        });
+        let _lease = RepoLease::acquire(
+            &request.state_dir,
+            &request.canonical_repo(),
+            &lease_holder,
+        )
+        .map_err(|error| LoopError::new(format!("acquire exclusive repo lease: {error}")))?;
         let mut run = if let Some(run_id) = request.resume_run_id.as_deref() {
             RunHandle::open(&request.state_dir, run_id).map_err(run_error)?
         } else {
@@ -280,8 +281,6 @@ impl LoopKernel {
             RunHandle::open(&request.state_dir, &run_id).map_err(run_error)?
         };
         validate_run_target(&run, request)?;
-        let _lease = RepoLease::acquire(&request.state_dir, &request.canonical_repo(), run.run_id())
-            .map_err(|error| LoopError::new(format!("acquire exclusive repo lease: {error}")))?;
         let mut state = read_state(run.dir(), &request.target)?;
         if let Some(terminal) = state.terminal {
             return Self::complete_transition(claim, request, &mut state, &mut run, terminal.into());
@@ -336,6 +335,9 @@ impl LoopKernel {
                     continue;
                 }
             };
+            // `run_worker_process` returned only after proving the worker group
+            // quiescent; persist that proof before any verifier checkpoint.
+            run.invalidate_worker_group().map_err(run_error)?;
             let after = commits
                 .head(&request.repo)
                 .map_err(|error| LoopError::new(format!("read post-worker HEAD: {error}")))?;
@@ -549,6 +551,7 @@ fn run_error(error: crate::run::RunError) -> LoopError {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::collections::VecDeque;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -572,14 +575,17 @@ mod tests {
         verifiers: VecDeque<TestProcess>,
         contexts: Vec<LoopIteration>,
         released: bool,
+        panic_next_verifier: bool,
         closed: bool,
         finished_before_close: bool,
+        verifier_saw_quiesced_worker: bool,
         state_dir: PathBuf,
     }
 
     enum TestProcess {
         SpawnError,
         Status(ProcessStatus, Option<String>),
+        StatusWithPgid(ProcessStatus, Option<String>, u32),
     }
 
     impl TestHarness {
@@ -607,6 +613,8 @@ mod tests {
                     released: false,
                     closed: false,
                     finished_before_close: false,
+                    panic_next_verifier: false,
+                    verifier_saw_quiesced_worker: false,
                     state_dir,
                 })),
             }
@@ -631,6 +639,12 @@ mod tests {
             self.inner.borrow().contexts.get(1).is_some_and(|context| context.feedback.iter().any(|feedback| feedback.contains(value)))
         }
         fn finished_run_before_close(&self) -> bool { self.inner.borrow().finished_before_close }
+        fn verifier_saw_quiesced_worker(&self) -> bool {
+            self.inner.borrow().verifier_saw_quiesced_worker
+        }
+        fn panic_during_next_verifier(&self) {
+            self.inner.borrow_mut().panic_next_verifier = true;
+        }
     }
 
     impl CommitProbe for TestHarness {
@@ -652,7 +666,16 @@ mod tests {
             };
             match next.unwrap_or(TestProcess::SpawnError) {
                 TestProcess::SpawnError => Err(DispatchError::new("synthetic spawn failure")),
-                TestProcess::Status(status, commit) => Ok(Box::new(TestChild { status, commit })),
+                TestProcess::Status(status, commit) => Ok(Box::new(TestChild {
+                    status,
+                    commit,
+                    pgid: None,
+                })),
+                TestProcess::StatusWithPgid(status, commit, pgid) => Ok(Box::new(TestChild {
+                    status,
+                    commit,
+                    pgid: Some(pgid),
+                })),
             }
         }
     }
@@ -662,7 +685,27 @@ mod tests {
             self.inner.borrow_mut().contexts.push(iteration.clone());
             Ok(spawn("worker"))
         }
-        fn verifier(&self, _iteration: &LoopIteration) -> Result<SpawnRequest> { Ok(spawn("verify")) }
+        fn verifier(&self, _iteration: &LoopIteration) -> Result<SpawnRequest> {
+            let state_dir = self.inner.borrow().state_dir.clone();
+            let run_id = fs::read_dir(state_dir.join("runs-v2"))
+                .expect("run directory")
+                .next()
+                .expect("run")
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("utf-8 run id");
+            let pgid = RunHandle::open(&state_dir, &run_id)
+                .expect("open run")
+                .worker_pgid();
+            let should_panic = {
+                let mut state = self.inner.borrow_mut();
+                state.verifier_saw_quiesced_worker = pgid.is_none();
+                std::mem::take(&mut state.panic_next_verifier)
+            };
+            assert!(!should_panic, "synthetic verifier crash");
+            Ok(spawn("verify"))
+        }
     }
 
     impl LoopClaim for TestHarness {
@@ -680,13 +723,18 @@ mod tests {
         }
     }
 
-    struct TestChild { status: ProcessStatus, commit: Option<String> }
+    struct TestChild {
+        status: ProcessStatus,
+        commit: Option<String>,
+        pgid: Option<u32>,
+    }
     impl ChildProcess for TestChild {
         fn wait_for(&mut self, _timeout: Duration) -> crate::dispatch::Result<Option<ProcessStatus>> { Ok(Some(self.status)) }
         fn terminate(&mut self) -> crate::dispatch::Result<()> { Ok(()) }
         fn kill(&mut self) -> crate::dispatch::Result<()> { Ok(()) }
         fn wait(&mut self) -> crate::dispatch::Result<ProcessStatus> { Ok(self.status) }
         fn authenticated_worker_commit(&self) -> Option<String> { self.commit.clone() }
+        fn id(&self) -> Option<u32> { self.pgid }
     }
 
     fn spawn(command: &str) -> SpawnRequest {
@@ -722,9 +770,76 @@ mod tests {
     fn loop_rejects_a_concurrent_repository_lease() {
         let harness = TestHarness::new(vec![], vec![], true);
         let request = harness.request();
-        let lease = RepoLease::acquire(&request.state_dir, &request.canonical_repo(), "other").expect("held lease");
+        let lease = RepoLease::acquire(&request.state_dir, &request.canonical_repo(), "other")
+            .expect("held lease");
         assert!(LoopKernel::run(&harness, &harness, &harness, &harness, &request).is_err());
         drop(lease);
+        assert!(!request.state_dir.join("runs-v2").exists());
+    }
+
+    #[test]
+    fn loop_clears_completed_worker_identity_before_verifier_subprocess() {
+        let harness = TestHarness::new(
+            vec![TestProcess::StatusWithPgid(
+                ProcessStatus::code(0),
+                Some("b".repeat(40)),
+                42,
+            )],
+            vec![success_verifier()],
+            true,
+        );
+        assert_eq!(
+            LoopKernel::run(&harness, &harness, &harness, &harness, &harness.request())
+                .expect("terminal"),
+            LoopTerminal::Completed
+        );
+        assert!(harness.verifier_saw_quiesced_worker());
+    }
+
+    #[test]
+    fn loop_resumes_after_crashing_at_verifier_checkpoint() {
+        let harness = TestHarness::new(
+            vec![
+                TestProcess::StatusWithPgid(
+                    ProcessStatus::code(0),
+                    Some("b".repeat(40)),
+                    42,
+                ),
+                success_worker('c'),
+            ],
+            vec![success_verifier()],
+            true,
+        );
+        let mut request = harness.request();
+        harness.panic_during_next_verifier();
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _ = LoopKernel::run(&harness, &harness, &harness, &harness, &request);
+        }))
+        .is_err());
+        let run_id = fs::read_dir(request.state_dir.join("runs-v2"))
+            .expect("run directory")
+            .next()
+            .expect("run")
+            .expect("entry")
+            .file_name()
+            .into_string()
+            .expect("utf-8 run id");
+        request.resume_run_id = Some(run_id);
+        assert_eq!(
+            LoopKernel::run(&harness, &harness, &harness, &harness, &request)
+                .expect("resume verifier checkpoint"),
+            LoopTerminal::Completed
+        );
+    }
+
+    #[test]
+    fn loop_start_does_not_emit_a_spurious_coverage_gap() {
+        let harness = TestHarness::new(vec![], vec![], true);
+        let request = harness.request();
+        let run_id = LoopKernel::start(&harness, &request).expect("start");
+        let events = fs::read_to_string(request.state_dir.join("runs-v2").join(run_id).join("events.jsonl"))
+            .expect("events");
+        assert!(!events.contains("loop_prepared"));
     }
 
     #[test]
