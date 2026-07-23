@@ -508,6 +508,8 @@ pub(crate) enum PlanProgress {
     AwaitingSecondOpinion {
         author: ApprovedExecution,
         peer: ApprovedExecution,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        second: Option<Box<ApprovedExecution>>,
         artifact: ArtifactRef,
         revisions: RevisionLimit,
     },
@@ -621,6 +623,7 @@ impl PlanProgress {
             PeerVerdict::Approve => Self::AwaitingSecondOpinion {
                 author,
                 peer,
+                second: None,
                 artifact,
                 revisions,
             },
@@ -656,11 +659,59 @@ impl PlanProgress {
         };
         Ok(())
     }
-
-    pub(crate) fn record_second_opinion(&mut self, verdict: SecondOpinionVerdict) -> Result<()> {
-        if !matches!(self, Self::AwaitingSecondOpinion { .. }) {
+    pub(crate) fn bind_second_opinion(&mut self, second: ApprovedExecution) -> Result<()> {
+        let Self::AwaitingSecondOpinion {
+            author,
+            peer,
+            second: bound,
+            ..
+        } = self
+        else {
             return Err(RunError::new(
-                "second opinion verdict is not legal in this plan state",
+                "second opinion can bind only while awaiting second opinion",
+            ));
+        };
+        if second.execution_key == author.execution_key
+            || second.execution_key == peer.execution_key
+        {
+            return Err(RunError::new(
+                "second opinion binding must use a distinct exact execution",
+            ));
+        }
+        if second.provider_id == author.provider_id || second.provider_id == peer.provider_id {
+            return Err(RunError::new(
+                "second opinion binding must use a pairwise-distinct provider",
+            ));
+        }
+        if let Some(existing) = bound {
+            if existing.as_ref() != &second {
+                return Err(RunError::new(
+                    "second opinion binding cannot change after reservation",
+                ));
+            }
+        } else {
+            *bound = Some(Box::new(second));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_second_opinion(
+        &mut self,
+        second: &ApprovedExecution,
+        verdict: SecondOpinionVerdict,
+    ) -> Result<()> {
+        let Self::AwaitingSecondOpinion {
+            second: Some(bound),
+            ..
+        } = self
+        else {
+            return Err(RunError::new(
+                "second opinion verdict requires a durable second-opinion binding",
+            ));
+        };
+        if bound.as_ref() != second {
+            return Err(RunError::new(
+                "second opinion verdict must use the durable bound identity",
             ));
         }
         *self = Self::Terminal {
@@ -1757,6 +1808,16 @@ impl RunHandle {
         )
     }
 
+    /// Persists the exact pairwise-distinct second-opinion identity before its
+    /// first invocation so a later resume cannot select a different reviewer.
+    pub(crate) fn bind_plan_second_opinion(&mut self, second: ApprovedExecution) -> Result<()> {
+        self.plan_mut("binding plan second opinion")?
+            .progress
+            .bind_second_opinion(second)?;
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()
+    }
+
     /// Records a strict final spec opinion. A final reject is terminal and
     /// never re-opens the peer/revision loop.
     pub(crate) fn record_plan_second_opinion(
@@ -1789,7 +1850,7 @@ impl RunHandle {
         }
         self.plan_mut("recording plan second opinion")?
             .progress
-            .record_second_opinion(verdict)?;
+            .record_second_opinion(&second, verdict)?;
         self.manifest.updated_at = Utc::now().to_rfc3339();
         self.write_manifest()?;
         self.append_event(
@@ -3954,16 +4015,14 @@ mod tests {
             reopened.terminal_transition().expect("read transition"),
             Some(transition)
         );
-        assert!(
-            reopened
-                .write_terminal_transition(&TerminalTransition {
-                    action: TerminalTransitionAction::Close,
-                    reason: "different reason".to_string(),
-                    metadata: None,
-                    comment: None,
-                })
-                .is_err()
-        );
+        assert!(reopened
+            .write_terminal_transition(&TerminalTransition {
+                action: TerminalTransitionAction::Close,
+                reason: "different reason".to_string(),
+                metadata: None,
+                comment: None,
+            })
+            .is_err());
     }
 
     #[test]
@@ -4010,11 +4069,9 @@ mod tests {
         let handle =
             RunHandle::create_at(temp.path(), RunJob::Consult, new_run_request(), fixed_now())
                 .expect("create run");
-        assert!(
-            handle
-                .manifest_path()
-                .starts_with(runs_dir(temp.path()).join(handle.run_id()))
-        );
+        assert!(handle
+            .manifest_path()
+            .starts_with(runs_dir(temp.path()).join(handle.run_id())));
         assert!(handle.run_id().starts_with("run-consult-"));
         assert!(handle.dir().join("attempts").is_dir());
         assert!(handle.dir().join("artifacts").is_dir());
@@ -4054,11 +4111,9 @@ mod tests {
         assert_eq!(artifact.path, "attempts/001/stdout.log");
         assert_eq!(artifact.sha256.len(), 64);
         assert!(handle.capture_artifact(&source, relative).is_err());
-        assert!(
-            handle
-                .capture_artifact(&source, Path::new("approval.json"))
-                .is_err()
-        );
+        assert!(handle
+            .capture_artifact(&source, Path::new("approval.json"))
+            .is_err());
         std::fs::write(handle.dir().join("approval.json"), b"tampered\n").expect("tamper approval");
         assert!(read_manifest(&handle.manifest_path()).is_err());
         assert!(read_events(&handle.events_path()).is_err());
@@ -4649,8 +4704,12 @@ mod tests {
         progress
             .record_peer_verdict(peer, PeerVerdict::Approve)
             .expect("same peer approves");
+        let second = execution("second", "opencode-go");
         progress
-            .record_second_opinion(SecondOpinionVerdict::Accept)
+            .bind_second_opinion(second.clone())
+            .expect("persist pairwise-distinct second opinion");
+        progress
+            .record_second_opinion(&second, SecondOpinionVerdict::Accept)
             .expect("second opinion terminates plan");
         assert!(matches!(
             progress,
@@ -4719,11 +4778,9 @@ mod tests {
 
         std::fs::remove_dir_all(&pending).expect("remove fixture pending");
         std::fs::remove_dir_all(&implementing).expect("remove fixture implementing");
-        assert!(
-            legacy_v1_preflight(temp.path())
-                .expect("classify inert history")
-                .activation_allowed()
-        );
+        assert!(legacy_v1_preflight(temp.path())
+            .expect("classify inert history")
+            .activation_allowed());
         RunHandle::create_at(temp.path(), RunJob::Consult, new_run_request(), fixed_now())
             .expect("finished v1 history is inert to v2");
     }

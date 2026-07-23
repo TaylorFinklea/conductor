@@ -1040,14 +1040,15 @@ where
         .clone()
     {
         crate::run::PlanProgress::Prepared => {
-            let selected = match available_planner(bursar, &planner_candidates, None) {
-                Ok(selected) => selected,
-                Err(error) => {
-                    run.block_plan_before_authoring()
-                        .map_err(|error| format!("plan blocked checkpoint: {error}"))?;
-                    return Err(error);
-                }
-            };
+            let selected =
+                match available_planner(bursar, &captured_snapshot, &planner_candidates, None) {
+                    Ok(selected) => selected,
+                    Err(error) => {
+                        run.block_plan_before_authoring()
+                            .map_err(|error| format!("plan blocked checkpoint: {error}"))?;
+                        return Err(error);
+                    }
+                };
             router
                 .commit(&approval.reservation)
                 .map_err(|error| format!("planner reservation: {error}"))?;
@@ -1061,10 +1062,15 @@ where
                     "persisted plan author is outside immutable approved planner route".to_string(),
                 );
             }
-            match recheck_author(bursar, &author) {
+            match recheck_author(bursar, &captured_snapshot, &author) {
                 Ok(()) => author,
                 Err(current_error) => {
-                    match available_planner(bursar, &planner_candidates, Some(&author)) {
+                    match available_planner(
+                        bursar,
+                        &captured_snapshot,
+                        &planner_candidates,
+                        Some(&author),
+                    ) {
                         Ok(replacement) => {
                             run.replace_plan_author_before_artifact(replacement.clone())
                                 .map_err(|error| format!("plan fallback checkpoint: {error}"))?;
@@ -1227,7 +1233,7 @@ where
             } => {
                 let (reviewer, degraded) = match peer {
                     Some(bound) => {
-                        if let Err(error) = recheck_author(bursar, &bound) {
+                        if let Err(error) = recheck_author(bursar, snapshot, &bound) {
                             run.finish_plan_blocked().map_err(|checkpoint| {
                                 format!("plan blocked after bound peer loss: {checkpoint}")
                             })?;
@@ -1271,7 +1277,7 @@ where
                     attempt,
                     "started",
                 )?;
-                recheck_author(bursar, &reviewer)?;
+                recheck_author(bursar, snapshot, &reviewer)?;
                 let first = with_isolated_worktree(repo, &approval.target_head, |worktree| {
                     executor.peer_review(&PlanPeerReviewRequest {
                         worktree: worktree.to_path_buf(),
@@ -1304,7 +1310,7 @@ where
                             repair_attempt,
                             "started",
                         )?;
-                        recheck_author(bursar, &reviewer)?;
+                        recheck_author(bursar, snapshot, &reviewer)?;
                         let repair =
                             with_isolated_worktree(repo, &approval.target_head, |worktree| {
                                 executor.peer_review(&PlanPeerReviewRequest {
@@ -1365,7 +1371,7 @@ where
                 artifact,
                 ..
             } => {
-                recheck_author(bursar, &author).map_err(|error| {
+                recheck_author(bursar, snapshot, &author).map_err(|error| {
                     let _ = run.finish_plan_blocked();
                     format!("immutable plan author is no longer eligible for revision: {error}")
                 })?;
@@ -1398,7 +1404,7 @@ where
                     attempt,
                     "started",
                 )?;
-                recheck_author(bursar, &author)?;
+                recheck_author(bursar, snapshot, &author)?;
                 let first = with_isolated_worktree(repo, &approval.target_head, |worktree| {
                     executor.revise(&PlanRevisionRequest {
                         worktree: worktree.to_path_buf(),
@@ -1425,7 +1431,7 @@ where
                             repair_attempt,
                             "started",
                         )?;
-                        recheck_author(bursar, &author)?;
+                        recheck_author(bursar, snapshot, &author)?;
                         let repair =
                             with_isolated_worktree(repo, &approval.target_head, |worktree| {
                                 executor.revise(&PlanRevisionRequest {
@@ -1484,26 +1490,38 @@ where
             crate::run::PlanProgress::AwaitingSecondOpinion {
                 author,
                 peer,
+                second,
                 artifact,
                 ..
             } => {
-                let (reviewer, _) = match select_reviewer(
-                    router,
-                    run.run_id(),
-                    bursar,
-                    run.plan().map_err(|error| error.to_string())?,
-                    snapshot,
-                    crate::run::PlanStage::SecondOpinion,
-                    &author,
-                    Some(&peer),
-                ) {
-                    Ok(bound) => bound,
-                    Err(error) => {
+                let reviewer = if let Some(bound) = second {
+                    if let Err(error) = recheck_author(bursar, snapshot, &bound) {
                         run.finish_plan_blocked().map_err(|checkpoint| {
-                            format!("plan blocked after second-opinion candidate exhaustion: {checkpoint}")
+                            format!("plan blocked after bound second-opinion loss: {checkpoint}")
                         })?;
-                        return Err(error);
+                        return Err(format!(
+                            "bound plan second opinion is no longer eligible: {error}"
+                        ));
                     }
+                    *bound
+                } else {
+                    let (bound, _) = select_reviewer(
+                        router,
+                        run.run_id(),
+                        bursar,
+                        run.plan().map_err(|error| error.to_string())?,
+                        snapshot,
+                        crate::run::PlanStage::SecondOpinion,
+                        &author,
+                        Some(&peer),
+                    )
+                    .map_err(|error| {
+                        let _ = run.finish_plan_blocked();
+                        format!("plan blocked after second-opinion candidate exhaustion: {error}")
+                    })?;
+                    run.bind_plan_second_opinion(bound.clone())
+                        .map_err(|error| format!("plan second-opinion binding: {error}"))?;
+                    bound
                 };
                 let profile = profile_for_execution(snapshot, &reviewer)?;
                 let canonical_plan = plan_artifact_bytes(run, &artifact)?;
@@ -1520,7 +1538,7 @@ where
                     attempt,
                     "started",
                 )?;
-                recheck_author(bursar, &reviewer)?;
+                recheck_author(bursar, snapshot, &reviewer)?;
                 let first = with_isolated_worktree(repo, &approval.target_head, |worktree| {
                     executor.second_opinion(&PlanSecondOpinionRequest {
                         worktree: worktree.to_path_buf(),
@@ -1552,7 +1570,7 @@ where
                             repair_attempt,
                             "started",
                         )?;
-                        recheck_author(bursar, &reviewer)?;
+                        recheck_author(bursar, snapshot, &reviewer)?;
                         let repair =
                             with_isolated_worktree(repo, &approval.target_head, |worktree| {
                                 executor.second_opinion(&PlanSecondOpinionRequest {
@@ -1718,7 +1736,7 @@ fn select_reviewer<C: crate::bursar::BursarClient + ?Sized>(
                     crate::run::PlanStage::SecondOpinion => false,
                 })
         })
-        .filter(|candidate| recheck_author(bursar, candidate).is_ok())
+        .filter(|candidate| recheck_author(bursar, snapshot, candidate).is_ok())
         .cloned()
         .collect::<Vec<_>>();
     if live.is_empty() {
@@ -1917,6 +1935,7 @@ fn approval_response(paths: &PlanJobPaths, approval: &PlanApproval) -> Result<()
 
 fn recheck_author<C: crate::bursar::BursarClient + ?Sized>(
     bursar: &C,
+    captured_snapshot: &crate::bursar::RosterSnapshot,
     approved: &crate::run::ApprovedExecution,
 ) -> Result<(), String> {
     let live = bursar
@@ -1943,7 +1962,23 @@ fn recheck_author<C: crate::bursar::BursarClient + ?Sized>(
     let report = bursar
         .status()
         .map_err(|error| format!("live Bursar provider status: {error}"))?;
-    let status = report.providers.get(&approved.provider_id).ok_or_else(|| {
+    let availability_key = captured_snapshot
+        .providers
+        .iter()
+        .find(|provider| provider.provider_id == approved.provider_id)
+        .filter(|provider| {
+            captured_snapshot
+                .profiles
+                .iter()
+                .find(|profile| profile.profile_id == approved.profile_id)
+                .is_some_and(|profile| {
+                    profile.provider_id == provider.provider_id
+                        && crate::role_routing::approved_execution(profile, provider) == *approved
+                })
+        })
+        .map(|provider| provider.availability_key.as_str())
+        .ok_or_else(|| "approved plan author is absent from captured Bursar roster".to_string())?;
+    let status = report.providers.get(availability_key).ok_or_else(|| {
         "approved plan author provider is absent from live Bursar status".to_string()
     })?;
     if !matches!(
@@ -1972,6 +2007,7 @@ fn planner_candidates(
 
 fn available_planner<C: crate::bursar::BursarClient + ?Sized>(
     bursar: &C,
+    captured_snapshot: &crate::bursar::RosterSnapshot,
     candidates: &[crate::run::ApprovedExecution],
     exclude: Option<&crate::run::ApprovedExecution>,
 ) -> Result<crate::run::ApprovedExecution, String> {
@@ -1980,7 +2016,7 @@ fn available_planner<C: crate::bursar::BursarClient + ?Sized>(
         if exclude.is_some_and(|excluded| candidate == excluded) {
             continue;
         }
-        match recheck_author(bursar, candidate) {
+        match recheck_author(bursar, captured_snapshot, candidate) {
             Ok(()) => return Ok(candidate.clone()),
             Err(error) => failures.push(format!("{}: {error}", candidate.profile_id)),
         }
@@ -2514,6 +2550,218 @@ enabled = true
     fn spec_document() -> Vec<u8> {
         br#"{"schema":"conductor/plan-document@1","kind":"spec","title":"Spec","context":"Context","goals":["Goal"],"constraints":["Constraint"],"requirements":["Requirement"],"acceptance":["Acceptance"],"verification":["cargo test"],"non_goals":[],"risks":[],"assumptions":[],"open_questions":[]}"#.to_vec()
     }
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fixture preserves the real ProviderId versus AvailabilityKey boundary"
+    )]
+    fn omp_plan_fixture(label: &str) -> (TestDir, PlanJobPaths, crate::config::Config, FakeBursar) {
+        let temp = TestDir::new(label);
+        let checked_at = chrono::Utc::now().to_rfc3339();
+        let provider_rows = [
+            ("openai-codex", "codex"),
+            ("anthropic", "anthropic"),
+            ("opencode-go", "opencode-go"),
+        ]
+        .into_iter()
+        .map(|(provider_id, availability_key)| {
+            serde_json::json!({
+                "provider_id": provider_id, "availability_key": availability_key, "enabled": true,
+                "state": "healthy", "availability": "healthy", "checked_at": checked_at,
+                "data_as_of": null, "expires_at": "2100-01-01T00:00:00Z", "reason": null,
+                "eligible": true, "ineligibility_reason": null
+            })
+        })
+        .collect::<Vec<_>>();
+        let profiles = [
+            (
+                "openai-codex--omp--gpt-5.6-sol--xhigh",
+                "openai-codex",
+                "gpt-5.6-sol",
+            ),
+            (
+                "anthropic--omp--claude-opus-4-8--max",
+                "anthropic",
+                "claude-opus-4-8",
+            ),
+            ("opencode-go--omp--kimi-k3--max", "opencode-go", "kimi-k3"),
+        ];
+        let profile_rows = profiles
+            .iter()
+            .map(|(profile_id, provider_id, model)| {
+                serde_json::json!({
+                    "profile_id": profile_id, "provider_id": provider_id, "model": model,
+                    "harness": "omp", "dispatch_id": model, "reasoning_effort": "max",
+                    "tier": "lead", "ceiling": "XL", "efficiency": "lean", "cost": 0.0,
+                    "data_policy": "standard", "enabled": true, "roles": ["plan"],
+                    "state": "healthy", "eligible": true, "ineligibility_reason": null
+                })
+            })
+            .collect::<Vec<_>>();
+        let roster = serde_json::json!({
+            "schema": "bursar/roster@2",
+            "generated_at": checked_at,
+            "source_artifact": {"path": "/fixture/roster.toml", "sha256": "a".repeat(64)},
+            "policy_sha256": "b".repeat(64),
+            "providers": provider_rows,
+            "profiles": profile_rows
+        });
+        let snapshot = crate::bursar::parse_roster_snapshot(roster.to_string().as_bytes())
+            .expect("strict OMP fixture roster");
+        let providers = [
+            ("codex", crate::bursar::Availability::Healthy),
+            ("anthropic", crate::bursar::Availability::Healthy),
+            ("opencode-go", crate::bursar::Availability::Healthy),
+        ]
+        .into_iter()
+        .map(|(availability_key, availability)| {
+            (
+                availability_key.to_string(),
+                crate::bursar::ProviderStatus {
+                    availability,
+                    source: "test".to_string(),
+                    checked_at: checked_at.clone(),
+                    data_as_of: None,
+                    expires_at: Some("2100-01-01T00:00:00Z".to_string()),
+                    windows: vec![],
+                    reason: None,
+                    extra: serde_json::Map::new(),
+                },
+            )
+        })
+        .collect();
+        let config = crate::config::parse_str(
+            r#"
+[[role_binding]]
+role = "plan"
+profile_id = "openai-codex--omp--gpt-5.6-sol--xhigh"
+weight = 60
+enabled = true
+
+[[role_binding]]
+role = "plan"
+profile_id = "anthropic--omp--claude-opus-4-8--max"
+weight = 20
+enabled = true
+
+[[role_binding]]
+role = "plan"
+profile_id = "opencode-go--omp--kimi-k3--max"
+weight = 20
+enabled = true
+"#,
+        )
+        .expect("60/20/20 OMP planner config");
+        (
+            temp,
+            PlanJobPaths {
+                state_dir: std::env::temp_dir().join(format!(
+                    "conductor-plan-state-{label}-{}",
+                    std::process::id()
+                )),
+                reports_home: std::env::temp_dir().join(format!(
+                    "conductor-plan-reports-{label}-{}",
+                    std::process::id()
+                )),
+            },
+            config,
+            FakeBursar {
+                snapshot,
+                status: crate::bursar::StatusReport {
+                    schema: "bursar/status@2".to_string(),
+                    checked_at,
+                    providers,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn spec_revision_resume_uses_distinct_omp_availability_key_identities() {
+        let (temp, paths, config, bursar) = omp_plan_fixture("omp-second-opinion");
+        let repo = initialized_repo(&temp);
+        let before_head = git_output(&repo, ["rev-parse", "HEAD"]).expect("head");
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo: repo.clone(),
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::Spec,
+                max_plan_revisions: 1,
+                require_second_opinion: true,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let executor = ScriptedExecutor::new(
+            vec![Ok(spec_document())],
+            vec![Ok(spec_document())],
+            vec![Ok(peer_revise()), Ok(peer_approve())],
+            vec![
+                Err("simulated second-opinion crash".to_string()),
+                Ok(br#"{"schema":"conductor/plan-second-opinion@1","verdict":"accept"}"#.to_vec()),
+            ],
+        );
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(
+            status(&paths, &prepared.run_id).expect("status"),
+            "awaiting_second_opinion"
+        );
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor)
+            .expect("resume completes the bound second opinion");
+
+        assert_eq!(
+            status(&paths, &prepared.run_id).expect("status"),
+            "accepted"
+        );
+        assert_eq!(
+            git_output(&repo, ["rev-parse", "HEAD"]).expect("head"),
+            before_head,
+            "planning never mutates the target"
+        );
+        let calls = executor.calls.lock().expect("calls");
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(stage, _)| stage.as_str())
+                .collect::<Vec<_>>(),
+            ["author", "peer", "revision", "peer", "second", "second"]
+        );
+        assert_eq!(calls[0].1, calls[2].1, "revision reuses its author");
+        assert_eq!(calls[1].1, calls[3].1, "approval reuses its peer");
+        assert_eq!(calls[4].1, calls[5].1, "resume reuses its opinion binding");
+        assert_eq!(
+            calls[0].1.provider_id, "openai-codex",
+            "the 60 weight author proves availability-key lookup is not ProviderId lookup"
+        );
+        assert_ne!(calls[0].1.execution_key, calls[1].1.execution_key);
+        assert_ne!(calls[0].1.execution_key, calls[4].1.execution_key);
+        assert_ne!(calls[1].1.execution_key, calls[4].1.execution_key);
+        assert_ne!(calls[0].1.provider_id, calls[1].1.provider_id);
+        assert_ne!(calls[0].1.provider_id, calls[4].1.provider_id);
+        assert_ne!(calls[1].1.provider_id, calls[4].1.provider_id);
+        drop(calls);
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let plan = run.plan().expect("plan");
+        assert_eq!(plan.stage_attempts.planner, 2);
+        assert_eq!(plan.stage_attempts.peer_review, 2);
+        assert_eq!(plan.stage_attempts.second_opinion, 2);
+        assert_eq!(
+            plan.routes
+                .stages
+                .iter()
+                .map(|route| route.candidates.len())
+                .collect::<Vec<_>>(),
+            vec![3, 3, 3],
+            "all 60/20/20 candidates remain pinned in every stage route"
+        );
+    }
 
     fn peer_approve() -> Vec<u8> {
         br#"{"schema":"conductor/plan-peer-review@1","verdict":"approve","findings":[]}"#.to_vec()
@@ -2961,21 +3209,19 @@ enabled = true
                 crate::run::PlanStage::SecondOpinion,
             ]
         );
-        assert!(
-            events
-                .iter()
-                .filter(|event| event.kind == crate::run::EventKind::AttemptFinished)
-                .filter_map(|event| event.plan_invocation.as_ref())
-                .all(|evidence| {
-                    evidence.role == "plan"
-                        && evidence.input_sha256.len() == 64
-                        && evidence
-                            .output_sha256
-                            .as_ref()
-                            .is_some_and(|digest| digest.len() == 64)
-                        && evidence.attempt == 1
-                })
-        );
+        assert!(events
+            .iter()
+            .filter(|event| event.kind == crate::run::EventKind::AttemptFinished)
+            .filter_map(|event| event.plan_invocation.as_ref())
+            .all(|evidence| {
+                evidence.role == "plan"
+                    && evidence.input_sha256.len() == 64
+                    && evidence
+                        .output_sha256
+                        .as_ref()
+                        .is_some_and(|digest| digest.len() == 64)
+                    && evidence.attempt == 1
+            }));
     }
 
     #[test]
@@ -3158,12 +3404,10 @@ enabled = true
             "accepted"
         );
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
-        assert!(
-            crate::run::read_events(&run.events_path())
-                .expect("events")
-                .iter()
-                .any(|event| event.outcome.as_deref() == Some("peer_provider_diversity_degraded"))
-        );
+        assert!(crate::run::read_events(&run.events_path())
+            .expect("events")
+            .iter()
+            .any(|event| event.outcome.as_deref() == Some("peer_provider_diversity_degraded")));
         drop(temp);
     }
     #[test]
@@ -3212,11 +3456,9 @@ enabled = true
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         let events = crate::run::read_events(&run.events_path()).expect("events");
-        assert!(
-            !events
-                .iter()
-                .any(|event| event.outcome.as_deref() == Some("peer_provider_diversity_degraded"))
-        );
+        assert!(!events
+            .iter()
+            .any(|event| event.outcome.as_deref() == Some("peer_provider_diversity_degraded")));
         assert!(
             !events.iter().any(|event| {
                 event.kind == crate::run::EventKind::AttemptFinished
