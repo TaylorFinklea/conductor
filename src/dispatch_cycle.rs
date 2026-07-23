@@ -278,6 +278,7 @@ pub(crate) fn run_dispatch_cycle<
     let mut dispatched = 0_u64;
     let mut verified = 0_u64;
     let mut failed = 0_u64;
+    let mut report_write_failures = Vec::new();
 
     for item in &items {
         let attempt = match dispatch_one(
@@ -300,7 +301,15 @@ pub(crate) fn run_dispatch_cycle<
             Ok(attempt) => attempt,
             Err(error) => {
                 failed += 1;
-                record_dispatch_failure(&report_path, item, &error)?;
+                if let Err(report_write_error) = record_dispatch_failure(&report_path, item, &error)
+                {
+                    report_write_failures.push(DispatchReportWriteFailure {
+                        repo: item.repo.clone(),
+                        issue_id: item.issue_id.clone(),
+                        dispatch_error: error.to_string(),
+                        report_write_error: report_write_error.to_string(),
+                    });
+                }
                 continue;
             }
         };
@@ -314,14 +323,31 @@ pub(crate) fn run_dispatch_cycle<
         }
     }
 
-    patch_live(
+    let completion = format!("complete {cycle_id}: verified {verified}/{dispatched}, failed {failed}");
+    let final_report_error = patch_live(
         live,
         &report_path,
         cycle_start,
-        format!("complete {cycle_id}: verified {verified}/{dispatched}, failed {failed}"),
+        completion,
         Some(1.0),
-    )?;
-    patch_status_if_present(&report_path, ReportStatus::Done)?;
+    )
+    .err()
+    .or_else(|| patch_status_if_present(&report_path, ReportStatus::Done).err());
+    if report_write_failures.is_empty() {
+        if let Some(error) = final_report_error {
+            return Err(error);
+        }
+    } else {
+        write_dispatch_report_fallback(
+            state_dir,
+            cycle_id,
+            dispatched,
+            verified,
+            failed,
+            &report_write_failures,
+            final_report_error.as_ref(),
+        )?;
+    }
 
     Ok(DispatchCycleResult {
         gate,
@@ -508,6 +534,18 @@ fn record_replan_required(
     .map_err(|error| DispatchCycleError::message(format!("report approval scope skip: {error}")))
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_DISPATCH_FAILURE_REPORT_WRITE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+fn fail_next_dispatch_failure_report_write() {
+    FAIL_NEXT_DISPATCH_FAILURE_REPORT_WRITE.with(|failure| failure.set(true));
+}
+
 fn record_dispatch_failure(
     report_path: &Path,
     item: &PlannedItem,
@@ -515,6 +553,12 @@ fn record_dispatch_failure(
 ) -> std::result::Result<(), DispatchCycleError> {
     if !report_path.exists() {
         return Ok(());
+    }
+    #[cfg(test)]
+    if FAIL_NEXT_DISPATCH_FAILURE_REPORT_WRITE.with(|failure| failure.replace(false)) {
+        return Err(DispatchCycleError::message(
+            "injected dispatch failure report write error",
+        ));
     }
     deck::append_callout(
         report_path,
@@ -526,6 +570,74 @@ fn record_dispatch_failure(
         ),
     )
     .map_err(|error| DispatchCycleError::message(format!("report dispatch failure: {error}")))
+}
+
+const DISPATCH_REPORT_FALLBACK_SCHEMA: &str = "conductor/dispatch-report-fallback@1";
+
+#[derive(serde::Serialize)]
+struct DispatchReportWriteFailure {
+    repo: String,
+    issue_id: String,
+    dispatch_error: String,
+    report_write_error: String,
+}
+
+#[derive(serde::Serialize)]
+struct DispatchReportFallback<'a> {
+    schema: &'static str,
+    cycle_id: &'a str,
+    completed_at: String,
+    dispatched: u64,
+    verified: u64,
+    failed: u64,
+    report_write_failures: &'a [DispatchReportWriteFailure],
+    final_report_error: Option<String>,
+}
+
+fn write_dispatch_report_fallback(
+    state_dir: &Path,
+    cycle_id: &str,
+    dispatched: u64,
+    verified: u64,
+    failed: u64,
+    report_write_failures: &[DispatchReportWriteFailure],
+    final_report_error: Option<&DispatchCycleError>,
+) -> std::result::Result<(), DispatchCycleError> {
+    let fallback_dir = state_dir.join("dispatch-report-fallbacks").join(cycle_id);
+    std::fs::create_dir_all(&fallback_dir).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "create dispatch report fallback {}: {error}",
+            fallback_dir.display()
+        ))
+    })?;
+    let fallback = DispatchReportFallback {
+        schema: DISPATCH_REPORT_FALLBACK_SCHEMA,
+        cycle_id,
+        completed_at: timestamp(),
+        dispatched,
+        verified,
+        failed,
+        report_write_failures,
+        final_report_error: final_report_error.map(ToString::to_string),
+    };
+    let bytes = serde_json::to_vec_pretty(&fallback).map_err(|error| {
+        DispatchCycleError::message(format!("serialize dispatch report fallback: {error}"))
+    })?;
+    let path = fallback_dir.join("terminal-summary.json");
+    let temporary = fallback_dir.join("terminal-summary.tmp");
+    std::fs::write(&temporary, bytes).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "write dispatch report fallback {}: {error}",
+            temporary.display()
+        ))
+    })?;
+    std::fs::rename(&temporary, &path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        DispatchCycleError::message(format!(
+            "publish dispatch report fallback {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 struct DispatchOneResult {
@@ -6795,6 +6907,84 @@ mod tests {
             manifest.outcome.as_deref(),
             Some("legacy_adoption_event_error")
         );
+    }
+
+    #[test]
+    fn report_failure_write_does_not_abort_later_approved_items() {
+        let temp = TempDir::new("report-failure-continuation");
+        let first_repo = temp.path().join("first-repo");
+        let second_repo = temp.path().join("second-repo");
+        init_sandbox_repo_without_bd(&first_repo);
+        init_sandbox_repo_without_bd(&second_repo);
+        let mut cfg = config::parse_str(fixture_config(temp.path())).expect("config parses");
+        cfg.budgets.max_dispatches_per_cycle = 8;
+        cfg.roster[0].provider = "opencode-go".to_string();
+        cfg.budgets.use_bursar = false;
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+        let cycle_id = "cycle-report-failure-continuation";
+        let first_issue = sandbox_issue();
+        let mut second_issue = sandbox_issue();
+        cfg.review.enabled = false;
+        second_issue.id = "sandbox-2".to_string();
+        write_plan_with_items(
+            &state,
+            cycle_id,
+            &[
+                (&first_repo, "first-repo", &first_issue, "fake-worker"),
+                (&second_repo, "second-repo", &second_issue, "fake-worker"),
+            ],
+            &cfg.roster,
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+        let bd = RecordingBdClient::new_with_issues([first_issue, second_issue]);
+        let exec = FailFirstDispatchExec::new();
+        fail_next_dispatch_failure_report_write();
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &GitCommitProbe,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            &RecordingLiveSink::new(false),
+            &FakeBursarClient::unavailable(),
+        )
+        .expect("report detail failure must not abort later approved items");
+
+        assert_eq!(result.dispatched, 1);
+        assert_eq!(result.verified, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(bd.release_count(), 1, "failed first claim is released");
+        assert_eq!(bd.show(&first_repo, "sandbox-1").unwrap().status, "open");
+        assert_eq!(bd.show(&second_repo, "sandbox-2").unwrap().status, "closed");
+        assert!(
+            exec.successful_spawns()
+                .iter()
+                .any(|request| request.argv.first().map(String::as_str) == Some("pi")),
+            "the second approved item reached its worker"
+        );
+
+        let fallback_path = state
+            .join("dispatch-report-fallbacks")
+            .join(cycle_id)
+            .join("terminal-summary.json");
+        let fallback: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&fallback_path).expect("fallback terminal summary"),
+        )
+        .expect("fallback summary json");
+        assert_eq!(
+            fallback["report_write_failures"][0]["issue_id"],
+            "sandbox-1"
+        );
+        assert_eq!(fallback["dispatched"], 1);
+        assert_eq!(fallback["verified"], 1);
+        assert_eq!(fallback["failed"], 1);
     }
 
     #[test]
@@ -13525,6 +13715,36 @@ dispatch_id = "fake-worker"
                 return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(code))));
             }
             panic!("unexpected spawn argv: {:?}", request.argv)
+        }
+    }
+
+    struct FailFirstDispatchExec {
+        failed: RefCell<bool>,
+        successful: SandboxExec,
+    }
+
+    impl FailFirstDispatchExec {
+        fn new() -> Self {
+            Self {
+                failed: RefCell::new(false),
+                successful: SandboxExec::new(),
+            }
+        }
+
+        fn successful_spawns(&self) -> Vec<SpawnRequest> {
+            self.successful.spawns()
+        }
+    }
+
+    impl Exec for FailFirstDispatchExec {
+        fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+            if request.argv.first().map(String::as_str) == Some("pi") && !*self.failed.borrow() {
+                *self.failed.borrow_mut() = true;
+                return Err(crate::dispatch::DispatchError::new(
+                    "injected first worker dispatch failure",
+                ));
+            }
+            self.successful.spawn(request)
         }
     }
 
