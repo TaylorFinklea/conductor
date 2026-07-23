@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -1582,7 +1582,178 @@ pub(crate) fn find_pending_work_run(
     repo: &str,
     bead: &str,
 ) -> Result<Option<String>> {
-    find_work_run_at_stage(state_dir, cycle_id, repo, bead, WorkStage::PendingReview)
+    PendingWorkIndex::scan(state_dir)?.find_pending_work_run(cycle_id, repo, bead)
+}
+
+/// A single, untrusted manifest pass over the active run namespace for one
+/// dispatch cycle. It filters only likely pending-review candidates; every
+/// selected candidate is still fully authenticated before it can be resumed.
+#[derive(Debug, Default)]
+pub(crate) struct PendingWorkIndex {
+    candidates: BTreeMap<PendingWorkKey, Vec<PathBuf>>,
+    malformed: Vec<MalformedManifest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PendingWorkKey {
+    cycle_id: String,
+    repo: String,
+    bead: String,
+}
+
+impl PendingWorkKey {
+    fn new(cycle_id: &str, repo: &str, bead: &str) -> Self {
+        Self {
+            cycle_id: cycle_id.to_string(),
+            repo: repo.to_string(),
+            bead: bead.to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MalformedManifest {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl PendingWorkIndex {
+    /// Reads each lightweight manifest once. This intentionally does not
+    /// validate artifact hashes: those can be large and are authentication
+    /// work reserved for candidates matching an approved target.
+    pub(crate) fn scan(state_dir: &Path) -> Result<Self> {
+        let root = runs_dir(state_dir);
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => {
+                return Err(RunError::new(format!(
+                    "failed to read runs dir {}: {error}",
+                    root.display()
+                )));
+            }
+        };
+        let mut run_dirs = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                RunError::new(format!("failed to read run directory entry: {error}"))
+            })?;
+            if entry
+                .file_type()
+                .map_err(|error| RunError::new(format!("failed to stat run entry: {error}")))?
+                .is_dir()
+            {
+                run_dirs.push(entry.path());
+            }
+        }
+        run_dirs.sort();
+
+        let mut index = Self::default();
+        for run_dir in run_dirs {
+            let path = run_dir.join("manifest.json");
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                index.malformed.push(MalformedManifest { path, bytes });
+                continue;
+            };
+            let Some(key) = pending_work_key_from_untrusted_manifest(&value) else {
+                continue;
+            };
+            index.candidates.entry(key).or_default().push(path);
+        }
+        for paths in index.candidates.values_mut() {
+            paths.sort();
+        }
+        index.malformed.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(index)
+    }
+
+    /// Authenticates all candidates for one exact target. The index evidence
+    /// only chooses what to authenticate; it is never sufficient to resume.
+    pub(crate) fn find_pending_work_run(
+        &self,
+        cycle_id: &str,
+        repo: &str,
+        bead: &str,
+    ) -> Result<Option<String>> {
+        let key = PendingWorkKey::new(cycle_id, repo, bead);
+        let malformed = self
+            .malformed
+            .iter()
+            .filter(|entry| manifest_bytes_may_match(&entry.bytes, &key))
+            .map(|entry| entry.path.display().to_string())
+            .collect::<Vec<_>>();
+        if !malformed.is_empty() {
+            return Err(RunError::new(format!(
+                "pending-review evidence for {cycle_id} {repo}/{bead} is malformed: {}",
+                malformed.join(", ")
+            )));
+        }
+
+        let Some(paths) = self.candidates.get(&key) else {
+            return Ok(None);
+        };
+        let mut run_ids = Vec::with_capacity(paths.len());
+        for path in paths {
+            let manifest = read_manifest(path).map_err(|error| {
+                RunError::new(format!(
+                    "pending-review candidate {} failed authentication: {}",
+                    path.display(),
+                    error.into_message()
+                ))
+            })?;
+            if pending_work_key_from_manifest(&manifest).as_ref() != Some(&key) {
+                return Err(RunError::new(format!(
+                    "pending-review candidate {} changed identity after discovery",
+                    path.display()
+                )));
+            }
+            run_ids.push(manifest.run_id);
+        }
+        run_ids.sort();
+        if run_ids.len() > 1 {
+            return Err(RunError::new(format!(
+                "multiple pending-review runs found for {cycle_id} {repo}/{bead}: {}",
+                run_ids.join(", ")
+            )));
+        }
+        Ok(run_ids.pop())
+    }
+}
+
+fn pending_work_key_from_manifest(manifest: &RunManifest) -> Option<PendingWorkKey> {
+    let work = work_state(manifest)?;
+    (manifest.job == RunJob::Work
+        && manifest.lifecycle != RunLifecycle::Finished
+        && work.stage == WorkStage::PendingReview)
+        .then(|| {
+            PendingWorkKey::new(
+                &work.cycle_id,
+                &manifest.target.repo,
+                manifest.target.bead.as_deref().unwrap_or_default(),
+            )
+        })
+}
+
+fn pending_work_key_from_untrusted_manifest(value: &serde_json::Value) -> Option<PendingWorkKey> {
+    let target = value.get("target")?;
+    let repo = target.get("repo")?.as_str()?;
+    let bead = target.get("bead")?.as_str()?;
+    let details = value.get("details")?;
+    let state = details.get("state")?;
+    let cycle_id = state.get("cycle_id")?.as_str()?;
+    (value.get("job")?.as_str() == Some("work")
+        && details.get("job")?.as_str() == Some("work")
+        && value.get("lifecycle")?.as_str() != Some("finished")
+        && state.get("stage")?.as_str() == Some("pending_review"))
+        .then(|| PendingWorkKey::new(cycle_id, repo, bead))
+}
+
+fn manifest_bytes_may_match(bytes: &[u8], key: &PendingWorkKey) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    text.contains(&key.cycle_id) && text.contains(&key.repo) && text.contains(&key.bead)
 }
 
 /// Finds the one unfinished work run still mid-implementation for an exact
@@ -2664,6 +2835,219 @@ mod tests {
         assert_eq!(verify_events.len(), 1);
         assert_eq!(verify_events[0].outcome.as_deref(), Some("passed"));
         assert_eq!(verify_events[0].artifact_refs, vec![artifact]);
+    }
+    fn pending_work_run(
+        temp: &TempDir,
+        cycle_id: &str,
+        repo: &str,
+        bead: &str,
+        label: &str,
+    ) -> RunHandle {
+        let mut request = new_run_request();
+        request.target = RunTarget {
+            repo: repo.to_string(),
+            bead: Some(bead.to_string()),
+        };
+        request.work = Some(WorkState {
+            cycle_id: cycle_id.to_string(),
+            authorization_sha256: "b".repeat(64),
+            before_head: Some("d".repeat(40)),
+            owner_pid: None,
+            worker_pgid: None,
+            worker_profile: None,
+            worker_commit: None,
+            mechanical: None,
+            stage: WorkStage::Implementing,
+            review_resume_budget_secs: None,
+        });
+        let mut handle = RunHandle::create_at(temp.path(), RunJob::Work, request, fixed_now())
+            .expect("create work run");
+        let verifier_log = temp.path().join(format!("{label}.log"));
+        std::fs::write(&verifier_log, b"mechanical verification passed\n")
+            .expect("write verifier log");
+        let artifact = handle
+            .capture_artifact(&verifier_log, Path::new("artifacts/mechanical.log"))
+            .expect("capture verifier evidence");
+        handle
+            .checkpoint_pending_review(
+                "gpt-5.6-luna",
+                &"c".repeat(40),
+                "cargo test",
+                vec![artifact],
+            )
+            .expect("checkpoint pending review");
+        handle
+    }
+
+    #[test]
+    fn find_pending_work_run_ignores_an_unrelated_run_with_corrupt_artifacts() {
+        let temp = TempDir::new("pending-unrelated-corrupt");
+        let unrelated = pending_work_run(
+            &temp,
+            "cycle-other",
+            "/repo/other",
+            "other-1",
+            "unrelated",
+        );
+        std::fs::remove_file(unrelated.dir().join("artifacts/mechanical.log"))
+            .expect("prune unrelated artifact");
+        let matching = pending_work_run(
+            &temp,
+            "cycle-target",
+            "/repo/target",
+            "target-1",
+            "matching",
+        );
+
+        let found = find_pending_work_run(
+            temp.path(),
+            "cycle-target",
+            "/repo/target",
+            "target-1",
+        )
+        .expect("unrelated corruption must not block discovery");
+
+        assert_eq!(found.as_deref(), Some(matching.run_id()));
+    }
+
+    #[test]
+    fn find_pending_work_run_fails_closed_when_the_matching_candidate_is_corrupt() {
+        let temp = TempDir::new("pending-matching-corrupt");
+        let matching = pending_work_run(
+            &temp,
+            "cycle-target",
+            "/repo/target",
+            "target-1",
+            "matching",
+        );
+        std::fs::remove_file(matching.dir().join("artifacts/mechanical.log"))
+            .expect("prune matching artifact");
+
+        let error = find_pending_work_run(
+            temp.path(),
+            "cycle-target",
+            "/repo/target",
+            "target-1",
+        )
+        .expect_err("matching corruption must fail closed");
+
+        assert!(
+            error.to_string().contains("pending-review candidate"),
+            "matching authentication failure must identify its candidate: {error}"
+        );
+    }
+
+    #[test]
+    fn find_pending_work_run_reports_matching_duplicates_in_run_id_order() {
+        let temp = TempDir::new("pending-duplicates");
+        let first = pending_work_run(
+            &temp,
+            "cycle-target",
+            "/repo/target",
+            "target-1",
+            "first",
+        );
+        let second = pending_work_run(
+            &temp,
+            "cycle-target",
+            "/repo/target",
+            "target-1",
+            "second",
+        );
+        let mut expected = [first.run_id().to_string(), second.run_id().to_string()];
+        expected.sort();
+
+        let error = find_pending_work_run(
+            temp.path(),
+            "cycle-target",
+            "/repo/target",
+            "target-1",
+        )
+        .expect_err("multiple matching pending runs must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "multiple pending-review runs found for cycle-target /repo/target/target-1: {}",
+                expected.join(", ")
+            )
+        );
+    }
+
+    #[test]
+    fn find_pending_work_run_ignores_pruned_finished_history_for_another_target() {
+        let temp = TempDir::new("pending-pruned-finished");
+        let mut finished = RunHandle::create_at(
+            temp.path(),
+            RunJob::Work,
+            new_run_request(),
+            fixed_now(),
+        )
+        .expect("create finished history");
+        let history_log = temp.path().join("history.log");
+        std::fs::write(&history_log, b"historic evidence\n").expect("write history log");
+        finished
+            .capture_artifact(&history_log, Path::new("artifacts/history.log"))
+            .expect("capture history artifact");
+        finished.finish("verified").expect("finish history");
+        std::fs::remove_file(finished.dir().join("artifacts/history.log"))
+            .expect("prune finished history artifact");
+        let matching = pending_work_run(
+            &temp,
+            "cycle-target",
+            "/repo/target",
+            "target-1",
+            "matching",
+        );
+
+        let found = find_pending_work_run(
+            temp.path(),
+            "cycle-target",
+            "/repo/target",
+            "target-1",
+        )
+        .expect("pruned finished history must not block discovery");
+
+        assert_eq!(found.as_deref(), Some(matching.run_id()));
+    }
+
+    #[test]
+    fn pending_work_index_authenticates_multiple_targets_without_rescanning_history() {
+        let temp = TempDir::new("pending-index");
+        let first = pending_work_run(
+            &temp,
+            "cycle-target",
+            "/repo/first",
+            "first-1",
+            "first",
+        );
+        let second = pending_work_run(
+            &temp,
+            "cycle-target",
+            "/repo/second",
+            "second-1",
+            "second",
+        );
+        let index = PendingWorkIndex::scan(temp.path()).expect("build per-cycle discovery index");
+        let unrelated = pending_work_run(
+            &temp,
+            "cycle-other",
+            "/repo/other",
+            "other-1",
+            "unrelated",
+        );
+        std::fs::remove_file(unrelated.dir().join("artifacts/mechanical.log"))
+            .expect("corrupt post-index unrelated history");
+
+        let found_first = index
+            .find_pending_work_run("cycle-target", "/repo/first", "first-1")
+            .expect("first indexed lookup");
+        let found_second = index
+            .find_pending_work_run("cycle-target", "/repo/second", "second-1")
+            .expect("second indexed lookup");
+
+        assert_eq!(found_first.as_deref(), Some(first.run_id()));
+        assert_eq!(found_second.as_deref(), Some(second.run_id()));
     }
     #[test]
     fn run_event_terminal_transition_is_hashed_and_read_only_after_finish() {

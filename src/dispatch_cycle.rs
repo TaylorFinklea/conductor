@@ -26,9 +26,9 @@ use crate::plan::{
 };
 use crate::quarantine;
 use crate::run::{
-    EventInput, EventKind, NewRun, RosterSnapshotInput, RunHandle, RunJob, RunLimits, RunTarget,
-    RunVerifier, TerminalTransition, TerminalTransitionAction, TerminalTransitionMetadata,
-    WorkStage, WorkState,
+    EventInput, EventKind, NewRun, PendingWorkIndex, RosterSnapshotInput, RunHandle, RunJob,
+    RunLimits, RunTarget, RunVerifier, TerminalTransition, TerminalTransitionAction,
+    TerminalTransitionMetadata, WorkStage, WorkState,
 };
 use crate::triage::{self, CandidateRejection};
 use crate::verify::{self, ReviewSettings, VerifyDecision, VerifyRequest};
@@ -303,6 +303,7 @@ pub(crate) fn run_dispatch_cycle<
     }
 
     let items = planned_items(&plan)?;
+    let pending_work_index = PendingWorkIndex::scan(state_dir).map_err(run_artifact_error)?;
     let cycle_start = Instant::now();
     let mut dispatched = 0_u64;
     let mut verified = 0_u64;
@@ -316,6 +317,7 @@ pub(crate) fn run_dispatch_cycle<
             exec,
             commits,
             state_dir,
+            &pending_work_index,
             ledger_path,
             cycle_id,
             options,
@@ -1663,6 +1665,7 @@ fn dispatch_one<
     exec: &E,
     commits: &C,
     state_dir: &Path,
+    pending_work_index: &PendingWorkIndex,
     ledger_path: &Path,
     cycle_id: &str,
     options: &DispatchCycleOptions,
@@ -1776,9 +1779,9 @@ fn dispatch_one<
             &promotion,
         );
     }
-    let pending_run =
-        crate::run::find_pending_work_run(state_dir, cycle_id, &canonical_repo, &item.issue_id)
-            .map_err(run_artifact_error)?;
+    let pending_run = pending_work_index
+        .find_pending_work_run(cycle_id, &canonical_repo, &item.issue_id)
+        .map_err(run_artifact_error)?;
     if let Some(run_id) = pending_run {
         if !options.resume {
             return Err(DispatchCycleError::message(
