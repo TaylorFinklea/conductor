@@ -355,7 +355,10 @@ fn plan_cli_input(
     }
 }
 
-fn parse_plan_run_options(args: &[String], verb: &str) -> Result<(String, PathBuf), String> {
+pub(crate) fn parse_plan_run_options(
+    args: &[String],
+    verb: &str,
+) -> Result<(String, PathBuf), String> {
     let Some(run_id) = args.first() else {
         return Err(format!("plan {verb} requires <run-id>"));
     };

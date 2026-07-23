@@ -532,7 +532,7 @@ fn plan_run_id() -> String {
     let sequence = PLAN_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(
         "plan-{}-p{}-{sequence:06}",
-        chrono::Utc::now().format("%Y%m%dT%H%M%S%.9f"),
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%9f"),
         std::process::id()
     )
 }
@@ -2521,6 +2521,46 @@ enabled = true
 
     fn peer_revise() -> Vec<u8> {
         br#"{"schema":"conductor/plan-peer-review@1","verdict":"revise","findings":[{"id":"F-1","severity":"high","location":"tasks.one","problem":"Missing detail","required_change":"Add the missing detail"}]}"#.to_vec()
+    }
+
+    #[test]
+    fn prepared_plan_run_id_passes_cli_dispatch_parsing_and_dispatches() {
+        let (temp, paths, config, bursar) = plan_fixture("cli-run-id");
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 0,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+
+        let (status_run_id, _) =
+            crate::cli::parse_plan_run_options(std::slice::from_ref(&prepared.run_id), "status")
+                .expect("prepare-generated run id must pass CLI status parsing");
+        assert_eq!(
+            status(&paths, &status_run_id).expect("prepared status"),
+            "awaiting_approval"
+        );
+
+        let (run_id, _) =
+            crate::cli::parse_plan_run_options(std::slice::from_ref(&prepared.run_id), "dispatch")
+                .expect("prepare-generated run id must pass CLI dispatch parsing");
+
+        approve(&paths, &run_id);
+        let author = FakeAuthor::new(vec![implementation_document()]);
+        dispatch(&paths, &config, &bursar, &run_id, &author).expect("dispatch");
+        assert_eq!(status(&paths, &run_id).expect("status"), "accepted");
     }
 
     #[test]
