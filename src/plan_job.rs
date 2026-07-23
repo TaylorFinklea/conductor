@@ -1279,18 +1279,25 @@ fn planned_routes(prepared: &crate::role_routing::PreparedPlanner) -> crate::run
     }
 }
 
-/// Terminalizes a durable authoring run once its immutable call budget has
-/// already been consumed. This protects resume after a crash between an
-/// attempt checkpoint and its terminal failure checkpoint.
-fn finish_exhausted_authoring(run: &mut crate::run::RunHandle) -> Result<bool, String> {
+/// Terminalizes an active stage once its immutable call budget has already
+/// been consumed. This protects resume after a crash between an attempt
+/// checkpoint and its terminal failure checkpoint.
+fn finish_exhausted_stage(
+    run: &mut crate::run::RunHandle,
+    stage: crate::run::PlanStage,
+) -> Result<bool, String> {
     let plan = run.plan().map_err(|error| error.to_string())?;
-    let exhausted = matches!(plan.progress, crate::run::PlanProgress::Authoring { .. })
-        && plan.stage_attempts.planner >= plan.stage_attempt_limit.value();
-    if exhausted {
-        run.finish_plan_blocked()
-            .map_err(|error| format!("plan blocked checkpoint: {error}"))?;
+    let attempts = match stage {
+        crate::run::PlanStage::Planner => plan.stage_attempts.planner,
+        crate::run::PlanStage::PeerReview => plan.stage_attempts.peer_review,
+        crate::run::PlanStage::SecondOpinion => plan.stage_attempts.second_opinion,
+    };
+    if attempts < plan.stage_attempt_limit.value() {
+        return Ok(false);
     }
-    Ok(exhausted)
+    run.finish_plan_blocked()
+        .map_err(|error| format!("plan blocked checkpoint: {error}"))?;
+    Ok(true)
 }
 
 /// Runs only the initial author stage after the exact published approval is
@@ -1380,7 +1387,7 @@ where
             &approval,
         );
     }
-    if finish_exhausted_authoring(&mut run)? {
+    if finish_exhausted_stage(&mut run, crate::run::PlanStage::Planner)? {
         return Err("plan author attempt limit exhausted".to_string());
     }
     let planner_candidates = planner_candidates(run.plan().map_err(|error| error.to_string())?)?;
@@ -1489,7 +1496,7 @@ where
                 author_attempt,
                 "failed",
             )?;
-            finish_exhausted_authoring(&mut run)?;
+            finish_exhausted_stage(&mut run, crate::run::PlanStage::Planner)?;
             return Err(error);
         }
     };
@@ -1550,7 +1557,7 @@ where
                         repair_attempt,
                         "failed",
                     )?;
-                    finish_exhausted_authoring(&mut run)?;
+                    finish_exhausted_stage(&mut run, crate::run::PlanStage::Planner)?;
                     return Err(error);
                 }
             };
@@ -1569,7 +1576,7 @@ where
                         repair_attempt,
                         "malformed",
                     )?;
-                    finish_exhausted_authoring(&mut run)?;
+                    finish_exhausted_stage(&mut run, crate::run::PlanStage::Planner)?;
                     return Err(format!(
                         "plan author output invalid after repair: {first_error}; {second_error}"
                     ));
@@ -1660,6 +1667,9 @@ where
                 artifact,
                 ..
             } => {
+                if finish_exhausted_stage(run, crate::run::PlanStage::PeerReview)? {
+                    return Err("plan peer-review attempt limit exhausted".to_string());
+                }
                 let (reviewer, degraded) = match peer {
                     Some(bound) => {
                         if let Err(error) = recheck_author(bursar, snapshot, &bound) {
@@ -1736,6 +1746,7 @@ where
                             attempt,
                             "failed",
                         )?;
+                        finish_exhausted_stage(run, crate::run::PlanStage::PeerReview)?;
                         return Err(error);
                     }
                 };
@@ -1801,6 +1812,7 @@ where
                                         repair_attempt,
                                         "failed",
                                     )?;
+                                    finish_exhausted_stage(run, crate::run::PlanStage::PeerReview)?;
                                     return Err(error);
                                 }
                             };
@@ -1819,6 +1831,7 @@ where
                                     repair_attempt,
                                     "malformed",
                                 )?;
+                                finish_exhausted_stage(run, crate::run::PlanStage::PeerReview)?;
                                 return Err(format!(
                                     "plan peer output invalid after repair: {first_error}; {second_error}"
                                 ));
@@ -1865,6 +1878,9 @@ where
                 artifact,
                 ..
             } => {
+                if finish_exhausted_stage(run, crate::run::PlanStage::Planner)? {
+                    return Err("plan revision attempt limit exhausted".to_string());
+                }
                 recheck_author(bursar, snapshot, &author).map_err(|error| {
                     let _ = run.finish_plan_blocked();
                     format!("immutable plan author is no longer eligible for revision: {error}")
@@ -1925,6 +1941,7 @@ where
                             attempt,
                             "failed",
                         )?;
+                        finish_exhausted_stage(run, crate::run::PlanStage::Planner)?;
                         return Err(error);
                     }
                 };
@@ -1943,6 +1960,9 @@ where
                             attempt,
                             "malformed",
                         )?;
+                        if finish_exhausted_stage(run, crate::run::PlanStage::Planner)? {
+                            return Err("plan revision attempt limit exhausted".to_string());
+                        }
                         let repair_attempt = run
                             .record_plan_stage_attempt(crate::run::PlanStage::Planner)
                             .map_err(|error| format!("plan revision repair attempt: {error}"))?;
@@ -1960,26 +1980,56 @@ where
                         )?;
                         recheck_author(bursar, snapshot, &author)?;
                         let repair =
-                            with_isolated_worktree(repo, &approval.target_head, |worktree| {
+                            match with_isolated_worktree(repo, &approval.target_head, |worktree| {
                                 executor.revise(&PlanRevisionRequest {
                                     worktree: worktree.to_path_buf(),
-                                    prior_plan,
-                                    findings,
+                                    prior_plan: prior_plan.clone(),
+                                    findings: findings.clone(),
                                     output_kind: approval.output_kind,
                                     execution: author.clone(),
                                     profile: profile.clone(),
                                 })
-                            })?;
-                        (
-                            parse_document(approval.output_kind, &repair).map_err(
-                                |second_error| {
-                                    format!(
-                                        "plan revision output invalid after repair: {first_error}; {second_error}"
-                                    )
-                                },
-                            )?,
-                            repair_attempt,
-                        )
+                            }) {
+                                Ok(output) => output,
+                                Err(error) => {
+                                    append_plan_invocation(
+                                        run,
+                                        ledger_path,
+                                        crate::run::EventKind::AttemptFinished,
+                                        crate::run::PlanStage::Planner,
+                                        &author,
+                                        &profile,
+                                        &prior_plan,
+                                        None,
+                                        repair_attempt,
+                                        "failed",
+                                    )?;
+                                    finish_exhausted_stage(run, crate::run::PlanStage::Planner)?;
+                                    return Err(error);
+                                }
+                            };
+                        let document = match parse_document(approval.output_kind, &repair) {
+                            Ok(document) => document,
+                            Err(second_error) => {
+                                append_plan_invocation(
+                                    run,
+                                    ledger_path,
+                                    crate::run::EventKind::AttemptFinished,
+                                    crate::run::PlanStage::Planner,
+                                    &author,
+                                    &profile,
+                                    &prior_plan,
+                                    Some(&repair),
+                                    repair_attempt,
+                                    "malformed",
+                                )?;
+                                finish_exhausted_stage(run, crate::run::PlanStage::Planner)?;
+                                return Err(format!(
+                                    "plan revision output invalid after repair: {first_error}; {second_error}"
+                                ));
+                            }
+                        };
+                        (document, repair_attempt)
                     }
                 };
                 let canonical = canonical_document_json(&document)?;
@@ -2023,6 +2073,9 @@ where
                 artifact,
                 ..
             } => {
+                if finish_exhausted_stage(run, crate::run::PlanStage::SecondOpinion)? {
+                    return Err("plan second-opinion attempt limit exhausted".to_string());
+                }
                 let reviewer = if let Some(bound) = second {
                     if let Err(error) = recheck_author(bursar, snapshot, &bound) {
                         run.finish_plan_blocked().map_err(|checkpoint| {
@@ -2094,6 +2147,7 @@ where
                             attempt,
                             "failed",
                         )?;
+                        finish_exhausted_stage(run, crate::run::PlanStage::SecondOpinion)?;
                         return Err(error);
                     }
                 };
@@ -2112,6 +2166,9 @@ where
                             attempt,
                             "malformed",
                         )?;
+                        if finish_exhausted_stage(run, crate::run::PlanStage::SecondOpinion)? {
+                            return Err("plan second-opinion attempt limit exhausted".to_string());
+                        }
                         let repair_attempt = run
                             .record_plan_stage_attempt(crate::run::PlanStage::SecondOpinion)
                             .map_err(|error| {
@@ -2131,7 +2188,7 @@ where
                         )?;
                         recheck_author(bursar, snapshot, &reviewer)?;
                         let repair =
-                            with_isolated_worktree(repo, &approval.target_head, |worktree| {
+                            match with_isolated_worktree(repo, &approval.target_head, |worktree| {
                                 executor.second_opinion(&PlanSecondOpinionRequest {
                                     worktree: worktree.to_path_buf(),
                                     target: run
@@ -2139,16 +2196,53 @@ where
                                         .map_err(|error| error.to_string())?
                                         .target
                                         .clone(),
-                                    canonical_plan,
+                                    canonical_plan: canonical_plan.clone(),
                                     execution: reviewer.clone(),
                                     profile: profile.clone(),
                                 })
-                            })?;
-                        let verdict = parse_second_opinion(&repair).map_err(|second_error| {
-                            format!(
-                                "plan second-opinion output invalid after repair: {first_error}; {second_error}"
-                            )
-                        })?;
+                            }) {
+                                Ok(output) => output,
+                                Err(error) => {
+                                    append_plan_invocation(
+                                        run,
+                                        ledger_path,
+                                        crate::run::EventKind::AttemptFinished,
+                                        crate::run::PlanStage::SecondOpinion,
+                                        &reviewer,
+                                        &profile,
+                                        &canonical_plan,
+                                        None,
+                                        repair_attempt,
+                                        "failed",
+                                    )?;
+                                    finish_exhausted_stage(
+                                        run,
+                                        crate::run::PlanStage::SecondOpinion,
+                                    )?;
+                                    return Err(error);
+                                }
+                            };
+                        let verdict = match parse_second_opinion(&repair) {
+                            Ok(verdict) => verdict,
+                            Err(second_error) => {
+                                append_plan_invocation(
+                                    run,
+                                    ledger_path,
+                                    crate::run::EventKind::AttemptFinished,
+                                    crate::run::PlanStage::SecondOpinion,
+                                    &reviewer,
+                                    &profile,
+                                    &canonical_plan,
+                                    Some(&repair),
+                                    repair_attempt,
+                                    "malformed",
+                                )?;
+                                finish_exhausted_stage(run, crate::run::PlanStage::SecondOpinion)?;
+                                return Err(format!(
+                                    "plan second-opinion output invalid after repair: {first_error}; {second_error}"
+                                ));
+                            }
+                        };
                         (repair, verdict, repair_attempt)
                     }
                 };
@@ -4719,25 +4813,13 @@ enabled = true
     }
 
     #[test]
-    fn loss_of_a_bound_peer_blocks_without_replacement() {
-        let (temp, paths, config, fake) = plan_fixture("bound-peer-loss");
-        let bursar = StatusSwitchBursar::from_fake(&fake);
-        let repo = initialized_repo(&temp);
+    fn bound_peer_backend_exhaustion_after_revision_is_terminal_and_nonresumable() {
+        let (temp, paths, config, bursar) = plan_fixture("bound-peer-exhaustion");
         let prepared = prepare(
             &paths,
             &config,
             &bursar,
-            PlanPrepareRequest {
-                repo,
-                input: PlanPrepareInput::Artifact {
-                    bytes: b"author this".to_vec(),
-                    tier: crate::run::PlanTier::Lead,
-                    complexity: crate::run::PlanComplexity::XL,
-                },
-                output_kind: PlanOutputKind::ImplementationPlan,
-                max_plan_revisions: 1,
-                require_second_opinion: false,
-            },
+            implementation_request(initialized_repo(&temp)),
         )
         .expect("prepare");
         approve(&paths, &prepared.run_id);
@@ -4746,24 +4828,284 @@ enabled = true
             vec![Ok(implementation_document())],
             vec![
                 Ok(peer_revise()),
-                Err("simulated bound-peer crash".to_string()),
+                Err("bound peer backend failure".to_string()),
             ],
             Vec::new(),
         );
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
-        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
-        let progress = run.plan().expect("plan").progress.clone();
-        let peer_provider = match &progress {
-            crate::run::PlanProgress::AwaitingPeer {
-                peer: Some(peer), ..
-            } => peer.provider_id.clone(),
-            other => panic!("expected a persisted bound peer, got {other:?}"),
-        };
-        let calls_before = executor.calls.lock().expect("calls").len();
-        bursar.exhaust(&peer_provider);
 
         assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
-        assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
+        let calls = executor.calls.lock().expect("calls").len();
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(executor.calls.lock().expect("calls").len(), calls);
+        assert_eq!(
+            plan_ledger_rows(&paths.ledger_path)
+                .iter()
+                .map(|row| row["outcome"].as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("returned"),
+                Some("returned"),
+                Some("returned"),
+                Some("failed"),
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_backend_attempt_exhaustion_is_terminal_and_nonresumable() {
+        let (temp, paths, config, bursar) = plan_fixture("peer-backend-exhaustion");
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            implementation_request(initialized_repo(&temp)),
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let executor = ScriptedExecutor::new(
+            vec![Ok(implementation_document())],
+            Vec::new(),
+            vec![
+                Err("first peer backend failure".to_string()),
+                Err("second peer backend failure".to_string()),
+            ],
+            Vec::new(),
+        );
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        let calls = executor.calls.lock().expect("calls").len();
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(executor.calls.lock().expect("calls").len(), calls);
+        let rows = plan_ledger_rows(&paths.ledger_path);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["outcome"].as_str())
+                .collect::<Vec<_>>(),
+            vec![Some("returned"), Some("failed"), Some("failed")]
+        );
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert!(matches!(
+            crate::run::read_events(&run.events_path())
+                .expect("events")
+                .last(),
+            Some(crate::run::RunEvent {
+                kind: crate::run::EventKind::RunFinished,
+                outcome: Some(outcome),
+                ..
+            }) if outcome == "blocked"
+        ));
+    }
+
+    #[test]
+    fn peer_double_malformed_repair_is_terminal_and_nonresumable() {
+        let (temp, paths, config, bursar) = plan_fixture("peer-malformed-exhaustion");
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            implementation_request(initialized_repo(&temp)),
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let executor = ScriptedExecutor::new(
+            vec![Ok(implementation_document())],
+            Vec::new(),
+            vec![
+                Ok(b"bad peer JSON".to_vec()),
+                Ok(b"still bad peer JSON".to_vec()),
+            ],
+            Vec::new(),
+        );
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        let calls = executor.calls.lock().expect("calls").len();
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(executor.calls.lock().expect("calls").len(), calls);
+        assert_eq!(
+            plan_ledger_rows(&paths.ledger_path)
+                .iter()
+                .map(|row| row["outcome"].as_str())
+                .collect::<Vec<_>>(),
+            vec![Some("returned"), Some("malformed"), Some("malformed")]
+        );
+    }
+
+    #[test]
+    fn second_opinion_backend_attempt_exhaustion_is_terminal_and_nonresumable() {
+        let (temp, paths, config, bursar) = plan_fixture("second-backend-exhaustion");
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo: initialized_repo(&temp),
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::Spec,
+                max_plan_revisions: 1,
+                require_second_opinion: true,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let executor = ScriptedExecutor::new(
+            vec![Ok(spec_document())],
+            Vec::new(),
+            vec![Ok(peer_approve())],
+            vec![
+                Err("first second-opinion backend failure".to_string()),
+                Err("second second-opinion backend failure".to_string()),
+            ],
+        );
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        let calls = executor.calls.lock().expect("calls").len();
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(executor.calls.lock().expect("calls").len(), calls);
+        let rows = plan_ledger_rows(&paths.ledger_path);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row["stage"].as_str(), row["outcome"].as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("planner"), Some("returned")),
+                (Some("peer-review"), Some("returned")),
+                (Some("second-opinion"), Some("failed")),
+                (Some("second-opinion"), Some("failed")),
+            ]
+        );
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert!(matches!(
+            crate::run::read_events(&run.events_path())
+                .expect("events")
+                .last(),
+            Some(crate::run::RunEvent {
+                kind: crate::run::EventKind::RunFinished,
+                outcome: Some(outcome),
+                ..
+            }) if outcome == "blocked"
+        ));
+    }
+
+    #[test]
+    fn second_opinion_double_malformed_repair_is_terminal_and_nonresumable() {
+        let (temp, paths, config, bursar) = plan_fixture("second-malformed-exhaustion");
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo: initialized_repo(&temp),
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::Spec,
+                max_plan_revisions: 1,
+                require_second_opinion: true,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let executor = ScriptedExecutor::new(
+            vec![Ok(spec_document())],
+            Vec::new(),
+            vec![Ok(peer_approve())],
+            vec![
+                Ok(b"bad second JSON".to_vec()),
+                Ok(b"still bad second JSON".to_vec()),
+            ],
+        );
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        let calls = executor.calls.lock().expect("calls").len();
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(executor.calls.lock().expect("calls").len(), calls);
+        assert_eq!(
+            plan_ledger_rows(&paths.ledger_path)
+                .iter()
+                .map(|row| row["outcome"].as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("returned"),
+                Some("returned"),
+                Some("malformed"),
+                Some("malformed"),
+            ]
+        );
+    }
+    fn assert_revision_attempt_exhaustion(
+        label: &str,
+        revision: Result<Vec<u8>, String>,
+        expected_outcome: &str,
+    ) {
+        let (temp, paths, config, bursar) = plan_fixture(label);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            implementation_request(initialized_repo(&temp)),
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let executor = ScriptedExecutor::new(
+            vec![Ok(implementation_document())],
+            vec![revision],
+            vec![Ok(peer_revise())],
+            Vec::new(),
+        );
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        let calls = executor.calls.lock().expect("calls").len();
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(executor.calls.lock().expect("calls").len(), calls);
+        assert_eq!(
+            plan_ledger_rows(&paths.ledger_path)
+                .iter()
+                .map(|row| row["outcome"].as_str())
+                .collect::<Vec<_>>(),
+            vec![Some("returned"), Some("returned"), Some(expected_outcome)]
+        );
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert!(matches!(
+            crate::run::read_events(&run.events_path())
+                .expect("events")
+                .last(),
+            Some(crate::run::RunEvent {
+                kind: crate::run::EventKind::RunFinished,
+                outcome: Some(outcome),
+                ..
+            }) if outcome == "blocked"
+        ));
+    }
+
+    #[test]
+    fn revision_backend_attempt_limit_is_terminal_and_nonresumable() {
+        assert_revision_attempt_exhaustion(
+            "revision-backend-exhaustion",
+            Err("revision backend failure".to_string()),
+            "failed",
+        );
+    }
+
+    #[test]
+    fn revision_malformed_attempt_limit_is_terminal_and_nonresumable() {
+        assert_revision_attempt_exhaustion(
+            "revision-malformed-exhaustion",
+            Ok(b"bad revision JSON".to_vec()),
+            "malformed",
+        );
     }
 }
