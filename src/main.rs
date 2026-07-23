@@ -14,6 +14,7 @@ mod job;
 mod ledger;
 mod r#loop;
 mod plan;
+mod plan_job;
 mod quarantine;
 mod ratchet;
 mod role_routing;
