@@ -2816,6 +2816,94 @@ enabled = true
         )
         .expect("write responses");
     }
+    fn plan_ledger_rows(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .expect("ledger")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("ledger row"))
+            .collect()
+    }
+
+    fn assert_successful_plan_ledger_and_events(paths: &PlanJobPaths, run_id: &str) {
+        assert!(
+            paths.ledger_path.is_file(),
+            "every fake plan backend call must leave a generic ledger artifact"
+        );
+        let rows = plan_ledger_rows(&paths.ledger_path);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row["role"].as_str(), row["job"].as_str(), row["stage"].as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("plan"), Some("plan"), Some("planner")),
+                (Some("plan"), Some("plan"), Some("peer-review")),
+                (Some("plan"), Some("plan"), Some("second-opinion")),
+            ]
+        );
+        assert!(rows.iter().all(|row| {
+            row["profile"].as_str().is_some()
+                && row["execution_key"].as_str().is_some()
+                && row["provider"].as_str().is_some()
+                && row["input_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
+                && row["output_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
+                && row["attempt"] == 1
+                && row["outcome"] == "returned"
+                && row["duration_ms"].is_null()
+                && row["tokens"].is_null()
+        }));
+        let run = crate::run::RunHandle::open(&paths.state_dir, run_id).expect("run");
+        let events = crate::run::read_events(&run.events_path()).expect("events");
+        let invocations = events
+            .iter()
+            .filter(|event| event.kind == crate::run::EventKind::AttemptFinished)
+            .filter_map(|event| event.plan_invocation.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            invocations.iter().map(|evidence| evidence.stage).collect::<Vec<_>>(),
+            vec![
+                crate::run::PlanStage::Planner,
+                crate::run::PlanStage::PeerReview,
+                crate::run::PlanStage::SecondOpinion,
+            ]
+        );
+        assert!(invocations.iter().all(|evidence| {
+            evidence.role == "plan"
+                && evidence.input_sha256.len() == 64
+                && evidence
+                    .output_sha256
+                    .as_ref()
+                    .is_some_and(|digest| digest.len() == 64)
+                && evidence.attempt == 1
+        }));
+    }
+
+    fn assert_malformed_peer_repair_ledger(paths: &PlanJobPaths) {
+        let rows = plan_ledger_rows(&paths.ledger_path);
+        assert_eq!(rows.len(), 3, "author plus both peer invocations");
+        assert_eq!(
+            rows.iter()
+                .map(|row| {
+                    (
+                        row["stage"].as_str(),
+                        row["attempt"].as_u64(),
+                        row["outcome"].as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("planner"), Some(1), Some("returned")),
+                (Some("peer-review"), Some(1), Some("malformed")),
+                (Some("peer-review"), Some(2), Some("returned")),
+            ]
+        );
+        assert!(rows.iter().all(|row| {
+            row["input_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
+                && row["output_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
+                && row["duration_ms"].is_null()
+                && row["tokens"].is_null()
+        }));
+    }
 
     fn implementation_document() -> Vec<u8> {
         br#"{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()
@@ -3471,68 +3559,7 @@ enabled = true
         assert_ne!(calls[0].1.provider_id, calls[2].1.provider_id);
         assert_ne!(calls[1].1.provider_id, calls[2].1.provider_id);
         drop(calls);
-        let ledger_path = paths.ledger_path.clone();
-        assert!(
-            ledger_path.is_file(),
-            "every fake plan backend call must leave a generic ledger artifact"
-        );
-        let ledger_rows = std::fs::read_to_string(&ledger_path)
-            .expect("ledger")
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("ledger row"))
-            .collect::<Vec<_>>();
-        assert_eq!(ledger_rows.len(), 3);
-        assert_eq!(
-            ledger_rows
-                .iter()
-                .map(|row| (row["role"].as_str(), row["job"].as_str(), row["stage"].as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (Some("plan"), Some("plan"), Some("planner")),
-                (Some("plan"), Some("plan"), Some("peer-review")),
-                (Some("plan"), Some("plan"), Some("second-opinion")),
-            ]
-        );
-        assert!(ledger_rows.iter().all(|row| {
-            row["profile"].as_str().is_some()
-                && row["execution_key"].as_str().is_some()
-                && row["provider"].as_str().is_some()
-                && row["input_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
-                && row["output_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
-                && row["attempt"] == 1
-                && row["outcome"] == "returned"
-                && row["duration_ms"].is_null()
-                && row["tokens"].is_null()
-        }));
-        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
-        let events = crate::run::read_events(&run.events_path()).expect("events");
-        let stages = events
-            .iter()
-            .filter(|event| event.kind == crate::run::EventKind::AttemptFinished)
-            .filter_map(|event| event.plan_invocation.as_ref())
-            .map(|evidence| evidence.stage)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            stages,
-            vec![
-                crate::run::PlanStage::Planner,
-                crate::run::PlanStage::PeerReview,
-                crate::run::PlanStage::SecondOpinion,
-            ]
-        );
-        assert!(events
-            .iter()
-            .filter(|event| event.kind == crate::run::EventKind::AttemptFinished)
-            .filter_map(|event| event.plan_invocation.as_ref())
-            .all(|evidence| {
-                evidence.role == "plan"
-                    && evidence.input_sha256.len() == 64
-                    && evidence
-                        .output_sha256
-                        .as_ref()
-                        .is_some_and(|digest| digest.len() == 64)
-                    && evidence.attempt == 1
-            }));
+        assert_successful_plan_ledger_and_events(&paths, &prepared.run_id);
     }
 
     #[test]
@@ -3668,28 +3695,7 @@ enabled = true
             status(&paths, &prepared.run_id).expect("status"),
             "accepted"
         );
-        let rows = std::fs::read_to_string(&paths.ledger_path)
-            .expect("ledger")
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("ledger row"))
-            .collect::<Vec<_>>();
-        assert_eq!(rows.len(), 3, "author plus both peer invocations");
-        assert_eq!(
-            rows.iter()
-                .map(|row| (row["stage"].as_str(), row["attempt"].as_u64(), row["outcome"].as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (Some("planner"), Some(1), Some("returned")),
-                (Some("peer-review"), Some(1), Some("malformed")),
-                (Some("peer-review"), Some(2), Some("returned")),
-            ]
-        );
-        assert!(rows.iter().all(|row| {
-            row["input_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
-                && row["output_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
-                && row["duration_ms"].is_null()
-                && row["tokens"].is_null()
-        }));
+        assert_malformed_peer_repair_ledger(&paths);
 
         let (temp, paths, config, fake) = plan_fixture("peer-resume-degraded");
         let bursar = StatusSwitchBursar::from_fake(&fake);
