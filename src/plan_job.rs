@@ -1325,6 +1325,18 @@ mod tests {
         }
     }
 
+    struct FailingAuthor(std::sync::Mutex<usize>);
+
+    impl PlanAuthor for FailingAuthor {
+        fn author(&self, _request: &PlanAuthorRequest) -> Result<Vec<u8>, String> {
+            *self
+                .0
+                .lock()
+                .map_err(|_| "failing author lock".to_string())? += 1;
+            Err("simulated author crash".to_string())
+        }
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "fixture constructs the exact multi-provider authoring environment"
@@ -1746,6 +1758,53 @@ enabled = true
 
         dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("dispatch");
 
+        assert!(cancel(&paths, &config, &prepared.run_id).is_err());
+    }
+
+    #[test]
+    fn exhausted_author_and_approved_fallbacks_after_authorship_are_terminal_and_noncancellable() {
+        let (temp, paths, config, fake) = plan_fixture("started-provider-block");
+        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let author = FailingAuthor(std::sync::Mutex::new(0));
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert_eq!(*author.0.lock().expect("calls"), 1);
+        for provider in ["anthropic", "codex", "opencode-go"] {
+            bursar.exhaust(provider);
+        }
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert_eq!(
+            *author.0.lock().expect("calls"),
+            1,
+            "terminal provider loss must not replace or invoke an author"
+        );
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert!(matches!(
+            run.plan().expect("plan").progress,
+            crate::run::PlanProgress::Terminal {
+                verdict: crate::run::PlanTerminalVerdict::Blocked
+            }
+        ));
         assert!(cancel(&paths, &config, &prepared.run_id).is_err());
     }
 }
