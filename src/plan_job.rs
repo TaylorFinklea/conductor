@@ -996,6 +996,7 @@ where
     ) {
         return dispatch_review_stages(
             &mut run,
+            &router,
             bursar,
             author,
             &captured_snapshot,
@@ -1155,6 +1156,7 @@ where
             .map_err(|error| format!("plan peer checkpoint: {error}"))?;
         dispatch_review_stages(
             &mut run,
+            &router,
             bursar,
             author,
             &captured_snapshot,
@@ -1170,6 +1172,7 @@ where
 )]
 fn dispatch_review_stages<C, A>(
     run: &mut crate::run::RunHandle,
+    router: &crate::role_routing::RoleRouter,
     bursar: &C,
     executor: &A,
     snapshot: &crate::bursar::RosterSnapshot,
@@ -1204,14 +1207,26 @@ where
                         }
                         (bound, false)
                     }
-                    None => select_reviewer(
+                    None => match select_reviewer(
+                        router,
+                        run.run_id(),
                         bursar,
                         run.plan().map_err(|error| error.to_string())?,
                         snapshot,
                         crate::run::PlanStage::PeerReview,
                         &author,
                         None,
-                    )?,
+                    ) {
+                        Ok(bound) => bound,
+                        Err(error) => {
+                            run.finish_plan_blocked().map_err(|checkpoint| {
+                                format!(
+                                    "plan blocked after peer candidate exhaustion: {checkpoint}"
+                                )
+                            })?;
+                            return Err(error);
+                        }
+                    },
                 };
                 let profile = profile_for_execution(snapshot, &reviewer)?;
                 let canonical_plan = plan_artifact_bytes(run, &artifact)?;
@@ -1444,14 +1459,24 @@ where
                 artifact,
                 ..
             } => {
-                let (reviewer, _) = select_reviewer(
+                let (reviewer, _) = match select_reviewer(
+                    router,
+                    run.run_id(),
                     bursar,
                     run.plan().map_err(|error| error.to_string())?,
                     snapshot,
                     crate::run::PlanStage::SecondOpinion,
                     &author,
                     Some(&peer),
-                )?;
+                ) {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        run.finish_plan_blocked().map_err(|checkpoint| {
+                            format!("plan blocked after second-opinion candidate exhaustion: {checkpoint}")
+                        })?;
+                        return Err(error);
+                    }
+                };
                 let profile = profile_for_execution(snapshot, &reviewer)?;
                 let canonical_plan = plan_artifact_bytes(run, &artifact)?;
                 let attempt = run
@@ -1604,7 +1629,17 @@ fn peer_rubric(kind: PlanOutputKind) -> String {
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reviewer selection joins the persisted route with the live roster and bound identities"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "all fail-closed review eligibility gates are deliberately visible at the bind boundary"
+)]
 fn select_reviewer<C: crate::bursar::BursarClient + ?Sized>(
+    router: &crate::role_routing::RoleRouter,
+    run_id: &str,
     bursar: &C,
     plan: &crate::run::PlanRunDetails,
     snapshot: &crate::bursar::RosterSnapshot,
@@ -1619,48 +1654,129 @@ fn select_reviewer<C: crate::bursar::BursarClient + ?Sized>(
         .find(|route| route.stage == stage)
         .ok_or_else(|| "plan authorization omits required reviewer route".to_string())?;
     let author_tier = execution_tier(snapshot, author)?;
-    let mut live = Vec::new();
-    for candidate in &route.candidates {
-        if candidate.execution_key == author.execution_key
-            || peer.is_some_and(|known| candidate.execution_key == known.execution_key)
-            || execution_tier(snapshot, candidate)? < author_tier
-        {
-            continue;
-        }
-        if recheck_author(bursar, candidate).is_ok() {
-            live.push(candidate.clone());
-        }
-    }
+    let mut live = route
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            route
+                .constraints
+                .distinct_execution_from
+                .iter()
+                .all(|dependency| match dependency {
+                    crate::run::PlanStage::Planner => {
+                        candidate.execution_key != author.execution_key
+                    }
+                    crate::run::PlanStage::PeerReview => {
+                        peer.is_some_and(|known| candidate.execution_key != known.execution_key)
+                    }
+                    crate::run::PlanStage::SecondOpinion => false,
+                })
+        })
+        .filter(|candidate| {
+            route.constraints.tier_at_least.iter().all(|dependency| {
+                !matches!(dependency, crate::run::PlanStage::Planner)
+                    || execution_tier(snapshot, candidate).is_ok_and(|tier| tier >= author_tier)
+            })
+        })
+        .filter(|candidate| {
+            route
+                .provider_distinct_from
+                .iter()
+                .all(|dependency| match dependency {
+                    crate::run::PlanStage::Planner => candidate.provider_id != author.provider_id,
+                    crate::run::PlanStage::PeerReview => {
+                        peer.is_some_and(|known| candidate.provider_id != known.provider_id)
+                    }
+                    crate::run::PlanStage::SecondOpinion => false,
+                })
+        })
+        .filter(|candidate| recheck_author(bursar, candidate).is_ok())
+        .cloned()
+        .collect::<Vec<_>>();
     if live.is_empty() {
         return Err("no approved distinct reviewer candidate is currently eligible".to_string());
     }
-    match route.constraints.provider_diversity {
-        crate::run::PlanProviderDiversity::None => Ok((live.remove(0), false)),
+    let (require_provider_distinct, degraded) = match route.constraints.provider_diversity {
+        crate::run::PlanProviderDiversity::None => (false, false),
         crate::run::PlanProviderDiversity::CrossProviderOrDegraded => {
-            if let Some(candidate) = live
+            let cross = live
                 .iter()
-                .find(|candidate| candidate.provider_id != author.provider_id)
-            {
-                return Ok((candidate.clone(), false));
+                .filter(|candidate| candidate.provider_id != author.provider_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            if cross.is_empty() {
+                (false, true)
+            } else {
+                live = cross;
+                (true, false)
             }
-            Ok((live.remove(0), true))
         }
         crate::run::PlanProviderDiversity::PairwiseDistinct => {
             let peer = peer.ok_or_else(|| {
                 "pairwise-distinct second opinion requires a bound peer".to_string()
             })?;
-            live.into_iter()
-                .find(|candidate| {
-                    candidate.provider_id != author.provider_id
-                        && candidate.provider_id != peer.provider_id
-                })
-                .map(|candidate| (candidate, false))
-                .ok_or_else(|| {
+            live.retain(|candidate| {
+                candidate.provider_id != author.provider_id
+                    && candidate.provider_id != peer.provider_id
+            });
+            if live.is_empty() {
+                return Err(
                     "no approved pairwise-provider-distinct second opinion is currently eligible"
-                        .to_string()
-                })
+                        .to_string(),
+                );
+            }
+            (true, false)
         }
-    }
+    };
+    let minimum_tier = match author_tier {
+        0 => crate::config::Tier::Junior,
+        1 => crate::config::Tier::Senior,
+        _ => crate::config::Tier::Lead,
+    };
+    let binding_attempt = match stage {
+        crate::run::PlanStage::Planner => plan.stage_attempts.planner,
+        crate::run::PlanStage::PeerReview => plan.stage_attempts.peer_review,
+        crate::run::PlanStage::SecondOpinion => plan.stage_attempts.second_opinion,
+    };
+    let binding_run_id = format!(
+        "{run_id}-{}-bind-{binding_attempt}",
+        match stage {
+            crate::run::PlanStage::Planner => "planner",
+            crate::run::PlanStage::PeerReview => "peer-review",
+            crate::run::PlanStage::SecondOpinion => "second-opinion",
+        }
+    );
+    let mut constraints = planner_constraints(snapshot, minimum_tier)?;
+    constraints.allowed_profile_ids = live
+        .iter()
+        .map(|candidate| {
+            crate::role_routing::ProfileId::new(candidate.profile_id.clone())
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    constraints.allowed_provider_ids = live
+        .iter()
+        .map(|candidate| candidate.provider_id.clone())
+        .collect();
+    constraints.approved_execution_keys = live
+        .iter()
+        .map(|candidate| candidate.execution_key.clone())
+        .collect();
+    let prepared = router
+        .bind_reviewer(
+            crate::role_routing::RunId::new(binding_run_id).map_err(|error| error.to_string())?,
+            crate::role_routing::RoleId::new("plan").map_err(|error| error.to_string())?,
+            stage,
+            author.clone(),
+            peer.cloned(),
+            require_provider_distinct,
+            constraints,
+        )
+        .map_err(|error| format!("reviewer scheduler binding: {error}"))?;
+    router
+        .commit(&prepared.route.reservation)
+        .map_err(|error| format!("reviewer reservation: {error}"))?;
+    Ok((prepared.route.selected, degraded))
 }
 
 fn execution_tier(

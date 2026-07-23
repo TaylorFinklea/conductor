@@ -683,6 +683,10 @@ impl RoleRouter {
     /// Binds a reviewer only after the actual author (and for second opinion,
     /// actual peer) identity is immutable. It always consumes its own stage
     /// lane and never consults live Bursar or config state.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the delayed binding boundary records each immutable review identity explicitly"
+    )]
     pub(crate) fn bind_reviewer(
         &self,
         run_id: RunId,
@@ -690,6 +694,7 @@ impl RoleRouter {
         stage: PlanStage,
         author: crate::run::ApprovedExecution,
         peer: Option<crate::run::ApprovedExecution>,
+        require_provider_distinct: bool,
         mut constraints: HardEligibility,
     ) -> Result<PreparedReviewer> {
         if !matches!(stage, PlanStage::PeerReview | PlanStage::SecondOpinion) {
@@ -698,9 +703,11 @@ impl RoleRouter {
             ));
         }
         self.validate_pinned_execution(&author)?;
-        constraints
-            .provider_distinct_from
-            .insert(author.provider_id.clone());
+        if require_provider_distinct {
+            constraints
+                .provider_distinct_from
+                .insert(author.provider_id.clone());
+        }
         if matches!(stage, PlanStage::SecondOpinion) {
             let known_peer = peer.as_ref().ok_or_else(|| {
                 RoleRoutingError::new(
@@ -1932,6 +1939,7 @@ mod tests {
                     PlanStage::SecondOpinion,
                     author.clone(),
                     None,
+                    true,
                     strict_constraints(&snapshot, "plan"),
                 )
                 .is_err()
@@ -1943,6 +1951,7 @@ mod tests {
                 PlanStage::PeerReview,
                 author.clone(),
                 None,
+                true,
                 strict_constraints(&snapshot, "plan"),
             )
             .expect("peer binding");
@@ -1956,6 +1965,7 @@ mod tests {
                 PlanStage::SecondOpinion,
                 author.clone(),
                 Some(peer.route.selected.clone()),
+                true,
                 strict_constraints(&snapshot, "plan"),
             )
             .expect("second binding");
