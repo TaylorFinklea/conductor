@@ -258,6 +258,7 @@ fn plan_paths() -> crate::plan_job::PlanJobPaths {
     crate::plan_job::PlanJobPaths {
         state_dir: state_dir(),
         reports_home: reports_home(),
+        ledger_path: ledger_path(),
     }
 }
 

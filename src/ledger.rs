@@ -45,6 +45,32 @@ pub(crate) struct LedgerRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) role: String,
+    /// Generic Conductor job category, when this row records a staged run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) job: Option<String>,
+    /// Generic stage within a staged run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stage: Option<String>,
+    /// Immutable approved execution identity, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) execution_key: Option<String>,
+    /// Provider selected for this execution, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<String>,
+    /// Digest of the exact backend input, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) input_sha256: Option<String>,
+    /// Digest of the backend output, including malformed output when returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) output_sha256: Option<String>,
+    /// Monotonic per-stage invocation attempt, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) attempt: Option<u8>,
+    /// Observed backend outcome for an invocation, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) outcome: Option<String>,
+    /// Harness-reported token evidence. Unknown telemetry is represented as null.
+    pub(crate) tokens: Option<u64>,
     pub(crate) task: String,
     pub(crate) verify_passed: bool,
     pub(crate) complexity: String,
@@ -52,7 +78,6 @@ pub(crate) struct LedgerRow {
     pub(crate) notes: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failure_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) duration_ms: Option<u64>,
 }
 
@@ -151,6 +176,15 @@ mod tests {
             profile: None,
             reasoning_effort: None,
             role: "implement".to_string(),
+            job: None,
+            stage: None,
+            execution_key: None,
+            provider: None,
+            input_sha256: None,
+            output_sha256: None,
+            attempt: None,
+            outcome: None,
+            tokens: None,
             task: "sandbox-1".to_string(),
             verify_passed: true,
             complexity: "S".to_string(),
@@ -187,6 +221,15 @@ mod tests {
                 profile: Some("luna-reviewer".to_string()),
                 reasoning_effort: Some("high".to_string()),
                 role: "adversarial-reviewer".to_string(),
+                job: None,
+                stage: None,
+                execution_key: None,
+                provider: None,
+                input_sha256: None,
+                output_sha256: None,
+                attempt: None,
+                outcome: None,
+                tokens: None,
                 task: "review-123".to_string(),
                 verify_passed: false,
                 complexity: "L".to_string(),
@@ -223,6 +266,15 @@ mod tests {
             profile: None,
             reasoning_effort: None,
             role: "implement".to_string(),
+            job: None,
+            stage: None,
+            execution_key: None,
+            provider: None,
+            input_sha256: None,
+            output_sha256: None,
+            attempt: None,
+            outcome: None,
+            tokens: None,
             task: task.to_string(),
             verify_passed: true,
             complexity: "S".to_string(),

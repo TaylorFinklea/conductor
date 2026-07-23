@@ -6,6 +6,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use chrono::Utc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -428,6 +429,7 @@ pub(crate) struct PlanPrepareRequest {
 pub(crate) struct PlanJobPaths {
     pub(crate) state_dir: PathBuf,
     pub(crate) reports_home: PathBuf,
+    pub(crate) ledger_path: PathBuf,
 }
 
 /// A plan executor receives only an isolated authoring request or the blinded
@@ -1026,6 +1028,7 @@ where
             &mut run,
             &router,
             bursar,
+            &paths.ledger_path,
             author,
             &captured_snapshot,
             &repo,
@@ -1105,15 +1108,17 @@ where
         .planner;
     append_plan_invocation(
         &mut run,
+        &paths.ledger_path,
         crate::run::EventKind::AttemptStarted,
         crate::run::PlanStage::Planner,
         &selected,
+        &profile,
         &input_bytes,
         None,
         author_attempt,
         "started",
     )?;
-    let output = with_isolated_worktree(&repo, &approval.target_head, |worktree| {
+    let output = match with_isolated_worktree(&repo, &approval.target_head, |worktree| {
         author.author(&PlanAuthorRequest {
             worktree: worktree.to_path_buf(),
             input: input_bytes.clone(),
@@ -1121,10 +1126,39 @@ where
             execution: selected.clone(),
             profile: profile.clone(),
         })
-    })?;
+    }) {
+        Ok(output) => output,
+        Err(error) => {
+            append_plan_invocation(
+                &mut run,
+                &paths.ledger_path,
+                crate::run::EventKind::AttemptFinished,
+                crate::run::PlanStage::Planner,
+                &selected,
+                &profile,
+                &input_bytes,
+                None,
+                author_attempt,
+                "failed",
+            )?;
+            return Err(error);
+        }
+    };
     let document = match parse_document(approval.output_kind, &output) {
         Ok(document) => document,
         Err(first_error) => {
+            append_plan_invocation(
+                &mut run,
+                &paths.ledger_path,
+                crate::run::EventKind::AttemptFinished,
+                crate::run::PlanStage::Planner,
+                &selected,
+                &profile,
+                &input_bytes,
+                Some(&output),
+                author_attempt,
+                "malformed",
+            )?;
             run.record_plan_author_attempt()
                 .map_err(|error| format!("plan author repair attempt: {error}"))?;
             let repair_attempt = run
@@ -1134,15 +1168,17 @@ where
                 .planner;
             append_plan_invocation(
                 &mut run,
+                &paths.ledger_path,
                 crate::run::EventKind::AttemptStarted,
                 crate::run::PlanStage::Planner,
                 &selected,
+                &profile,
                 &input_bytes,
                 None,
                 repair_attempt,
                 "started",
             )?;
-            let repair = with_isolated_worktree(&repo, &approval.target_head, |worktree| {
+            let repair = match with_isolated_worktree(&repo, &approval.target_head, |worktree| {
                 author.author(&PlanAuthorRequest {
                     worktree: worktree.to_path_buf(),
                     input: input_bytes.clone(),
@@ -1150,10 +1186,44 @@ where
                     execution: selected.clone(),
                     profile: profile.clone(),
                 })
-            })?;
-            parse_document(approval.output_kind, &repair).map_err(|second_error| {
-                format!("plan author output invalid after repair: {first_error}; {second_error}")
-            })?
+            }) {
+                Ok(output) => output,
+                Err(error) => {
+                    append_plan_invocation(
+                        &mut run,
+                        &paths.ledger_path,
+                        crate::run::EventKind::AttemptFinished,
+                        crate::run::PlanStage::Planner,
+                        &selected,
+                        &profile,
+                        &input_bytes,
+                        None,
+                        repair_attempt,
+                        "failed",
+                    )?;
+                    return Err(error);
+                }
+            };
+            match parse_document(approval.output_kind, &repair) {
+                Ok(document) => document,
+                Err(second_error) => {
+                    append_plan_invocation(
+                        &mut run,
+                        &paths.ledger_path,
+                        crate::run::EventKind::AttemptFinished,
+                        crate::run::PlanStage::Planner,
+                        &selected,
+                        &profile,
+                        &input_bytes,
+                        Some(&repair),
+                        repair_attempt,
+                        "malformed",
+                    )?;
+                    return Err(format!(
+                        "plan author output invalid after repair: {first_error}; {second_error}"
+                    ));
+                }
+            }
         }
     };
     let canonical = canonical_document_json(&document)?;
@@ -1164,9 +1234,11 @@ where
         .planner;
     append_plan_invocation(
         &mut run,
+        &paths.ledger_path,
         crate::run::EventKind::AttemptFinished,
         crate::run::PlanStage::Planner,
         &selected,
+        &profile,
         &input_bytes,
         Some(&canonical),
         author_attempt,
@@ -1192,6 +1264,7 @@ where
             &mut run,
             &router,
             bursar,
+            &paths.ledger_path,
             author,
             &captured_snapshot,
             &repo,
@@ -1204,10 +1277,15 @@ where
     clippy::too_many_lines,
     reason = "each persisted plan review stage keeps its binding, provider, and artifact gates explicit"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the immutable plan execution boundary carries every authorization and evidence source"
+)]
 fn dispatch_review_stages<C, A>(
     run: &mut crate::run::RunHandle,
     router: &crate::role_routing::RoleRouter,
     bursar: &C,
+    ledger_path: &Path,
     executor: &A,
     snapshot: &crate::bursar::RosterSnapshot,
     repo: &Path,
@@ -1269,16 +1347,18 @@ where
                     .map_err(|error| format!("plan peer attempt: {error}"))?;
                 append_plan_invocation(
                     run,
+                    ledger_path,
                     crate::run::EventKind::AttemptStarted,
                     crate::run::PlanStage::PeerReview,
                     &reviewer,
+                    &profile,
                     &canonical_plan,
                     None,
                     attempt,
                     "started",
                 )?;
                 recheck_author(bursar, snapshot, &reviewer)?;
-                let first = with_isolated_worktree(repo, &approval.target_head, |worktree| {
+                let first = match with_isolated_worktree(repo, &approval.target_head, |worktree| {
                     executor.peer_review(&PlanPeerReviewRequest {
                         worktree: worktree.to_path_buf(),
                         target: run
@@ -1291,28 +1371,61 @@ where
                         execution: reviewer.clone(),
                         profile: profile.clone(),
                     })
-                })?;
+                }) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        append_plan_invocation(
+                            run,
+                            ledger_path,
+                            crate::run::EventKind::AttemptFinished,
+                            crate::run::PlanStage::PeerReview,
+                            &reviewer,
+                            &profile,
+                            &canonical_plan,
+                            None,
+                            attempt,
+                            "failed",
+                        )?;
+                        return Err(error);
+                    }
+                };
                 let (review_bytes, verdict, _findings, final_attempt) = match parse_peer_review(
                     &first,
                 ) {
                     Ok((verdict, findings)) => (first, verdict, findings, attempt),
                     Err(first_error) => {
+                        append_plan_invocation(
+                            run,
+                            ledger_path,
+                            crate::run::EventKind::AttemptFinished,
+                            crate::run::PlanStage::PeerReview,
+                            &reviewer,
+                            &profile,
+                            &canonical_plan,
+                            Some(&first),
+                            attempt,
+                            "malformed",
+                        )?;
                         let repair_attempt = run
                             .record_plan_stage_attempt(crate::run::PlanStage::PeerReview)
                             .map_err(|error| format!("plan peer repair attempt: {error}"))?;
                         append_plan_invocation(
                             run,
+                            ledger_path,
                             crate::run::EventKind::AttemptStarted,
                             crate::run::PlanStage::PeerReview,
                             &reviewer,
+                            &profile,
                             &canonical_plan,
                             None,
                             repair_attempt,
                             "started",
                         )?;
                         recheck_author(bursar, snapshot, &reviewer)?;
-                        let repair =
-                            with_isolated_worktree(repo, &approval.target_head, |worktree| {
+                        let repair = match with_isolated_worktree(
+                            repo,
+                            &approval.target_head,
+                            |worktree| {
                                 executor.peer_review(&PlanPeerReviewRequest {
                                     worktree: worktree.to_path_buf(),
                                     target: run
@@ -1321,26 +1434,60 @@ where
                                         .target
                                         .clone(),
                                     rubric: peer_rubric(approval.output_kind),
-                                    canonical_plan,
+                                    canonical_plan: canonical_plan.clone(),
                                     execution: reviewer.clone(),
-                                    profile,
+                                    profile: profile.clone(),
                                 })
-                            })?;
-                        let (verdict, findings) =
-                                parse_peer_review(&repair).map_err(|second_error| {
-                                    format!(
-                                        "plan peer output invalid after repair: {first_error}; {second_error}"
-                                    )
-                                })?;
+                            },
+                        ) {
+                            Ok(output) => output,
+                            Err(error) => {
+                                append_plan_invocation(
+                                    run,
+                                    ledger_path,
+                                    crate::run::EventKind::AttemptFinished,
+                                    crate::run::PlanStage::PeerReview,
+                                    &reviewer,
+                                    &profile,
+                                    &canonical_plan,
+                                    None,
+                                    repair_attempt,
+                                    "failed",
+                                )?;
+                                return Err(error);
+                            }
+                        };
+                        let (verdict, findings) = match parse_peer_review(&repair) {
+                            Ok(parsed) => parsed,
+                            Err(second_error) => {
+                                append_plan_invocation(
+                                    run,
+                                    ledger_path,
+                                    crate::run::EventKind::AttemptFinished,
+                                    crate::run::PlanStage::PeerReview,
+                                    &reviewer,
+                                    &profile,
+                                    &canonical_plan,
+                                    Some(&repair),
+                                    repair_attempt,
+                                    "malformed",
+                                )?;
+                                return Err(format!(
+                                    "plan peer output invalid after repair: {first_error}; {second_error}"
+                                ));
+                            }
+                        };
                         (repair, verdict, findings, repair_attempt)
                     }
                 };
                 let evidence_input = plan_artifact_bytes(run, &artifact)?;
                 append_plan_invocation(
                     run,
+                    ledger_path,
                     crate::run::EventKind::AttemptFinished,
                     crate::run::PlanStage::PeerReview,
                     &reviewer,
+                    &profile,
                     &evidence_input,
                     Some(&review_bytes),
                     final_attempt,
@@ -1396,16 +1543,18 @@ where
                     .map_err(|error| format!("plan revision attempt: {error}"))?;
                 append_plan_invocation(
                     run,
+                    ledger_path,
                     crate::run::EventKind::AttemptStarted,
                     crate::run::PlanStage::Planner,
                     &author,
+                    &profile,
                     &prior_plan,
                     None,
                     attempt,
                     "started",
                 )?;
                 recheck_author(bursar, snapshot, &author)?;
-                let first = with_isolated_worktree(repo, &approval.target_head, |worktree| {
+                let first = match with_isolated_worktree(repo, &approval.target_head, |worktree| {
                     executor.revise(&PlanRevisionRequest {
                         worktree: worktree.to_path_buf(),
                         prior_plan: prior_plan.clone(),
@@ -1414,18 +1563,49 @@ where
                         execution: author.clone(),
                         profile: profile.clone(),
                     })
-                })?;
+                }) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        append_plan_invocation(
+                            run,
+                            ledger_path,
+                            crate::run::EventKind::AttemptFinished,
+                            crate::run::PlanStage::Planner,
+                            &author,
+                            &profile,
+                            &prior_plan,
+                            None,
+                            attempt,
+                            "failed",
+                        )?;
+                        return Err(error);
+                    }
+                };
                 let (document, final_attempt) = match parse_document(approval.output_kind, &first) {
                     Ok(document) => (document, attempt),
                     Err(first_error) => {
+                        append_plan_invocation(
+                            run,
+                            ledger_path,
+                            crate::run::EventKind::AttemptFinished,
+                            crate::run::PlanStage::Planner,
+                            &author,
+                            &profile,
+                            &prior_plan,
+                            Some(&first),
+                            attempt,
+                            "malformed",
+                        )?;
                         let repair_attempt = run
                             .record_plan_stage_attempt(crate::run::PlanStage::Planner)
                             .map_err(|error| format!("plan revision repair attempt: {error}"))?;
                         append_plan_invocation(
                             run,
+                            ledger_path,
                             crate::run::EventKind::AttemptStarted,
                             crate::run::PlanStage::Planner,
                             &author,
+                            &profile,
                             &prior_plan,
                             None,
                             repair_attempt,
@@ -1440,7 +1620,7 @@ where
                                     findings,
                                     output_kind: approval.output_kind,
                                     execution: author.clone(),
-                                    profile,
+                                    profile: profile.clone(),
                                 })
                             })?;
                         (
@@ -1459,9 +1639,11 @@ where
                 let evidence_input = plan_artifact_bytes(run, &artifact)?;
                 append_plan_invocation(
                     run,
+                    ledger_path,
                     crate::run::EventKind::AttemptFinished,
                     crate::run::PlanStage::Planner,
                     &author,
+                    &profile,
                     &evidence_input,
                     Some(&canonical),
                     final_attempt,
@@ -1530,16 +1712,18 @@ where
                     .map_err(|error| format!("plan second-opinion attempt: {error}"))?;
                 append_plan_invocation(
                     run,
+                    ledger_path,
                     crate::run::EventKind::AttemptStarted,
                     crate::run::PlanStage::SecondOpinion,
                     &reviewer,
+                    &profile,
                     &canonical_plan,
                     None,
                     attempt,
                     "started",
                 )?;
                 recheck_author(bursar, snapshot, &reviewer)?;
-                let first = with_isolated_worktree(repo, &approval.target_head, |worktree| {
+                let first = match with_isolated_worktree(repo, &approval.target_head, |worktree| {
                     executor.second_opinion(&PlanSecondOpinionRequest {
                         worktree: worktree.to_path_buf(),
                         target: run
@@ -1551,10 +1735,39 @@ where
                         execution: reviewer.clone(),
                         profile: profile.clone(),
                     })
-                })?;
+                }) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        append_plan_invocation(
+                            run,
+                            ledger_path,
+                            crate::run::EventKind::AttemptFinished,
+                            crate::run::PlanStage::SecondOpinion,
+                            &reviewer,
+                            &profile,
+                            &canonical_plan,
+                            None,
+                            attempt,
+                            "failed",
+                        )?;
+                        return Err(error);
+                    }
+                };
                 let (opinion_bytes, verdict, final_attempt) = match parse_second_opinion(&first) {
                     Ok(verdict) => (first, verdict, attempt),
                     Err(first_error) => {
+                        append_plan_invocation(
+                            run,
+                            ledger_path,
+                            crate::run::EventKind::AttemptFinished,
+                            crate::run::PlanStage::SecondOpinion,
+                            &reviewer,
+                            &profile,
+                            &canonical_plan,
+                            Some(&first),
+                            attempt,
+                            "malformed",
+                        )?;
                         let repair_attempt = run
                             .record_plan_stage_attempt(crate::run::PlanStage::SecondOpinion)
                             .map_err(|error| {
@@ -1562,9 +1775,11 @@ where
                             })?;
                         append_plan_invocation(
                             run,
+                            ledger_path,
                             crate::run::EventKind::AttemptStarted,
                             crate::run::PlanStage::SecondOpinion,
                             &reviewer,
+                            &profile,
                             &canonical_plan,
                             None,
                             repair_attempt,
@@ -1582,7 +1797,7 @@ where
                                         .clone(),
                                     canonical_plan,
                                     execution: reviewer.clone(),
-                                    profile,
+                                    profile: profile.clone(),
                                 })
                             })?;
                         let verdict = parse_second_opinion(&repair).map_err(|second_error| {
@@ -1596,9 +1811,11 @@ where
                 let evidence_input = plan_artifact_bytes(run, &artifact)?;
                 append_plan_invocation(
                     run,
+                    ledger_path,
                     crate::run::EventKind::AttemptFinished,
                     crate::run::PlanStage::SecondOpinion,
                     &reviewer,
+                    &profile,
                     &evidence_input,
                     Some(&opinion_bytes),
                     final_attempt,
@@ -1627,14 +1844,18 @@ where
 )]
 fn append_plan_invocation(
     run: &mut crate::run::RunHandle,
+    ledger_path: &Path,
     kind: crate::run::EventKind,
     stage: crate::run::PlanStage,
     execution: &crate::run::ApprovedExecution,
+    profile: &crate::bursar::RosterProfile,
     input: &[u8],
     output: Option<&[u8]>,
     attempt: u8,
     outcome: &str,
 ) -> Result<(), String> {
+    let input_sha256 = format!("{:x}", Sha256::digest(input));
+    let output_sha256 = output.map(|bytes| format!("{:x}", Sha256::digest(bytes)));
     run.append_event(
         kind,
         crate::run::EventInput {
@@ -1644,8 +1865,8 @@ fn append_plan_invocation(
                 role: "plan".to_string(),
                 stage,
                 execution: execution.clone(),
-                input_sha256: format!("{:x}", Sha256::digest(input)),
-                output_sha256: output.map(|bytes| format!("{:x}", Sha256::digest(bytes))),
+                input_sha256: input_sha256.clone(),
+                output_sha256: output_sha256.clone(),
                 attempt,
                 duration_ms: None,
                 tokens: None,
@@ -1653,7 +1874,56 @@ fn append_plan_invocation(
             ..crate::run::EventInput::default()
         },
     )
-    .map_err(|error| format!("plan invocation evidence: {error}"))
+    .map_err(|error| format!("plan invocation evidence: {error}"))?;
+    if kind != crate::run::EventKind::AttemptFinished {
+        return Ok(());
+    }
+    let plan = run.plan().map_err(|error| error.to_string())?;
+    let complexity = match plan.target.input {
+        crate::run::PlanInput::Bead { complexity, .. }
+        | crate::run::PlanInput::Artifact { complexity, .. } => match complexity {
+            crate::run::PlanComplexity::S => "S",
+            crate::run::PlanComplexity::M => "M",
+            crate::run::PlanComplexity::L => "L",
+            crate::run::PlanComplexity::XL => "XL",
+        },
+    };
+    crate::ledger::append(
+        ledger_path,
+        &crate::ledger::LedgerRow {
+            date: Utc::now().format("%Y-%m-%d").to_string(),
+            model: profile.dispatch_id.clone(),
+            harness: Some(profile.harness.clone()),
+            profile: Some(execution.profile_id.clone()),
+            reasoning_effort: profile.reasoning_effort.clone(),
+            role: "plan".to_string(),
+            job: Some("plan".to_string()),
+            stage: Some(plan_stage_label(stage).to_string()),
+            execution_key: Some(execution.execution_key.clone()),
+            provider: Some(execution.provider_id.clone()),
+            input_sha256: Some(input_sha256),
+            output_sha256,
+            attempt: Some(attempt),
+            outcome: Some(outcome.to_string()),
+            tokens: None,
+            task: run.run_id().to_string(),
+            verify_passed: outcome == "returned",
+            complexity: complexity.to_string(),
+            project: plan.target.repo.clone(),
+            notes: "conductor plan invocation".to_string(),
+            failure_reason: None,
+            duration_ms: None,
+        },
+    )
+    .map_err(|error| format!("plan invocation ledger: {error}"))
+}
+
+fn plan_stage_label(stage: crate::run::PlanStage) -> &'static str {
+    match stage {
+        crate::run::PlanStage::Planner => "planner",
+        crate::run::PlanStage::PeerReview => "peer-review",
+        crate::run::PlanStage::SecondOpinion => "second-opinion",
+    }
 }
 
 fn plan_artifact_bytes(
@@ -2439,6 +2709,10 @@ enabled = true
                     "conductor-plan-reports-{label}-{}",
                     std::process::id()
                 )),
+                ledger_path: std::env::temp_dir().join(format!(
+                    "conductor-plan-ledger-{label}-{}.jsonl",
+                    std::process::id()
+                )),
             },
             config,
             FakeBursar {
@@ -2660,6 +2934,10 @@ enabled = true
                 )),
                 reports_home: std::env::temp_dir().join(format!(
                     "conductor-plan-reports-{label}-{}",
+                    std::process::id()
+                )),
+                ledger_path: std::env::temp_dir().join(format!(
+                    "conductor-plan-ledger-{label}-{}.jsonl",
                     std::process::id()
                 )),
             },
@@ -3193,6 +3471,39 @@ enabled = true
         assert_ne!(calls[0].1.provider_id, calls[2].1.provider_id);
         assert_ne!(calls[1].1.provider_id, calls[2].1.provider_id);
         drop(calls);
+        let ledger_path = paths.ledger_path.clone();
+        assert!(
+            ledger_path.is_file(),
+            "every fake plan backend call must leave a generic ledger artifact"
+        );
+        let ledger_rows = std::fs::read_to_string(&ledger_path)
+            .expect("ledger")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("ledger row"))
+            .collect::<Vec<_>>();
+        assert_eq!(ledger_rows.len(), 3);
+        assert_eq!(
+            ledger_rows
+                .iter()
+                .map(|row| (row["role"].as_str(), row["job"].as_str(), row["stage"].as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("plan"), Some("plan"), Some("planner")),
+                (Some("plan"), Some("plan"), Some("peer-review")),
+                (Some("plan"), Some("plan"), Some("second-opinion")),
+            ]
+        );
+        assert!(ledger_rows.iter().all(|row| {
+            row["profile"].as_str().is_some()
+                && row["execution_key"].as_str().is_some()
+                && row["provider"].as_str().is_some()
+                && row["input_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
+                && row["output_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
+                && row["attempt"] == 1
+                && row["outcome"] == "returned"
+                && row["duration_ms"].is_null()
+                && row["tokens"].is_null()
+        }));
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         let events = crate::run::read_events(&run.events_path()).expect("events");
         let stages = events
@@ -3357,6 +3668,28 @@ enabled = true
             status(&paths, &prepared.run_id).expect("status"),
             "accepted"
         );
+        let rows = std::fs::read_to_string(&paths.ledger_path)
+            .expect("ledger")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("ledger row"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3, "author plus both peer invocations");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row["stage"].as_str(), row["attempt"].as_u64(), row["outcome"].as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("planner"), Some(1), Some("returned")),
+                (Some("peer-review"), Some(1), Some("malformed")),
+                (Some("peer-review"), Some(2), Some("returned")),
+            ]
+        );
+        assert!(rows.iter().all(|row| {
+            row["input_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
+                && row["output_sha256"].as_str().is_some_and(|digest| digest.len() == 64)
+                && row["duration_ms"].is_null()
+                && row["tokens"].is_null()
+        }));
 
         let (temp, paths, config, fake) = plan_fixture("peer-resume-degraded");
         let bursar = StatusSwitchBursar::from_fake(&fake);
@@ -3386,6 +3719,14 @@ enabled = true
             Vec::new(),
         );
         assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &resumed).is_err());
+        let failed_rows = std::fs::read_to_string(&paths.ledger_path)
+            .expect("ledger after failed backend invocation")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("ledger row"))
+            .collect::<Vec<_>>();
+        assert_eq!(failed_rows.len(), 2, "author and failed peer call are durable");
+        assert_eq!(failed_rows[1]["outcome"], "failed");
+        assert!(failed_rows[1]["output_sha256"].is_null());
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         let author_provider = match run.plan().expect("plan").progress {
             crate::run::PlanProgress::AwaitingPeer { ref author, .. } => author.provider_id.clone(),
@@ -3462,6 +3803,7 @@ enabled = true
         assert!(
             !events.iter().any(|event| {
                 event.kind == crate::run::EventKind::AttemptFinished
+                    && event.outcome.as_deref() == Some("returned")
                     && event
                         .plan_invocation
                         .as_ref()
@@ -3522,6 +3864,7 @@ enabled = true
                 .iter()
                 .any(|event| {
                     event.kind == crate::run::EventKind::AttemptFinished
+                        && event.outcome.as_deref() == Some("returned")
                         && event.plan_invocation.as_ref().is_some_and(|evidence| {
                             evidence.stage == crate::run::PlanStage::SecondOpinion
                         })
