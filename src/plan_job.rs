@@ -1300,6 +1300,63 @@ fn finish_exhausted_stage(
     Ok(true)
 }
 
+/// Checks every no-call precondition before persisting the crash/resume
+/// invocation boundary. If an already-persisted boundary is at capacity,
+/// terminalize it rather than propagating a resumable limit error.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the durable invocation boundary needs exact review evidence"
+)]
+fn start_plan_stage_invocation<C: crate::bursar::BursarClient + ?Sized>(
+    run: &mut crate::run::RunHandle,
+    bursar: &C,
+    snapshot: &crate::bursar::RosterSnapshot,
+    ledger_path: &Path,
+    stage: crate::run::PlanStage,
+    execution: &crate::run::ApprovedExecution,
+    profile: &crate::bursar::RosterProfile,
+    input: &[u8],
+) -> Result<u8, String> {
+    recheck_author(bursar, snapshot, execution)?;
+    if finish_exhausted_stage(run, stage)? {
+        return Err(format!(
+            "plan {} attempt limit exhausted",
+            plan_stage_label(stage)
+        ));
+    }
+    let attempt = match run.record_plan_stage_attempt(stage) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            if finish_exhausted_stage(run, stage)? {
+                return Err(format!(
+                    "plan {} attempt limit exhausted: {error}",
+                    plan_stage_label(stage)
+                ));
+            }
+            return Err(format!(
+                "plan {} attempt: {error}",
+                plan_stage_label(stage)
+            ));
+        }
+    };
+    if let Err(error) = append_plan_invocation(
+        run,
+        ledger_path,
+        crate::run::EventKind::AttemptStarted,
+        stage,
+        execution,
+        profile,
+        input,
+        None,
+        attempt,
+        "started",
+    ) {
+        let _ = finish_exhausted_stage(run, stage)?;
+        return Err(error);
+    }
+    Ok(attempt)
+}
+
 /// Runs only the initial author stage after the exact published approval is
 /// present. Peer verdicts and second opinion remain intentionally out of scope.
 #[expect(
@@ -1671,15 +1728,7 @@ where
                     return Err("plan peer-review attempt limit exhausted".to_string());
                 }
                 let (reviewer, degraded) = match peer {
-                    Some(bound) => {
-                        if let Err(error) = recheck_author(bursar, snapshot, &bound) {
-                            run.finish_plan_blocked().map_err(|checkpoint| {
-                                format!("plan blocked after bound peer loss: {checkpoint}")
-                            })?;
-                            return Err(format!("bound plan peer is no longer eligible: {error}"));
-                        }
-                        (bound, false)
-                    }
+                    Some(bound) => (bound, false),
                     None => match select_reviewer(
                         run,
                         router,
@@ -1702,22 +1751,16 @@ where
                 };
                 let profile = profile_for_execution(snapshot, &reviewer)?;
                 let canonical_plan = plan_artifact_bytes(run, &artifact)?;
-                let attempt = run
-                    .record_plan_stage_attempt(crate::run::PlanStage::PeerReview)
-                    .map_err(|error| format!("plan peer attempt: {error}"))?;
-                append_plan_invocation(
+                let attempt = start_plan_stage_invocation(
                     run,
+                    bursar,
+                    snapshot,
                     ledger_path,
-                    crate::run::EventKind::AttemptStarted,
                     crate::run::PlanStage::PeerReview,
                     &reviewer,
                     &profile,
                     &canonical_plan,
-                    None,
-                    attempt,
-                    "started",
                 )?;
-                recheck_author(bursar, snapshot, &reviewer)?;
                 let first = match with_isolated_worktree(repo, &approval.target_head, |worktree| {
                     executor.peer_review(&PlanPeerReviewRequest {
                         worktree: worktree.to_path_buf(),
@@ -1767,22 +1810,16 @@ where
                             attempt,
                             "malformed",
                         )?;
-                        let repair_attempt = run
-                            .record_plan_stage_attempt(crate::run::PlanStage::PeerReview)
-                            .map_err(|error| format!("plan peer repair attempt: {error}"))?;
-                        append_plan_invocation(
+                        let repair_attempt = start_plan_stage_invocation(
                             run,
+                            bursar,
+                            snapshot,
                             ledger_path,
-                            crate::run::EventKind::AttemptStarted,
                             crate::run::PlanStage::PeerReview,
                             &reviewer,
                             &profile,
                             &canonical_plan,
-                            None,
-                            repair_attempt,
-                            "started",
                         )?;
-                        recheck_author(bursar, snapshot, &reviewer)?;
                         let repair =
                             match with_isolated_worktree(repo, &approval.target_head, |worktree| {
                                 executor.peer_review(&PlanPeerReviewRequest {
@@ -1881,10 +1918,6 @@ where
                 if finish_exhausted_stage(run, crate::run::PlanStage::Planner)? {
                     return Err("plan revision attempt limit exhausted".to_string());
                 }
-                recheck_author(bursar, snapshot, &author).map_err(|error| {
-                    let _ = run.finish_plan_blocked();
-                    format!("immutable plan author is no longer eligible for revision: {error}")
-                })?;
                 let profile = profile_for_execution(snapshot, &author)?;
                 let prior_plan = plan_artifact_bytes(run, &artifact)?;
                 let peer_attempt = run
@@ -1901,22 +1934,16 @@ where
                 if !matches!(verdict, crate::run::PeerVerdict::Revise) {
                     return Err("revision state has no persisted revise findings".to_string());
                 }
-                let attempt = run
-                    .record_plan_stage_attempt(crate::run::PlanStage::Planner)
-                    .map_err(|error| format!("plan revision attempt: {error}"))?;
-                append_plan_invocation(
+                let attempt = start_plan_stage_invocation(
                     run,
+                    bursar,
+                    snapshot,
                     ledger_path,
-                    crate::run::EventKind::AttemptStarted,
                     crate::run::PlanStage::Planner,
                     &author,
                     &profile,
                     &prior_plan,
-                    None,
-                    attempt,
-                    "started",
                 )?;
-                recheck_author(bursar, snapshot, &author)?;
                 let first = match with_isolated_worktree(repo, &approval.target_head, |worktree| {
                     executor.revise(&PlanRevisionRequest {
                         worktree: worktree.to_path_buf(),
@@ -1960,25 +1987,16 @@ where
                             attempt,
                             "malformed",
                         )?;
-                        if finish_exhausted_stage(run, crate::run::PlanStage::Planner)? {
-                            return Err("plan revision attempt limit exhausted".to_string());
-                        }
-                        let repair_attempt = run
-                            .record_plan_stage_attempt(crate::run::PlanStage::Planner)
-                            .map_err(|error| format!("plan revision repair attempt: {error}"))?;
-                        append_plan_invocation(
+                        let repair_attempt = start_plan_stage_invocation(
                             run,
+                            bursar,
+                            snapshot,
                             ledger_path,
-                            crate::run::EventKind::AttemptStarted,
                             crate::run::PlanStage::Planner,
                             &author,
                             &profile,
                             &prior_plan,
-                            None,
-                            repair_attempt,
-                            "started",
                         )?;
-                        recheck_author(bursar, snapshot, &author)?;
                         let repair =
                             match with_isolated_worktree(repo, &approval.target_head, |worktree| {
                                 executor.revise(&PlanRevisionRequest {
@@ -2077,14 +2095,6 @@ where
                     return Err("plan second-opinion attempt limit exhausted".to_string());
                 }
                 let reviewer = if let Some(bound) = second {
-                    if let Err(error) = recheck_author(bursar, snapshot, &bound) {
-                        run.finish_plan_blocked().map_err(|checkpoint| {
-                            format!("plan blocked after bound second-opinion loss: {checkpoint}")
-                        })?;
-                        return Err(format!(
-                            "bound plan second opinion is no longer eligible: {error}"
-                        ));
-                    }
                     *bound
                 } else {
                     let (bound, _) = select_reviewer(
@@ -2104,22 +2114,16 @@ where
                 };
                 let profile = profile_for_execution(snapshot, &reviewer)?;
                 let canonical_plan = plan_artifact_bytes(run, &artifact)?;
-                let attempt = run
-                    .record_plan_stage_attempt(crate::run::PlanStage::SecondOpinion)
-                    .map_err(|error| format!("plan second-opinion attempt: {error}"))?;
-                append_plan_invocation(
+                let attempt = start_plan_stage_invocation(
                     run,
+                    bursar,
+                    snapshot,
                     ledger_path,
-                    crate::run::EventKind::AttemptStarted,
                     crate::run::PlanStage::SecondOpinion,
                     &reviewer,
                     &profile,
                     &canonical_plan,
-                    None,
-                    attempt,
-                    "started",
                 )?;
-                recheck_author(bursar, snapshot, &reviewer)?;
                 let first = match with_isolated_worktree(repo, &approval.target_head, |worktree| {
                     executor.second_opinion(&PlanSecondOpinionRequest {
                         worktree: worktree.to_path_buf(),
@@ -2166,27 +2170,16 @@ where
                             attempt,
                             "malformed",
                         )?;
-                        if finish_exhausted_stage(run, crate::run::PlanStage::SecondOpinion)? {
-                            return Err("plan second-opinion attempt limit exhausted".to_string());
-                        }
-                        let repair_attempt = run
-                            .record_plan_stage_attempt(crate::run::PlanStage::SecondOpinion)
-                            .map_err(|error| {
-                                format!("plan second-opinion repair attempt: {error}")
-                            })?;
-                        append_plan_invocation(
+                        let repair_attempt = start_plan_stage_invocation(
                             run,
+                            bursar,
+                            snapshot,
                             ledger_path,
-                            crate::run::EventKind::AttemptStarted,
                             crate::run::PlanStage::SecondOpinion,
                             &reviewer,
                             &profile,
                             &canonical_plan,
-                            None,
-                            repair_attempt,
-                            "started",
                         )?;
-                        recheck_author(bursar, snapshot, &reviewer)?;
                         let repair =
                             match with_isolated_worktree(repo, &approval.target_head, |worktree| {
                                 executor.second_opinion(&PlanSecondOpinionRequest {
@@ -2965,6 +2958,42 @@ mod tests {
             Ok(self.snapshot.clone())
         }
     }
+    struct TransientStatusBursar {
+        snapshot: crate::bursar::RosterSnapshot,
+        status: crate::bursar::StatusReport,
+        status_calls: std::sync::Mutex<usize>,
+        unavailable_on_call: usize,
+    }
+
+    impl TransientStatusBursar {
+        fn from_fake(fake: &FakeBursar, unavailable_on_call: usize) -> Self {
+            Self {
+                snapshot: fake.snapshot.clone(),
+                status: fake.status.clone(),
+                status_calls: std::sync::Mutex::new(0),
+                unavailable_on_call,
+            }
+        }
+    }
+
+    impl crate::bursar::BursarClient for TransientStatusBursar {
+        fn status(&self) -> crate::bursar::Result<crate::bursar::StatusReport> {
+            let mut calls = self.status_calls.lock().expect("status call lock");
+            *calls += 1;
+            let mut status = self.status.clone();
+            if *calls == self.unavailable_on_call {
+                for provider in status.providers.values_mut() {
+                    provider.availability = crate::bursar::Availability::Exhausted;
+                }
+            }
+            Ok(status)
+        }
+
+        fn roster_snapshot(&self) -> crate::bursar::Result<crate::bursar::RosterSnapshot> {
+            Ok(self.snapshot.clone())
+        }
+    }
+
 
     struct CapturingAuthor {
         output: Vec<u8>,
@@ -4685,16 +4714,105 @@ enabled = true
             .filter(|(stage, _)| stage == "peer")
             .map(|(_, execution)| execution.clone())
             .collect::<Vec<_>>();
+
         assert_eq!(peer_calls, vec![bound_peer.clone(), bound_peer]);
         drop(temp);
     }
     #[test]
-    fn bound_peer_loss_after_crash_finishes_blocked_without_replacement() {
+    fn transient_peer_ineligibility_before_repair_does_not_start_a_phantom_attempt() {
+        let (temp, paths, config, fake) = plan_fixture("peer-precall-eligibility");
+        let repo = initialized_repo(&temp);
+        let prepared =
+            prepare(&paths, &config, &fake, implementation_request(repo)).expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let mut run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let approval = load_approval(&run).expect("approval");
+        run.start_plan_authoring(approval.author.clone())
+            .expect("author binding");
+        let artifact = run
+            .capture_plan_artifact(
+                Path::new("artifacts/plan-document.json"),
+                &implementation_document(),
+            )
+            .expect("artifact");
+        run.await_plan_peer(artifact).expect("await peer");
+        drop(run);
+
+        // Peer selection probes each of the three pinned candidates. The fourth
+        // status check clears the first call; the fifth is the repair preflight.
+        let bursar = TransientStatusBursar::from_fake(&fake, 5);
+        let executor = ScriptedExecutor::new(
+            Vec::new(),
+            Vec::new(),
+            vec![Ok(b"bad peer JSON".to_vec()), Ok(peer_approve())],
+            Vec::new(),
+        );
+
+        assert!(
+            dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err(),
+            "a temporarily unavailable bound peer must stop before the repair call"
+        );
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert_eq!(
+            run.plan().expect("plan").stage_attempts.peer_review,
+            1,
+            "only the real malformed peer call may consume capacity"
+        );
+        assert_eq!(
+            executor
+                .calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .filter(|(stage, _)| stage == "peer")
+                .count(),
+            1,
+            "the unavailable repair must not reach the backend"
+        );
+        let peer_starts = crate::run::read_events(&run.events_path())
+            .expect("events")
+            .iter()
+            .filter(|event| {
+                event.kind == crate::run::EventKind::AttemptStarted
+                    && event.plan_invocation.as_ref().is_some_and(|evidence| {
+                        evidence.stage == crate::run::PlanStage::PeerReview
+                    })
+            })
+            .count();
+        assert_eq!(peer_starts, 1, "no phantom invocation-start evidence");
+        drop(run);
+
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor)
+            .expect("restored eligibility resumes the immutable peer binding");
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "accepted");
+        assert_eq!(
+            executor
+                .calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .filter(|(stage, _)| stage == "peer")
+                .count(),
+            2,
+            "exactly the malformed call and its real repair reach the backend"
+        );
+        assert_eq!(
+            plan_ledger_rows(&paths.ledger_path)
+                .iter()
+                .filter(|row| row["stage"] == "peer-review")
+                .map(|row| row["outcome"].as_str())
+                .collect::<Vec<_>>(),
+            vec![Some("malformed"), Some("returned")]
+        );
+    }
+    #[test]
+    fn bound_peer_loss_after_crash_preserves_binding_without_replacement() {
         let (temp, paths, config, fake) = plan_fixture("bound-peer-loss-after-crash");
         let bursar = StatusSwitchBursar::from_fake(&fake);
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
+
             &config,
             &bursar,
             PlanPrepareRequest {
@@ -4731,7 +4849,11 @@ enabled = true
 
         assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
-        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+        assert_eq!(
+            status(&paths, &prepared.run_id).expect("status"),
+            "awaiting_peer",
+            "a transient no-call eligibility failure must remain resumable"
+        );
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         let events = crate::run::read_events(&run.events_path()).expect("events");
         assert!(
@@ -4753,7 +4875,7 @@ enabled = true
     }
 
     #[test]
-    fn unbound_second_opinion_candidate_exhaustion_finishes_blocked_without_call() {
+    fn second_opinion_loss_after_binding_preserves_binding_without_call() {
         let (temp, paths, config, fake) = plan_fixture("unbound-second-exhaustion");
         let bursar = StatusSwitchBursar::from_fake(&fake);
         let repo = initialized_repo(&temp);
@@ -4795,7 +4917,7 @@ enabled = true
 
         assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
-        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "awaiting_second_opinion");
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         assert!(
             !crate::run::read_events(&run.events_path())
@@ -5104,6 +5226,7 @@ enabled = true
     fn revision_malformed_attempt_limit_is_terminal_and_nonresumable() {
         assert_revision_attempt_exhaustion(
             "revision-malformed-exhaustion",
+
             Ok(b"bad revision JSON".to_vec()),
             "malformed",
         );
