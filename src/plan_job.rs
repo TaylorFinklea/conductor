@@ -1154,14 +1154,21 @@ mod tests {
         }
     }
 
-    struct FakeAuthor(Vec<Vec<u8>>);
+    struct FakeAuthor(std::sync::Mutex<Vec<Vec<u8>>>);
+
+    impl FakeAuthor {
+        fn new(outputs: Vec<Vec<u8>>) -> Self {
+            Self(std::sync::Mutex::new(outputs))
+        }
+    }
 
     impl PlanAuthor for FakeAuthor {
         fn author(&self, _request: &PlanAuthorRequest) -> Result<Vec<u8>, String> {
-            self.0
-                .first()
-                .cloned()
-                .ok_or_else(|| "fake author has no output".to_string())
+            let mut outputs = self.0.lock().map_err(|_| "fake author lock".to_string())?;
+            if outputs.is_empty() {
+                return Err("fake author has no output".to_string());
+            }
+            Ok(outputs.remove(0))
         }
     }
 
@@ -1359,7 +1366,7 @@ enabled = true
         )
         .expect("prepare");
         approve(&paths, &prepared.run_id);
-        let author = FakeAuthor(vec![br#"{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()]);
+        let author = FakeAuthor::new(vec![br#"{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()]);
         dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("dispatch");
         assert_eq!(
             status(&paths, &prepared.run_id).expect("status"),
@@ -1395,7 +1402,7 @@ enabled = true
         )
         .expect("prepare");
         approve(&paths, &prepared.run_id);
-        let author = FakeAuthor(vec![br#"{"schema":"conductor/plan-document@1","kind":"spec","title":"Spec","context":"Context","goals":["Goal"],"constraints":["Invariant"],"requirements":["Requirement"],"acceptance":["Acceptance"],"verification":["cargo test"],"non_goals":[],"risks":[],"assumptions":[],"open_questions":["Needs operator answer"]}"#.to_vec()]);
+        let author = FakeAuthor::new(vec![br#"{"schema":"conductor/plan-document@1","kind":"spec","title":"Spec","context":"Context","goals":["Goal"],"constraints":["Invariant"],"requirements":["Requirement"],"acceptance":["Acceptance"],"verification":["cargo test"],"non_goals":[],"risks":[],"assumptions":[],"open_questions":["Needs operator answer"]}"#.to_vec()]);
         dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("dispatch");
         assert_eq!(
             status(&paths, &prepared.run_id).expect("status"),
