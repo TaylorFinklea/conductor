@@ -1216,7 +1216,10 @@ impl RunHandle {
             ));
         }
         let work = self.work_mut("recording review resume budget")?;
-        if !matches!(work.stage, WorkStage::Implementing | WorkStage::PendingReview) {
+        if !matches!(
+            work.stage,
+            WorkStage::Implementing | WorkStage::PendingReview
+        ) {
             return Err(RunError::new(
                 "review resume budget requires resumable work",
             ));
@@ -1378,7 +1381,9 @@ fn validate_terminal_event(event: &RunEvent) -> Result<()> {
         .filter(|outcome| !outcome.trim().is_empty())
         .ok_or_else(|| RunError::new("terminal event has no outcome"))?;
     if outcome != outcome.trim() {
-        return Err(RunError::new("terminal event outcome has surrounding whitespace"));
+        return Err(RunError::new(
+            "terminal event outcome has surrounding whitespace",
+        ));
     }
     if event.profile_id.is_some() {
         return Err(RunError::new("terminal event must not name a profile"));
@@ -1422,10 +1427,7 @@ fn reconcile_terminal_manifest(
             "unfinished manifest outcome conflicts with terminal event outcome",
         ));
     }
-    if let RunDetails::Work {
-        state: Some(work),
-    } = &mut manifest.details
-    {
+    if let RunDetails::Work { state: Some(work) } = &mut manifest.details {
         work.stage = WorkStage::Completed;
     }
     for artifact in &terminal.artifact_refs {
@@ -1436,8 +1438,9 @@ fn reconcile_terminal_manifest(
     manifest.lifecycle = RunLifecycle::Finished;
     manifest.outcome.clone_from(&terminal.outcome);
     manifest.updated_at = Utc::now().to_rfc3339();
-    let mut bytes = serde_json::to_vec_pretty(manifest)
-        .map_err(|error| RunError::new(format!("failed to serialize recovered manifest: {error}")))?;
+    let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
+        RunError::new(format!("failed to serialize recovered manifest: {error}"))
+    })?;
     bytes.push(b'\n');
     atomic_replace(&dir.join("manifest.json"), &bytes)
 }
@@ -2584,16 +2587,17 @@ mod tests {
     fn run_event_resume_repairs_interrupted_pending_review_checkpoint() {
         let temp = TempDir::new("resume-pending-review-event");
         let mut request = new_run_request();
-        request.work = Some(WorkState { cycle_id: "cycle-20260717-015903".to_string(),
-        authorization_sha256: "b".repeat(64),
-        before_head: Some("d".repeat(40)),
-        owner_pid: None,
-        worker_pgid: None,
-        worker_profile: None,
-        worker_commit: None,
-        mechanical: None,
-        stage: WorkStage::Implementing,
-        review_resume_budget_secs: None,
+        request.work = Some(WorkState {
+            cycle_id: "cycle-20260717-015903".to_string(),
+            authorization_sha256: "b".repeat(64),
+            before_head: Some("d".repeat(40)),
+            owner_pid: None,
+            worker_pgid: None,
+            worker_profile: None,
+            worker_commit: None,
+            mechanical: None,
+            stage: WorkStage::Implementing,
+            review_resume_budget_secs: None,
         });
         let mut handle = RunHandle::create_at(temp.path(), RunJob::Work, request, fixed_now())
             .expect("create work run");
@@ -2687,14 +2691,16 @@ mod tests {
             reopened.terminal_transition().expect("read transition"),
             Some(transition)
         );
-        assert!(reopened
-            .write_terminal_transition(&TerminalTransition {
-                action: TerminalTransitionAction::Close,
-                reason: "different reason".to_string(),
-                metadata: None,
-                comment: None,
-            })
-            .is_err());
+        assert!(
+            reopened
+                .write_terminal_transition(&TerminalTransition {
+                    action: TerminalTransitionAction::Close,
+                    reason: "different reason".to_string(),
+                    metadata: None,
+                    comment: None,
+                })
+                .is_err()
+        );
     }
 
     #[test]
@@ -2729,7 +2735,10 @@ mod tests {
         let reopened_again =
             RunHandle::open(temp.path(), &run_id).expect("terminal recovery is idempotent");
         assert_eq!(reopened_again.manifest().lifecycle, RunLifecycle::Finished);
-        assert_eq!(reopened_again.manifest().outcome.as_deref(), Some("verified"));
+        assert_eq!(
+            reopened_again.manifest().outcome.as_deref(),
+            Some("verified")
+        );
     }
 
     #[test]
@@ -2889,16 +2898,17 @@ mod tests {
 
     fn implementing_request_with_worker_pgid(worker_pgid: Option<u32>) -> NewRun {
         let mut request = new_run_request();
-        request.work = Some(WorkState { cycle_id: "cycle-1".to_string(),
-        authorization_sha256: "b".repeat(64),
-        before_head: None,
-        owner_pid: None,
-        worker_pgid,
-        worker_profile: None,
-        worker_commit: None,
-        mechanical: None,
-        stage: WorkStage::Implementing,
-        review_resume_budget_secs: None,
+        request.work = Some(WorkState {
+            cycle_id: "cycle-1".to_string(),
+            authorization_sha256: "b".repeat(64),
+            before_head: None,
+            owner_pid: None,
+            worker_pgid,
+            worker_profile: None,
+            worker_commit: None,
+            mechanical: None,
+            stage: WorkStage::Implementing,
+            review_resume_budget_secs: None,
         });
         request
     }
@@ -3081,16 +3091,17 @@ mod tests {
         let make_request = |bead: &str| {
             let mut request = new_run_request();
             request.target.bead = Some(bead.to_string());
-            request.work = Some(WorkState { cycle_id: cycle_id.to_string(),
-            authorization_sha256: "b".repeat(64),
-            before_head: None,
-            owner_pid: None,
-            worker_pgid: None,
-            worker_profile: None,
-            worker_commit: None,
-            mechanical: None,
-            stage: WorkStage::Implementing,
-            review_resume_budget_secs: None,
+            request.work = Some(WorkState {
+                cycle_id: cycle_id.to_string(),
+                authorization_sha256: "b".repeat(64),
+                before_head: None,
+                owner_pid: None,
+                worker_pgid: None,
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                stage: WorkStage::Implementing,
+                review_resume_budget_secs: None,
             });
             request
         };
@@ -3132,16 +3143,17 @@ mod tests {
         let make_request = || {
             let mut request = new_run_request();
             request.target.bead = Some("gen-bead".to_string());
-            request.work = Some(WorkState { cycle_id: cycle_id.to_string(),
-            authorization_sha256: "b".repeat(64),
-            before_head: Some("d".repeat(40)),
-            owner_pid: Some(123),
-            worker_pgid: Some(456),
-            worker_profile: None,
-            worker_commit: None,
-            mechanical: None,
-            stage: WorkStage::Implementing,
-            review_resume_budget_secs: None,
+            request.work = Some(WorkState {
+                cycle_id: cycle_id.to_string(),
+                authorization_sha256: "b".repeat(64),
+                before_head: Some("d".repeat(40)),
+                owner_pid: Some(123),
+                worker_pgid: Some(456),
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                stage: WorkStage::Implementing,
+                review_resume_budget_secs: None,
             });
             request
         };
@@ -3205,16 +3217,17 @@ mod tests {
         let make_request = || {
             let mut request = new_run_request();
             request.target.bead = Some("conflict-bead".to_string());
-            request.work = Some(WorkState { cycle_id: cycle_id.to_string(),
-            authorization_sha256: "b".repeat(64),
-            before_head: None,
-            owner_pid: None,
-            worker_pgid: None,
-            worker_profile: None,
-            worker_commit: None,
-            mechanical: None,
-            stage: WorkStage::Implementing,
-            review_resume_budget_secs: None,
+            request.work = Some(WorkState {
+                cycle_id: cycle_id.to_string(),
+                authorization_sha256: "b".repeat(64),
+                before_head: None,
+                owner_pid: None,
+                worker_pgid: None,
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                stage: WorkStage::Implementing,
+                review_resume_budget_secs: None,
             });
             request
         };
