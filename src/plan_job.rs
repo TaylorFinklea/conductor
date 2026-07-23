@@ -1317,7 +1317,14 @@ fn start_plan_stage_invocation<C: crate::bursar::BursarClient + ?Sized>(
     profile: &crate::bursar::RosterProfile,
     input: &[u8],
 ) -> Result<u8, String> {
-    recheck_author(bursar, snapshot, execution)?;
+    if let Err(error) = recheck_author(bursar, snapshot, execution) {
+        run.finish_plan_blocked()
+            .map_err(|checkpoint| format!("plan blocked after no-call eligibility loss: {checkpoint}"))?;
+        return Err(format!(
+            "plan {} execution is no longer eligible: {error}",
+            plan_stage_label(stage)
+        ));
+    }
     if finish_exhausted_stage(run, stage)? {
         return Err(format!(
             "plan {} attempt limit exhausted",
@@ -1728,7 +1735,15 @@ where
                     return Err("plan peer-review attempt limit exhausted".to_string());
                 }
                 let (reviewer, degraded) = match peer {
-                    Some(bound) => (bound, false),
+                    Some(bound) => {
+                        if let Err(error) = recheck_author(bursar, snapshot, &bound) {
+                            run.finish_plan_blocked().map_err(|checkpoint| {
+                                format!("plan blocked after bound peer loss: {checkpoint}")
+                            })?;
+                            return Err(format!("bound plan peer is no longer eligible: {error}"));
+                        }
+                        (bound, false)
+                    }
                     None => match select_reviewer(
                         run,
                         router,
@@ -1918,6 +1933,10 @@ where
                 if finish_exhausted_stage(run, crate::run::PlanStage::Planner)? {
                     return Err("plan revision attempt limit exhausted".to_string());
                 }
+                recheck_author(bursar, snapshot, &author).map_err(|error| {
+                    let _ = run.finish_plan_blocked();
+                    format!("immutable plan author is no longer eligible for revision: {error}")
+                })?;
                 let profile = profile_for_execution(snapshot, &author)?;
                 let prior_plan = plan_artifact_bytes(run, &artifact)?;
                 let peer_attempt = run
@@ -2095,6 +2114,14 @@ where
                     return Err("plan second-opinion attempt limit exhausted".to_string());
                 }
                 let reviewer = if let Some(bound) = second {
+                    if let Err(error) = recheck_author(bursar, snapshot, &bound) {
+                        run.finish_plan_blocked().map_err(|checkpoint| {
+                            format!("plan blocked after bound second-opinion loss: {checkpoint}")
+                        })?;
+                        return Err(format!(
+                            "bound plan second opinion is no longer eligible: {error}"
+                        ));
+                    }
                     *bound
                 } else {
                     let (bound, _) = select_reviewer(
@@ -2952,41 +2979,6 @@ mod tests {
     impl crate::bursar::BursarClient for StatusSwitchBursar {
         fn status(&self) -> crate::bursar::Result<crate::bursar::StatusReport> {
             Ok(self.status.lock().expect("status lock").clone())
-        }
-
-        fn roster_snapshot(&self) -> crate::bursar::Result<crate::bursar::RosterSnapshot> {
-            Ok(self.snapshot.clone())
-        }
-    }
-    struct TransientStatusBursar {
-        snapshot: crate::bursar::RosterSnapshot,
-        status: crate::bursar::StatusReport,
-        status_calls: std::sync::Mutex<usize>,
-        unavailable_on_call: usize,
-    }
-
-    impl TransientStatusBursar {
-        fn from_fake(fake: &FakeBursar, unavailable_on_call: usize) -> Self {
-            Self {
-                snapshot: fake.snapshot.clone(),
-                status: fake.status.clone(),
-                status_calls: std::sync::Mutex::new(0),
-                unavailable_on_call,
-            }
-        }
-    }
-
-    impl crate::bursar::BursarClient for TransientStatusBursar {
-        fn status(&self) -> crate::bursar::Result<crate::bursar::StatusReport> {
-            let mut calls = self.status_calls.lock().expect("status call lock");
-            *calls += 1;
-            let mut status = self.status.clone();
-            if *calls == self.unavailable_on_call {
-                for provider in status.providers.values_mut() {
-                    provider.availability = crate::bursar::Availability::Exhausted;
-                }
-            }
-            Ok(status)
         }
 
         fn roster_snapshot(&self) -> crate::bursar::Result<crate::bursar::RosterSnapshot> {
@@ -4719,94 +4711,7 @@ enabled = true
         drop(temp);
     }
     #[test]
-    fn transient_peer_ineligibility_before_repair_does_not_start_a_phantom_attempt() {
-        let (temp, paths, config, fake) = plan_fixture("peer-precall-eligibility");
-        let repo = initialized_repo(&temp);
-        let prepared =
-            prepare(&paths, &config, &fake, implementation_request(repo)).expect("prepare");
-        approve(&paths, &prepared.run_id);
-        let mut run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
-        let approval = load_approval(&run).expect("approval");
-        run.start_plan_authoring(approval.author.clone())
-            .expect("author binding");
-        let artifact = run
-            .capture_plan_artifact(
-                Path::new("artifacts/plan-document.json"),
-                &implementation_document(),
-            )
-            .expect("artifact");
-        run.await_plan_peer(artifact).expect("await peer");
-        drop(run);
-
-        // Peer selection probes each of the three pinned candidates. The fourth
-        // status check clears the first call; the fifth is the repair preflight.
-        let bursar = TransientStatusBursar::from_fake(&fake, 5);
-        let executor = ScriptedExecutor::new(
-            Vec::new(),
-            Vec::new(),
-            vec![Ok(b"bad peer JSON".to_vec()), Ok(peer_approve())],
-            Vec::new(),
-        );
-
-        assert!(
-            dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err(),
-            "a temporarily unavailable bound peer must stop before the repair call"
-        );
-        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
-        assert_eq!(
-            run.plan().expect("plan").stage_attempts.peer_review,
-            1,
-            "only the real malformed peer call may consume capacity"
-        );
-        assert_eq!(
-            executor
-                .calls
-                .lock()
-                .expect("calls")
-                .iter()
-                .filter(|(stage, _)| stage == "peer")
-                .count(),
-            1,
-            "the unavailable repair must not reach the backend"
-        );
-        let peer_starts = crate::run::read_events(&run.events_path())
-            .expect("events")
-            .iter()
-            .filter(|event| {
-                event.kind == crate::run::EventKind::AttemptStarted
-                    && event.plan_invocation.as_ref().is_some_and(|evidence| {
-                        evidence.stage == crate::run::PlanStage::PeerReview
-                    })
-            })
-            .count();
-        assert_eq!(peer_starts, 1, "no phantom invocation-start evidence");
-        drop(run);
-
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor)
-            .expect("restored eligibility resumes the immutable peer binding");
-        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "accepted");
-        assert_eq!(
-            executor
-                .calls
-                .lock()
-                .expect("calls")
-                .iter()
-                .filter(|(stage, _)| stage == "peer")
-                .count(),
-            2,
-            "exactly the malformed call and its real repair reach the backend"
-        );
-        assert_eq!(
-            plan_ledger_rows(&paths.ledger_path)
-                .iter()
-                .filter(|row| row["stage"] == "peer-review")
-                .map(|row| row["outcome"].as_str())
-                .collect::<Vec<_>>(),
-            vec![Some("malformed"), Some("returned")]
-        );
-    }
-    #[test]
-    fn bound_peer_loss_after_crash_preserves_binding_without_replacement() {
+    fn bound_peer_loss_after_crash_is_terminal_and_nonresumable() {
         let (temp, paths, config, fake) = plan_fixture("bound-peer-loss-after-crash");
         let bursar = StatusSwitchBursar::from_fake(&fake);
         let repo = initialized_repo(&temp);
@@ -4849,13 +4754,19 @@ enabled = true
 
         assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
-        assert_eq!(
-            status(&paths, &prepared.run_id).expect("status"),
-            "awaiting_peer",
-            "a transient no-call eligibility failure must remain resumable"
-        );
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
         let events = crate::run::read_events(&run.events_path()).expect("events");
+        assert!(matches!(
+            events.last(),
+            Some(crate::run::RunEvent {
+                kind: crate::run::EventKind::RunFinished,
+                outcome: Some(outcome),
+                ..
+            }) if outcome == "blocked"
+        ));
         assert!(
             !events
                 .iter()
@@ -4875,7 +4786,7 @@ enabled = true
     }
 
     #[test]
-    fn second_opinion_loss_after_binding_preserves_binding_without_call() {
+    fn second_opinion_loss_after_binding_is_terminal_and_nonresumable() {
         let (temp, paths, config, fake) = plan_fixture("unbound-second-exhaustion");
         let bursar = StatusSwitchBursar::from_fake(&fake);
         let repo = initialized_repo(&temp);
@@ -4917,7 +4828,20 @@ enabled = true
 
         assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
-        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "awaiting_second_opinion");
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert!(matches!(
+            crate::run::read_events(&run.events_path())
+                .expect("events")
+                .last(),
+            Some(crate::run::RunEvent {
+                kind: crate::run::EventKind::RunFinished,
+                outcome: Some(outcome),
+                ..
+            }) if outcome == "blocked"
+        ));
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         assert!(
             !crate::run::read_events(&run.events_path())
@@ -4932,6 +4856,72 @@ enabled = true
                 }),
             "the exhausted unbound second opinion must not produce a successful invocation"
         );
+    }
+
+    #[test]
+    fn bound_revision_author_loss_is_terminal_and_nonresumable() {
+        let (temp, paths, config, fake) = plan_fixture("bound-revision-loss");
+        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            implementation_request(initialized_repo(&temp)),
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let mut run =
+            crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let approval = load_approval(&run).expect("approval");
+        run.start_plan_authoring(approval.author.clone())
+            .expect("author binding");
+        let artifact = run
+            .capture_plan_artifact(
+                Path::new("artifacts/plan-document.json"),
+                &implementation_document(),
+            )
+            .expect("artifact");
+        run.await_plan_peer(artifact).expect("await peer");
+        let peer = run
+            .plan()
+            .expect("plan")
+            .routes
+            .stages
+            .iter()
+            .find(|route| route.stage == crate::run::PlanStage::PeerReview)
+            .and_then(|route| {
+                route
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.provider_id != approval.author.provider_id)
+            })
+            .cloned()
+            .expect("provider-distinct peer");
+        run.capture_plan_artifact(Path::new("artifacts/peer-review-0.json"), &peer_revise())
+            .expect("peer findings");
+        run.record_plan_peer_verdict(peer, crate::run::PeerVerdict::Revise, false)
+            .expect("revision state");
+        bursar.exhaust(&approval.author.provider_id);
+        drop(run);
+        let executor = ScriptedExecutor::new(Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let calls_before = executor.calls.lock().expect("calls").len();
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert!(matches!(
+            crate::run::read_events(&run.events_path())
+                .expect("events")
+                .last(),
+            Some(crate::run::RunEvent {
+                kind: crate::run::EventKind::RunFinished,
+                outcome: Some(outcome),
+                ..
+            }) if outcome == "blocked"
+        ));
     }
 
     #[test]
