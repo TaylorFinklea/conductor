@@ -823,6 +823,34 @@ fn valid_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+/// Validates the shipped plan policy against one exact Bursar v2 snapshot
+/// without preparing a run, allocating a scheduler turn, or making a model
+/// call. The initial pool must support every possible author as a spec author:
+/// a provider-distinct peer and a third, pairwise-distinct final opinion.
+pub(crate) fn validate_initial_policy(
+    config: &crate::config::Config,
+    snapshot: &crate::bursar::RosterSnapshot,
+) -> Result<(), String> {
+    let policy = crate::role_routing::RoutingPolicy::from_config(config, snapshot)
+        .map_err(|error| format!("role policy: {error}"))?;
+    let role = crate::role_routing::RoleId::new("plan")
+        .map_err(|error| format!("planner role: {error}"))?;
+    let constraints = planner_constraints(snapshot, crate::config::Tier::Lead)?;
+    crate::role_routing::validate_preapproval_contingencies_for_snapshot(
+        &policy,
+        snapshot,
+        &role,
+        &constraints,
+        true,
+    )
+    .map_err(|error| format!("plan team contingency: {error}"))?;
+    crate::run::RevisionLimit::new(config.budgets.max_plan_revisions)
+        .map_err(|error| format!("plan revision policy: {error}"))?;
+    crate::run::StageAttemptLimit::new(2)
+        .map_err(|error| format!("plan stage-attempt policy: {error}"))?;
+    Ok(())
+}
+
 fn planner_constraints(
     snapshot: &crate::bursar::RosterSnapshot,
     minimum_tier: crate::config::Tier,
@@ -2386,6 +2414,38 @@ enabled = true
                 },
             },
         )
+    }
+    #[test]
+    fn initial_policy_preflight_accepts_every_author_peer_and_spec_team_contingency() {
+        let (_temp, _paths, config, bursar) = plan_fixture("initial-policy-preflight");
+
+        validate_initial_policy(&config, &bursar.snapshot)
+            .expect("three provider plan pool is valid for every author, peer, and spec team");
+    }
+    #[test]
+    fn initial_policy_preflight_rejects_a_spec_pool_without_three_provider_contingencies() {
+        let (_temp, _paths, _config, bursar) = plan_fixture("initial-policy-two-provider");
+        let two_provider_config = crate::config::parse_str(
+            r#"
+[[role_binding]]
+role = "plan"
+profile_id = "planner-a"
+weight = 60
+enabled = true
+
+[[role_binding]]
+role = "plan"
+profile_id = "planner-b"
+weight = 40
+enabled = true
+"#,
+        )
+        .expect("two-provider policy parses before cross-provider preflight");
+
+        let error = validate_initial_policy(&two_provider_config, &bursar.snapshot)
+            .expect_err("spec policy needs a third provider contingency");
+
+        assert!(error.contains("three-way team"), "{error}");
     }
 
     struct TestDir(PathBuf);

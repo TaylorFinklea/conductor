@@ -71,6 +71,9 @@ max_external_dispatches = 4
 unknown_429_cooldown = 15
 item_wall_clock_mins = 45
 cycle_wall_clock_mins = 90
+# Plan requests default to one peer-requested revision; the parser hard-caps
+# any request at three, and each plan stage has a nonzero attempt limit.
+max_plan_revisions = 1
 
 [verify]
 # orchestra judge model — always passed explicitly (never trust the default).

@@ -622,56 +622,77 @@ impl RoleRouter {
         let snapshot = self.snapshot.as_ref().ok_or_else(|| {
             RoleRoutingError::new("contingency validation requires a pinned Bursar roster snapshot")
         })?;
-        let mut candidates = Vec::<String>::new();
-        for binding in self.policy.bindings_for(role_id) {
-            let profile = snapshot
-                .profiles
-                .iter()
-                .find(|profile| profile.profile_id == binding.profile_id.as_str())
-                .ok_or_else(|| {
-                    RoleRoutingError::new(
-                        "contingency validation found a policy profile absent from pinned snapshot",
-                    )
-                })?;
-            let provider = snapshot
-                .providers
-                .iter()
-                .find(|provider| provider.provider_id == profile.provider_id)
-                .ok_or_else(|| {
-                    RoleRoutingError::new(
-                        "contingency validation found a profile without pinned provider",
-                    )
-                })?;
-            let execution = approved_execution(profile, provider);
-            if hard_rejection_reasons(profile, provider, role_id, constraints, &execution)
-                .is_empty()
-            {
-                candidates.push(profile.provider_id.clone());
-            }
+        validate_preapproval_contingencies_for_snapshot(
+            &self.policy,
+            snapshot,
+            role_id,
+            constraints,
+            require_three_way_team,
+        )
+    }
+}
+
+/// Validates author/reviewer contingencies from a Bursar snapshot without
+/// allocating a scheduler reservation. This is used by both plan preparation
+/// and config activation preflight so approval cannot be the first place a
+/// broken initial team is discovered.
+pub(crate) fn validate_preapproval_contingencies_for_snapshot(
+    policy: &RoutingPolicy,
+    snapshot: &crate::bursar::RosterSnapshot,
+    role_id: &RoleId,
+    constraints: &HardEligibility,
+    require_three_way_team: bool,
+) -> Result<()> {
+    let mut candidates = Vec::<String>::new();
+    for binding in policy.bindings_for(role_id) {
+        let profile = snapshot
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_id == binding.profile_id.as_str())
+            .ok_or_else(|| {
+                RoleRoutingError::new(
+                    "contingency validation found a policy profile absent from pinned snapshot",
+                )
+            })?;
+        let provider = snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == profile.provider_id)
+            .ok_or_else(|| {
+                RoleRoutingError::new(
+                    "contingency validation found a profile without pinned provider",
+                )
+            })?;
+        let execution = approved_execution(profile, provider);
+        if hard_rejection_reasons(profile, provider, role_id, constraints, &execution).is_empty() {
+            candidates.push(profile.provider_id.clone());
         }
-        if candidates.is_empty() {
+    }
+    if candidates.is_empty() {
+        return Err(RoleRoutingError::new(
+            "preapproval contingency has no hard-eligible planner candidate",
+        ));
+    }
+    for author_provider in &candidates {
+        let distinct = candidates
+            .iter()
+            .filter(|provider| *provider != author_provider)
+            .collect::<BTreeSet<_>>();
+        if distinct.is_empty() {
             return Err(RoleRoutingError::new(
-                "preapproval contingency has no hard-eligible planner candidate",
+                "planner candidate lacks a legal provider-distinct peer contingency",
             ));
         }
-        for author_provider in &candidates {
-            let distinct = candidates
-                .iter()
-                .filter(|provider| *provider != author_provider)
-                .collect::<BTreeSet<_>>();
-            if distinct.is_empty() {
-                return Err(RoleRoutingError::new(
-                    "planner candidate lacks a legal provider-distinct peer contingency",
-                ));
-            }
-            if require_three_way_team && distinct.len() < 2 {
-                return Err(RoleRoutingError::new(
-                    "spec planner candidate lacks a legal provider-distinct three-way team",
-                ));
-            }
+        if require_three_way_team && distinct.len() < 2 {
+            return Err(RoleRoutingError::new(
+                "spec planner candidate lacks a legal provider-distinct three-way team",
+            ));
         }
-        Ok(())
     }
+    Ok(())
+}
+
+impl RoleRouter {
     pub(crate) fn commit(&self, reservation: &Reservation) -> Result<Reservation> {
         self.transition(reservation, ReservationState::Committed)
     }

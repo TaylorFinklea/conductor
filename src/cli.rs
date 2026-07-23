@@ -1432,6 +1432,21 @@ fn run_config_check(it: &mut std::vec::IntoIter<String>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let pinned_snapshot =
+        match crate::bursar::parse_roster_snapshot(&resolved_roster.snapshot_bytes) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                eprintln!("bursar roster snapshot: invalid — {error}");
+                return ExitCode::from(2);
+            }
+        };
+    if let Err(error) = crate::plan_job::validate_initial_policy(&cfg, &pinned_snapshot) {
+        eprintln!("plan policy preflight: invalid — {error}");
+        return ExitCode::from(2);
+    }
+    println!(
+        "plan policy: valid (every author has a provider-distinct peer and pairwise-distinct spec team)"
+    );
     println!(
         "config: valid ({} Bursar profiles; snapshot source {}#{}, policy {})",
         resolved_roster.roster.len(),
