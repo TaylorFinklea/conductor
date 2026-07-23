@@ -77,6 +77,9 @@ pub(crate) struct VerifyRequest {
     /// A worker commit already promoted into canonical history cannot be
     /// safely released for reimplementation on a verification failure.
     pub(crate) preserve_claim_on_failure: bool,
+    /// The dispatch cycle owns a durable run artifact and must apply a
+    /// terminal release only after persisting terminal transition evidence.
+    pub(crate) defer_claim_release: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -545,7 +548,7 @@ fn fail_with_review<B: BdClient + ?Sized>(
     review: Option<ReviewRecord>,
     review_attempts: Vec<ReviewRecord>,
 ) -> Result<VerifyOutcome> {
-    if !request.preserve_claim_on_failure {
+    if !request.preserve_claim_on_failure && !request.defer_claim_release {
         bd.release(&request.repo, &request.issue.id)?;
     }
     let comment = format!(
@@ -1438,6 +1441,32 @@ mod tests {
     }
 
     #[test]
+    fn deferred_failure_does_not_release_before_dispatch_persists_terminal_run() {
+        let temp = TempDir::new("deferred-failure-terminal-order");
+        let mut request = request(
+            temp.path(),
+            issue(false),
+            verify_config(false),
+            Some("same"),
+        );
+        request.defer_claim_release = true;
+        let bd = FakeBdClient::new(&request.issue);
+        let exec = FakeExec::new(vec![]);
+        let commits = FakeCommits::new([Some("same")]);
+
+        let outcome = run_with_backoff(&bd, &exec, &commits, &request, Duration::ZERO)
+            .expect("verify failure remains reportable");
+
+        assert_eq!(outcome.decision, VerifyDecision::Failed);
+        assert!(
+            !bd.events()
+                .iter()
+                .any(|event| matches!(event, BdEvent::Release { .. })),
+            "dispatch must persist its terminal transition before any release",
+        );
+    }
+
+    #[test]
     fn verify_refuses_foreign_head_instead_of_verifying_it_for_the_worker() {
         let temp = TempDir::new("foreign-worker-commit");
         let mut request = request(
@@ -1736,13 +1765,9 @@ mod tests {
             item_tier_floor: Tier::Junior,
         };
 
-        let deferred = run_review_stage_deferred(
-            &exec,
-            &request,
-            &settings,
-            Duration::from_secs(1),
-        )
-        .expect("review verdict is recorded without a Bead write");
+        let deferred =
+            run_review_stage_deferred(&exec, &request, &settings, Duration::from_secs(1))
+                .expect("review verdict is recorded without a Bead write");
 
         assert_eq!(deferred.outcome.decision, VerifyDecision::Passed);
         assert_eq!(
@@ -1778,9 +1803,8 @@ mod tests {
             item_tier_floor: Tier::Junior,
         };
 
-        let deferred =
-            run_review_stage_deferred_until(&exec, &request, &settings, Instant::now())
-                .expect("deadline exhaustion is a resumable review result");
+        let deferred = run_review_stage_deferred_until(&exec, &request, &settings, Instant::now())
+            .expect("deadline exhaustion is a resumable review result");
 
         assert_eq!(deferred.outcome.decision, VerifyDecision::PendingReview);
         assert_eq!(deferred.outcome.review_dispatches, 0);
@@ -2428,6 +2452,7 @@ mod tests {
             worker_commit: Some("after".to_string()),
             before_head: before_head.map(str::to_string),
             preserve_claim_on_failure: false,
+            defer_claim_release: false,
         }
     }
 

@@ -352,16 +352,11 @@ pub(crate) fn run_dispatch_cycle<
         }
     }
 
-    let completion = format!("complete {cycle_id}: verified {verified}/{dispatched}, failed {failed}");
-    let final_report_error = patch_live(
-        live,
-        &report_path,
-        cycle_start,
-        completion,
-        Some(1.0),
-    )
-    .err()
-    .or_else(|| patch_status_if_present(&report_path, ReportStatus::Done).err());
+    let completion =
+        format!("complete {cycle_id}: verified {verified}/{dispatched}, failed {failed}");
+    let final_report_error = patch_live(live, &report_path, cycle_start, completion, Some(1.0))
+        .err()
+        .or_else(|| patch_status_if_present(&report_path, ReportStatus::Done).err());
     if report_write_failures.is_empty() {
         if let Some(error) = final_report_error {
             return Err(error);
@@ -2292,6 +2287,7 @@ fn complete_worker_verification<
             worker_attempt.result.status,
             dispatch::DispatchStatus::Success
         ),
+        defer_claim_release: true,
     };
     let review = ReviewSettings {
         config: cfg.review.clone(),
@@ -2299,8 +2295,13 @@ fn complete_worker_verification<
         dispatched_model: active_roster.clone(),
         item_tier_floor: extracted.routing.tier_floor,
     };
-    let mechanical =
-        match verify::run_mechanical_until(bd, exec, commits, &verify_request, deadline.instant) {
+    let mechanical = match verify::run_mechanical_until(
+        bd,
+        exec,
+        commits,
+        &verify_request,
+        deadline.instant,
+    ) {
         Ok(outcome) => outcome,
         Err(error) => {
             return Err(DispatchCycleError::recovery_required(format!(
@@ -2323,9 +2324,13 @@ fn complete_worker_verification<
                     outcome.summary
                 )));
             }
-            run_artifacts
-                .finish(verify_decision_label(outcome.decision))
-                .map_err(run_artifact_error)?;
+            finish_work_run_then_release_claim(
+                bd,
+                repo_path,
+                &item.issue_id,
+                &mut run_artifacts,
+                verify_decision_label(outcome.decision),
+            )?;
             append_outcome_ledger(
                 cfg,
                 ledger_path,
@@ -2418,13 +2423,9 @@ fn complete_worker_verification<
         ));
     }
     verify_request.issue = review_issue;
-    let deferred = verify::run_review_stage_deferred_until(
-        exec,
-        &verify_request,
-        &review,
-        deadline.instant,
-    )
-    .map_err(|error| DispatchCycleError::message(format!("review: {error}")))?;
+    let deferred =
+        verify::run_review_stage_deferred_until(exec, &verify_request, &review, deadline.instant)
+            .map_err(|error| DispatchCycleError::message(format!("review: {error}")))?;
     let outcome = deferred.outcome;
     record_review_events(
         &mut run_artifacts,
@@ -3120,6 +3121,7 @@ fn resume_finished_promoted_work<
         worker_commit: Some(promotion.worker_commit.clone()),
         before_head: work.before_head,
         preserve_claim_on_failure: true,
+        defer_claim_release: true,
     };
     let mechanical = match verify::run_mechanical(bd, exec, commits, &verify_request) {
         Ok(mechanical) => mechanical,
@@ -4377,6 +4379,7 @@ fn resume_pending_review<
         worker_commit: Some(worker_commit.clone()),
         before_head: None,
         preserve_claim_on_failure: true,
+        defer_claim_release: true,
     };
     let review = ReviewSettings {
         config: cfg.review.clone(),
@@ -5113,16 +5116,17 @@ fn create_work_run(
                 mechanical: Some(verify_cmd.to_string()),
                 qualitative: qualitative_verifier_label(cfg),
             },
-            work: Some(WorkState { cycle_id: cycle_id.to_string(),
-            authorization_sha256: item.authorization_sha256.clone(),
-            before_head: before_head.map(str::to_string),
-            owner_pid: Some(std::process::id()),
-            worker_pgid: None,
-            worker_profile: None,
-            worker_commit: None,
-            mechanical: None,
-            stage: WorkStage::Implementing,
-            review_resume_budget_secs: None,
+            work: Some(WorkState {
+                cycle_id: cycle_id.to_string(),
+                authorization_sha256: item.authorization_sha256.clone(),
+                before_head: before_head.map(str::to_string),
+                owner_pid: Some(std::process::id()),
+                worker_pgid: None,
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                stage: WorkStage::Implementing,
+                review_resume_budget_secs: None,
             }),
             approval: Some(approval),
         },
@@ -5237,7 +5241,9 @@ fn record_review_events(
     bead_id: &str,
     outcome: &verify::VerifyOutcome,
 ) -> std::result::Result<(), DispatchCycleError> {
-    let review_budget_exhausted = outcome.summary.starts_with("qualitative review budget exhausted");
+    let review_budget_exhausted = outcome
+        .summary
+        .starts_with("qualitative review budget exhausted");
     if outcome.review_attempts.is_empty() {
         let coverage_outcome = if review_budget_exhausted {
             "qualitative_review_budget_exhausted_before_spawn"
@@ -5591,9 +5597,7 @@ fn apply_terminal_transition<B: BdClient + ?Sized>(
             if current.status == "closed" {
                 return Ok(());
             }
-            if current.status != "in_progress"
-                || current.assignee.as_deref() != Some("conductor")
-            {
+            if current.status != "in_progress" || current.assignee.as_deref() != Some("conductor") {
                 return Err(DispatchCycleError::recovery_required(
                     "terminal close refuses to mutate a Bead no longer claimed by conductor",
                 ));
@@ -5609,9 +5613,7 @@ fn apply_terminal_transition<B: BdClient + ?Sized>(
             if current.status == "open" {
                 return Ok(());
             }
-            if current.status != "in_progress"
-                || current.assignee.as_deref() != Some("conductor")
-            {
+            if current.status != "in_progress" || current.assignee.as_deref() != Some("conductor") {
                 return Err(DispatchCycleError::recovery_required(
                     "terminal release refuses to mutate a Bead no longer claimed by conductor",
                 ));
@@ -5657,9 +5659,7 @@ fn recover_terminal_claim_transition<B: BdClient + ?Sized>(
         None => match run.manifest().outcome.as_deref() {
             Some("verified") => TerminalTransition {
                 action: TerminalTransitionAction::Close,
-                reason: format!(
-                    "conductor {cycle_id}: recovered verified terminal run {run_id}"
-                ),
+                reason: format!("conductor {cycle_id}: recovered verified terminal run {run_id}"),
                 metadata: None,
                 comment: None,
             },
@@ -7036,6 +7036,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "covers the pre-worker claim, artifact, and release crash boundary"
+    )]
     #[test]
     fn post_claim_legacy_adoption_event_failure_finishes_and_releases_before_worker_starts() {
         let temp = TempDir::new("legacy-adoption-event-failure");
@@ -7062,16 +7066,17 @@ mod tests {
                 roster_snapshot: None,
                 limits: RunLimits::default(),
                 verifier: RunVerifier::default(),
-                work: Some(WorkState { cycle_id: "cycle-legacy-original".to_string(),
-                authorization_sha256: "a".repeat(64),
-                before_head: None,
-                owner_pid: None,
-                worker_pgid: None,
-                worker_profile: None,
-                worker_commit: None,
-                mechanical: None,
-                stage: WorkStage::Implementing,
-                review_resume_budget_secs: None,
+                work: Some(WorkState {
+                    cycle_id: "cycle-legacy-original".to_string(),
+                    authorization_sha256: "a".repeat(64),
+                    before_head: None,
+                    owner_pid: None,
+                    worker_pgid: None,
+                    worker_profile: None,
+                    worker_commit: None,
+                    mechanical: None,
+                    stage: WorkStage::Implementing,
+                    review_resume_budget_secs: None,
                 }),
                 approval: None,
             },
@@ -7079,7 +7084,9 @@ mod tests {
         )
         .expect("create stranded legacy run");
         let stranded_run_id = stranded_run.run_id().to_string();
-        stranded_run.finish("failed").expect("finish stranded legacy run");
+        stranded_run
+            .finish("failed")
+            .expect("finish stranded legacy run");
 
         let mut cfg = config::parse_str(fixture_config(temp.path())).expect("config parses");
         cfg.budgets
@@ -10082,16 +10089,17 @@ exit 0
                 mechanical: Some("test -f worker.txt".to_string()),
                 qualitative: Some("tiered-qualitative-review:min_tier_gap=1".to_string()),
             },
-            work: Some(WorkState { cycle_id: cycle_id.to_string(),
-            authorization_sha256: "a".repeat(64),
-            before_head: before_head.map(str::to_string),
-            owner_pid,
-            worker_pgid,
-            worker_profile: None,
-            worker_commit: None,
-            mechanical: None,
-            stage: WorkStage::Implementing,
-            review_resume_budget_secs: None,
+            work: Some(WorkState {
+                cycle_id: cycle_id.to_string(),
+                authorization_sha256: "a".repeat(64),
+                before_head: before_head.map(str::to_string),
+                owner_pid,
+                worker_pgid,
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                stage: WorkStage::Implementing,
+                review_resume_budget_secs: None,
             }),
             approval: Some(serde_json::json!({"schema": "test/approval@1"})),
         }
@@ -11713,16 +11721,17 @@ provider = "codex"
                 roster_snapshot: None,
                 limits: RunLimits::default(),
                 verifier: RunVerifier::default(),
-                work: Some(WorkState { cycle_id: "cycle-legacy-original".to_string(),
-                authorization_sha256: "a".repeat(64),
-                before_head: None,
-                owner_pid: None,
-                worker_pgid: None,
-                worker_profile: None,
-                worker_commit: None,
-                mechanical: None,
-                stage: WorkStage::Implementing,
-                review_resume_budget_secs: None,
+                work: Some(WorkState {
+                    cycle_id: "cycle-legacy-original".to_string(),
+                    authorization_sha256: "a".repeat(64),
+                    before_head: None,
+                    owner_pid: None,
+                    worker_pgid: None,
+                    worker_profile: None,
+                    worker_commit: None,
+                    mechanical: None,
+                    stage: WorkStage::Implementing,
+                    review_resume_budget_secs: None,
                 }),
                 approval: None,
             },
@@ -11984,16 +11993,17 @@ dispatch_id = "fake-worker"
                 roster_snapshot: None,
                 limits: RunLimits::default(),
                 verifier: RunVerifier::default(),
-                work: Some(WorkState { cycle_id: "cycle-legacy-original".to_string(),
-                authorization_sha256: "a".repeat(64),
-                before_head: None,
-                owner_pid: None,
-                worker_pgid: None,
-                worker_profile: None,
-                worker_commit: None,
-                mechanical: None,
-                stage: WorkStage::Implementing,
-                review_resume_budget_secs: None,
+                work: Some(WorkState {
+                    cycle_id: "cycle-legacy-original".to_string(),
+                    authorization_sha256: "a".repeat(64),
+                    before_head: None,
+                    owner_pid: None,
+                    worker_pgid: None,
+                    worker_profile: None,
+                    worker_commit: None,
+                    mechanical: None,
+                    stage: WorkStage::Implementing,
+                    review_resume_budget_secs: None,
                 }),
                 approval: None,
             },
