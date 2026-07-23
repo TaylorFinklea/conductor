@@ -471,14 +471,7 @@ struct CommandPlanAuthor;
 
 impl crate::plan_job::PlanAuthor for CommandPlanAuthor {
     fn author(&self, request: &crate::plan_job::PlanAuthorRequest) -> Result<Vec<u8>, String> {
-        let prompt = format!(
-            "Return only strict conductor/plan-document@1 {} JSON. Plan this immutable input without applying changes:\n{}",
-            match request.output_kind {
-                crate::plan_job::PlanOutputKind::Spec => "spec",
-                crate::plan_job::PlanOutputKind::ImplementationPlan => "implementation-plan",
-            },
-            String::from_utf8_lossy(&request.input)
-        );
+        let prompt = plan_author_prompt(request)?;
         let argv = plan_author_argv(request, &prompt)?;
         let (program, command_args) = argv
             .split_first()
@@ -499,17 +492,7 @@ impl crate::plan_job::PlanAuthor for CommandPlanAuthor {
     }
 
     fn revise(&self, request: &crate::plan_job::PlanRevisionRequest) -> Result<Vec<u8>, String> {
-        let findings = serde_json::to_string(&request.findings)
-            .map_err(|error| format!("plan revision findings: {error}"))?;
-        let prompt = format!(
-            "Return only strict conductor/plan-document@1 {} JSON. Revise this prior immutable plan to address these required peer findings without applying changes.\nPrior plan:\n{}\nFindings:\n{}",
-            match request.output_kind {
-                crate::plan_job::PlanOutputKind::Spec => "spec",
-                crate::plan_job::PlanOutputKind::ImplementationPlan => "implementation-plan",
-            },
-            String::from_utf8_lossy(&request.prior_plan),
-            findings,
-        );
+        let prompt = plan_revision_prompt(request)?;
         run_plan_backend(
             &request.profile,
             &request.execution,
@@ -523,14 +506,7 @@ impl crate::plan_job::PlanAuthor for CommandPlanAuthor {
         &self,
         request: &crate::plan_job::PlanPeerReviewRequest,
     ) -> Result<Vec<u8>, String> {
-        let target = serde_json::to_string(&request.target)
-            .map_err(|error| format!("plan peer target: {error}"))?;
-        let prompt = format!(
-            "Return only strict conductor/plan-peer-review@1 JSON. {}\nTarget:\n{}\nCanonical plan:\n{}",
-            request.rubric,
-            target,
-            String::from_utf8_lossy(&request.canonical_plan),
-        );
+        let prompt = plan_peer_review_prompt(request)?;
         run_plan_backend(
             &request.profile,
             &request.execution,
@@ -544,13 +520,7 @@ impl crate::plan_job::PlanAuthor for CommandPlanAuthor {
         &self,
         request: &crate::plan_job::PlanSecondOpinionRequest,
     ) -> Result<Vec<u8>, String> {
-        let target = serde_json::to_string(&request.target)
-            .map_err(|error| format!("plan second-opinion target: {error}"))?;
-        let prompt = format!(
-            "Return only strict conductor/plan-second-opinion@1 JSON with accept or reject. Independently assess this final canonical plan. Do not discuss any peer verdict.\nTarget:\n{}\nCanonical plan:\n{}",
-            target,
-            String::from_utf8_lossy(&request.canonical_plan),
-        );
+        let prompt = plan_second_opinion_prompt(request)?;
         run_plan_backend(
             &request.profile,
             &request.execution,
@@ -559,6 +529,70 @@ impl crate::plan_job::PlanAuthor for CommandPlanAuthor {
             "plan second opinion",
         )
     }
+}
+
+fn plan_author_prompt(request: &crate::plan_job::PlanAuthorRequest) -> Result<String, String> {
+    let contract = crate::plan_job::plan_document_prompt_contract(request.output_kind)?;
+    Ok(format!(
+        "Return ONLY one strict JSON object: no Markdown fences, commentary, or surrounding text. \
+         The `kind` field is required and must exactly match the approved output kind. \
+         Use this checked complete JSON shape, replacing example values without adding or omitting fields:\n\
+         {contract}\n\
+         Plan this immutable input without applying changes:\n{}",
+        String::from_utf8_lossy(&request.input)
+    ))
+}
+
+fn plan_revision_prompt(request: &crate::plan_job::PlanRevisionRequest) -> Result<String, String> {
+    let contract = crate::plan_job::plan_document_prompt_contract(request.output_kind)?;
+    let findings = serde_json::to_string(&request.findings)
+        .map_err(|error| format!("plan revision findings: {error}"))?;
+    Ok(format!(
+        "Return ONLY one strict JSON object: no Markdown fences, commentary, or surrounding text. \
+         The `kind` field is required and must exactly match the approved output kind. \
+         Use this checked complete JSON shape, replacing example values without adding or omitting fields:\n\
+         {contract}\n\
+         Revise this prior immutable plan to address these required peer findings without applying changes.\n\
+         Prior plan:\n{}\n\
+         Findings:\n{findings}",
+        String::from_utf8_lossy(&request.prior_plan),
+    ))
+}
+
+fn plan_peer_review_prompt(
+    request: &crate::plan_job::PlanPeerReviewRequest,
+) -> Result<String, String> {
+    let target = serde_json::to_string(&request.target)
+        .map_err(|error| format!("plan peer target: {error}"))?;
+    let contract = crate::plan_job::peer_review_prompt_contract()?;
+    Ok(format!(
+        "Return ONLY one strict JSON object: no Markdown fences, commentary, or surrounding text. \
+         Use one checked shape below. `approve` requires an empty findings array; `revise` requires \
+         at least one finding. The serialized examples enumerate every allowed verdict and severity:\n\
+         {contract}\n\
+         {}\n\
+         Target:\n{target}\n\
+         Canonical plan:\n{}",
+        request.rubric,
+        String::from_utf8_lossy(&request.canonical_plan),
+    ))
+}
+
+fn plan_second_opinion_prompt(
+    request: &crate::plan_job::PlanSecondOpinionRequest,
+) -> Result<String, String> {
+    let target = serde_json::to_string(&request.target)
+        .map_err(|error| format!("plan second-opinion target: {error}"))?;
+    let contract = crate::plan_job::second_opinion_prompt_contract()?;
+    Ok(format!(
+        "Return ONLY one strict JSON object: no Markdown fences, commentary, or surrounding text. \
+         Use one checked shape below; the serialized examples enumerate every allowed verdict. \
+         Independently assess this final canonical plan. Do not discuss any peer verdict.\n\
+         {contract}\n\
+         Target:\n{target}\n\
+         Canonical plan:\n{}",
+        String::from_utf8_lossy(&request.canonical_plan),
+    ))
 }
 
 fn run_plan_backend(
@@ -2068,6 +2102,155 @@ mod tests {
                 "strict prompt",
             ]
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one production-path regression exercises each independently shaped prompt"
+    )]
+    fn production_plan_prompts_embed_complete_strict_wire_contracts() {
+        let profile: crate::bursar::RosterProfile = serde_json::from_value(serde_json::json!({
+            "profile_id": "planner-pi",
+            "provider_id": "opencode-go",
+            "model": "glm-5.2",
+            "harness": "pi",
+            "dispatch_id": "opencode-go/glm-5.2",
+            "reasoning_effort": null,
+            "tier": "lead",
+            "ceiling": "XL",
+            "efficiency": "lean",
+            "cost": 0.0,
+            "data_policy": "standard",
+            "enabled": true,
+            "roles": ["plan"],
+            "state": "healthy",
+            "eligible": true,
+            "ineligibility_reason": null
+        }))
+        .expect("roster profile");
+        let execution = crate::run::ApprovedExecution {
+            profile_id: "planner-pi".to_string(),
+            provider_id: "opencode-go".to_string(),
+            availability_key: "opencode-go".to_string(),
+            execution_key: "planner-pi".to_string(),
+        };
+        let target = crate::run::PlanTarget {
+            repo: "/repo".to_string(),
+            input: crate::run::PlanInput::Artifact {
+                artifact: crate::run::ArtifactRef {
+                    path: "input.md".to_string(),
+                    sha256: "a".repeat(64),
+                },
+                tier: crate::run::PlanTier::Lead,
+                complexity: crate::run::PlanComplexity::XL,
+            },
+        };
+        let author = crate::plan_job::PlanAuthorRequest {
+            worktree: PathBuf::from("/tmp/plan-author"),
+            input: b"immutable input".to_vec(),
+            output_kind: crate::plan_job::PlanOutputKind::Spec,
+            execution: execution.clone(),
+            profile: profile.clone(),
+        };
+        let author_prompt = plan_author_prompt(&author).expect("author prompt");
+        for required in [
+            "\"schema\":\"conductor/plan-document@1\"",
+            "\"kind\":\"spec\"",
+            "\"title\"",
+            "\"context\"",
+            "\"goals\"",
+            "\"constraints\"",
+            "\"requirements\"",
+            "\"acceptance\"",
+            "\"verification\"",
+            "\"non_goals\"",
+            "\"risks\"",
+            "\"assumptions\"",
+            "\"open_questions\"",
+        ] {
+            assert!(
+                author_prompt.contains(required),
+                "missing {required}: {author_prompt}"
+            );
+        }
+        let implementation = crate::plan_job::PlanAuthorRequest {
+            output_kind: crate::plan_job::PlanOutputKind::ImplementationPlan,
+            ..author.clone()
+        };
+        let implementation_prompt =
+            plan_author_prompt(&implementation).expect("implementation prompt");
+        for required in [
+            "\"kind\":\"implementation-plan\"",
+            "\"tasks\"",
+            "\"id\"",
+            "\"depends_on\"",
+            "\"targets\"",
+            "\"file\"",
+            "\"symbol\"",
+            "\"change\"",
+            "\"acceptance\"",
+            "\"verify\"",
+        ] {
+            assert!(
+                implementation_prompt.contains(required),
+                "missing {required}: {implementation_prompt}"
+            );
+        }
+
+        let peer = crate::plan_job::PlanPeerReviewRequest {
+            worktree: PathBuf::from("/tmp/plan-peer"),
+            target: target.clone(),
+            rubric: "Review for correctness.".to_string(),
+            canonical_plan: br#"{"kind":"spec"}"#.to_vec(),
+            execution: execution.clone(),
+            profile: profile.clone(),
+        };
+        let peer_prompt = plan_peer_review_prompt(&peer).expect("peer prompt");
+        for required in [
+            "\"schema\":\"conductor/plan-peer-review@1\"",
+            "\"verdict\":\"revise\"",
+            "\"findings\"",
+            "\"id\"",
+            "\"severity\"",
+            "\"location\"",
+            "\"problem\"",
+            "\"required_change\"",
+            "approve",
+            "revise",
+            "low",
+            "medium",
+            "high",
+            "critical",
+        ] {
+            assert!(
+                peer_prompt.contains(required),
+                "missing {required}: {peer_prompt}"
+            );
+        }
+
+        let second = crate::plan_job::PlanSecondOpinionRequest {
+            worktree: PathBuf::from("/tmp/plan-second"),
+            target,
+            canonical_plan: br#"{"kind":"spec"}"#.to_vec(),
+            execution,
+            profile,
+        };
+        let second_prompt = plan_second_opinion_prompt(&second).expect("second prompt");
+        for required in [
+            "\"schema\":\"conductor/plan-second-opinion@1\"",
+            "\"verdict\":\"accept\"",
+            "accept",
+            "reject",
+        ] {
+            assert!(
+                second_prompt.contains(required),
+                "missing {required}: {second_prompt}"
+            );
+        }
+        assert!(!author_prompt.contains("```"));
+        assert!(!peer_prompt.contains("```"));
+        assert!(!second_prompt.contains("```"));
     }
     #[test]
     fn plan_prepare_defaults_to_one_revision() {

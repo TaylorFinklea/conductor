@@ -264,11 +264,11 @@ fn canonical_document_json(document: &PlanDocument) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("failed to serialize plan document: {error}"))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PeerReviewWire {
     schema: String,
-    verdict: String,
+    verdict: crate::run::PeerVerdict,
     findings: Vec<PlanFinding>,
 }
 
@@ -291,24 +291,27 @@ fn parse_peer_review(bytes: &[u8]) -> Result<(crate::run::PeerVerdict, Vec<PlanF
             return Err("plan peer-review finding is malformed".to_string());
         }
     }
-    match review.verdict.as_str() {
-        "approve" if review.findings.is_empty() => {
+    match review.verdict {
+        crate::run::PeerVerdict::Approve if review.findings.is_empty() => {
             Ok((crate::run::PeerVerdict::Approve, Vec::new()))
         }
-        "approve" => Err("approved plan peer-review must not include findings".to_string()),
-        "revise" if !review.findings.is_empty() => {
+        crate::run::PeerVerdict::Approve => {
+            Err("approved plan peer-review must not include findings".to_string())
+        }
+        crate::run::PeerVerdict::Revise if !review.findings.is_empty() => {
             Ok((crate::run::PeerVerdict::Revise, review.findings))
         }
-        "revise" => Err("revise plan peer-review requires findings".to_string()),
-        _ => Err("plan peer-review verdict must be approve or revise".to_string()),
+        crate::run::PeerVerdict::Revise => {
+            Err("revise plan peer-review requires findings".to_string())
+        }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SecondOpinionWire {
     schema: String,
-    verdict: String,
+    verdict: crate::run::SecondOpinionVerdict,
 }
 
 fn parse_second_opinion(bytes: &[u8]) -> Result<crate::run::SecondOpinionVerdict, String> {
@@ -319,11 +322,7 @@ fn parse_second_opinion(bytes: &[u8]) -> Result<crate::run::SecondOpinionVerdict
             "plan second-opinion schema must be conductor/plan-second-opinion@1".to_string(),
         );
     }
-    match opinion.verdict.as_str() {
-        "accept" => Ok(crate::run::SecondOpinionVerdict::Accept),
-        "reject" => Ok(crate::run::SecondOpinionVerdict::Reject),
-        _ => Err("plan second-opinion verdict must be accept or reject".to_string()),
-    }
+    Ok(opinion.verdict)
 }
 
 fn render_markdown(document: &PlanDocument) -> String {
@@ -501,6 +500,121 @@ pub(crate) struct PlanFinding {
     pub(crate) location: String,
     pub(crate) problem: String,
     pub(crate) required_change: String,
+}
+
+/// Returns an exact, checked compact JSON shape for the requested plan output.
+/// The prompt embeds this serialization rather than a separately-maintained
+/// prose schema, so every advertised key and nested object is parser-valid.
+pub(crate) fn plan_document_prompt_contract(kind: PlanOutputKind) -> Result<String, String> {
+    let document = match kind {
+        PlanOutputKind::Spec => PlanDocument::Spec {
+            schema: PLAN_DOCUMENT_SCHEMA.to_string(),
+            title: "Example plan title".to_string(),
+            context: "The immutable target and its constraints.".to_string(),
+            goals: vec!["Deliver the approved outcome.".to_string()],
+            constraints: vec!["Do not mutate the target repository.".to_string()],
+            requirements: vec!["Preserve the strict wire contract.".to_string()],
+            acceptance: vec!["The stated acceptance criteria hold.".to_string()],
+            verification: vec!["cargo test".to_string()],
+            non_goals: vec![],
+            risks: vec![],
+            assumptions: vec![],
+            open_questions: vec![],
+        },
+        PlanOutputKind::ImplementationPlan => PlanDocument::ImplementationPlan {
+            schema: PLAN_DOCUMENT_SCHEMA.to_string(),
+            title: "Example implementation plan".to_string(),
+            context: "The immutable target and its constraints.".to_string(),
+            tasks: vec![PlanTask {
+                id: "task-1".to_string(),
+                depends_on: vec![],
+                targets: vec![PlanTargetSymbol {
+                    file: "src/example.rs".to_string(),
+                    symbol: "example_symbol".to_string(),
+                }],
+                change: "Make the required implementation change.".to_string(),
+                acceptance: "The observable contract holds.".to_string(),
+                verify: "cargo test".to_string(),
+            }],
+            risks: vec![],
+            assumptions: vec![],
+        },
+    };
+    document.validate()?;
+    String::from_utf8(canonical_document_json(&document)?)
+        .map_err(|error| format!("plan prompt contract is not UTF-8: {error}"))
+}
+
+/// Returns checked peer-review examples spanning every permitted verdict and
+/// finding shape. The wire type supplies the serialized field names and enums.
+pub(crate) fn peer_review_prompt_contract() -> Result<String, String> {
+    serde_json::to_string(&[
+        PeerReviewWire {
+            schema: "conductor/plan-peer-review@1".to_string(),
+            verdict: crate::run::PeerVerdict::Approve,
+            findings: vec![],
+        },
+        PeerReviewWire {
+            schema: "conductor/plan-peer-review@1".to_string(),
+            verdict: crate::run::PeerVerdict::Revise,
+            findings: vec![PlanFinding {
+                id: "finding-low".to_string(),
+                severity: "low".to_string(),
+                location: "src/example.rs".to_string(),
+                problem: "The plan omits an observable contract.".to_string(),
+                required_change: "Add the missing contract.".to_string(),
+            }],
+        },
+        PeerReviewWire {
+            schema: "conductor/plan-peer-review@1".to_string(),
+            verdict: crate::run::PeerVerdict::Revise,
+            findings: vec![PlanFinding {
+                id: "finding-medium".to_string(),
+                severity: "medium".to_string(),
+                location: "src/example.rs".to_string(),
+                problem: "The plan omits an observable contract.".to_string(),
+                required_change: "Add the missing contract.".to_string(),
+            }],
+        },
+        PeerReviewWire {
+            schema: "conductor/plan-peer-review@1".to_string(),
+            verdict: crate::run::PeerVerdict::Revise,
+            findings: vec![PlanFinding {
+                id: "finding-high".to_string(),
+                severity: "high".to_string(),
+                location: "src/example.rs".to_string(),
+                problem: "The plan omits an observable contract.".to_string(),
+                required_change: "Add the missing contract.".to_string(),
+            }],
+        },
+        PeerReviewWire {
+            schema: "conductor/plan-peer-review@1".to_string(),
+            verdict: crate::run::PeerVerdict::Revise,
+            findings: vec![PlanFinding {
+                id: "finding-critical".to_string(),
+                severity: "critical".to_string(),
+                location: "src/example.rs".to_string(),
+                problem: "The plan omits an observable contract.".to_string(),
+                required_change: "Add the missing contract.".to_string(),
+            }],
+        },
+    ])
+    .map_err(|error| format!("failed to serialize plan peer-review prompt contract: {error}"))
+}
+
+/// Returns checked final-opinion examples spanning both permitted verdicts.
+pub(crate) fn second_opinion_prompt_contract() -> Result<String, String> {
+    serde_json::to_string(&[
+        SecondOpinionWire {
+            schema: "conductor/plan-second-opinion@1".to_string(),
+            verdict: crate::run::SecondOpinionVerdict::Accept,
+        },
+        SecondOpinionWire {
+            schema: "conductor/plan-second-opinion@1".to_string(),
+            verdict: crate::run::SecondOpinionVerdict::Reject,
+        },
+    ])
+    .map_err(|error| format!("failed to serialize plan second-opinion prompt contract: {error}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1165,6 +1279,20 @@ fn planned_routes(prepared: &crate::role_routing::PreparedPlanner) -> crate::run
     }
 }
 
+/// Terminalizes a durable authoring run once its immutable call budget has
+/// already been consumed. This protects resume after a crash between an
+/// attempt checkpoint and its terminal failure checkpoint.
+fn finish_exhausted_authoring(run: &mut crate::run::RunHandle) -> Result<bool, String> {
+    let plan = run.plan().map_err(|error| error.to_string())?;
+    let exhausted = matches!(plan.progress, crate::run::PlanProgress::Authoring { .. })
+        && plan.stage_attempts.planner >= plan.stage_attempt_limit.value();
+    if exhausted {
+        run.finish_plan_blocked()
+            .map_err(|error| format!("plan blocked checkpoint: {error}"))?;
+    }
+    Ok(exhausted)
+}
+
 /// Runs only the initial author stage after the exact published approval is
 /// present. Peer verdicts and second opinion remain intentionally out of scope.
 #[expect(
@@ -1251,6 +1379,9 @@ where
             &repo,
             &approval,
         );
+    }
+    if finish_exhausted_authoring(&mut run)? {
+        return Err("plan author attempt limit exhausted".to_string());
     }
     let planner_candidates = planner_candidates(run.plan().map_err(|error| error.to_string())?)?;
     let selected = match run
@@ -1358,6 +1489,7 @@ where
                 author_attempt,
                 "failed",
             )?;
+            finish_exhausted_authoring(&mut run)?;
             return Err(error);
         }
     };
@@ -1418,6 +1550,7 @@ where
                         repair_attempt,
                         "failed",
                     )?;
+                    finish_exhausted_authoring(&mut run)?;
                     return Err(error);
                 }
             };
@@ -1436,6 +1569,7 @@ where
                         repair_attempt,
                         "malformed",
                     )?;
+                    finish_exhausted_authoring(&mut run)?;
                     return Err(format!(
                         "plan author output invalid after repair: {first_error}; {second_error}"
                     ));
@@ -2600,6 +2734,30 @@ mod tests {
         .expect_err("schema-shaped empty specs must fail");
 
         assert!(error.contains("title"));
+    }
+
+    #[test]
+    fn plan_document_requires_explicit_kind_and_raw_json() {
+        let missing_kind = br#"{
+            "schema":"conductor/plan-document@1",
+            "title":"Plan",
+            "context":"Context",
+            "tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],
+            "risks":[],
+            "assumptions":[]
+        }"#;
+        assert!(
+            parse_document(PlanOutputKind::ImplementationPlan, missing_kind).is_err(),
+            "the approved kind must be explicit rather than inferred"
+        );
+
+        let fenced = br#"```json
+{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}
+```"#;
+        assert!(
+            parse_document(PlanOutputKind::ImplementationPlan, fenced).is_err(),
+            "fenced JSON is not a valid wire artifact"
+        );
     }
 
     #[test]
@@ -3892,7 +4050,7 @@ enabled = true
     }
 
     #[test]
-    fn malformed_output_and_schema_repair_consume_persisted_author_attempts() {
+    fn malformed_initial_and_repair_exhaustion_finishes_terminal_blocked_with_evidence() {
         let (temp, paths, config, bursar) = plan_fixture("repair-attempts");
         let repo = initialized_repo(&temp);
         let prepared = prepare(
@@ -3916,16 +4074,91 @@ enabled = true
         let author = FakeAuthor::new(vec![b"not json".to_vec(), b"still not json".to_vec()]);
 
         assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
-
-        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
-        assert!(matches!(
-            run.plan().expect("plan").progress,
-            crate::run::PlanProgress::Authoring { attempts: 2, .. }
-        ));
+        assert!(
+            matches!(
+                crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id)
+                    .expect("run")
+                    .plan()
+                    .expect("plan")
+                    .progress,
+                crate::run::PlanProgress::Terminal {
+                    verdict: crate::run::PlanTerminalVerdict::Blocked
+                }
+            ),
+            "schema repair exhaustion must not leave a resumable authoring manifest"
+        );
         assert!(
             dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err(),
-            "the persisted limit rejects an extra invocation after crash/resume"
+            "a terminal run must reject resume"
         );
+        assert!(
+            author.0.lock().expect("outputs").is_empty(),
+            "terminal resume must make no additional backend call"
+        );
+        let rows = plan_ledger_rows(&paths.ledger_path);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["outcome"], "malformed");
+        assert_eq!(rows[1]["outcome"], "malformed");
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let events = crate::run::read_events(&run.events_path()).expect("events");
+        assert!(matches!(
+            events.last(),
+            Some(crate::run::RunEvent {
+                kind: crate::run::EventKind::RunFinished,
+                outcome: Some(outcome),
+                ..
+            }) if outcome == "blocked"
+        ));
+    }
+
+    #[test]
+    fn backend_failure_exhaustion_finishes_terminal_blocked_with_evidence() {
+        let (temp, paths, config, bursar) = plan_fixture("backend-exhaustion");
+        let prepared = prepare(
+            &paths,
+            &config,
+            &bursar,
+            implementation_request(initialized_repo(&temp)),
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let author = FailingAuthor(std::sync::Mutex::new(0));
+
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert_eq!(*author.0.lock().expect("calls"), 2);
+        assert!(
+            matches!(
+                crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id)
+                    .expect("run")
+                    .plan()
+                    .expect("plan")
+                    .progress,
+                crate::run::PlanProgress::Terminal {
+                    verdict: crate::run::PlanTerminalVerdict::Blocked
+                }
+            ),
+            "backend retry exhaustion must not leave a resumable authoring manifest"
+        );
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert_eq!(
+            *author.0.lock().expect("calls"),
+            2,
+            "terminal resume must make no additional backend call"
+        );
+        let rows = plan_ledger_rows(&paths.ledger_path);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["outcome"] == "failed"));
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let events = crate::run::read_events(&run.events_path()).expect("events");
+        assert!(matches!(
+            events.last(),
+            Some(crate::run::RunEvent {
+                kind: crate::run::EventKind::RunFinished,
+                outcome: Some(outcome),
+                ..
+            }) if outcome == "blocked"
+        ));
     }
 
     #[test]
@@ -4407,9 +4640,11 @@ enabled = true
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         let events = crate::run::read_events(&run.events_path()).expect("events");
-        assert!(!events
-            .iter()
-            .any(|event| event.outcome.as_deref() == Some("peer_provider_diversity_degraded")));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.outcome.as_deref() == Some("peer_provider_diversity_degraded"))
+        );
         assert!(
             !events.iter().any(|event| {
                 event.kind == crate::run::EventKind::AttemptFinished
