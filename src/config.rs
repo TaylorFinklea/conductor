@@ -5,6 +5,8 @@
 // until those modules read these fields.
 #![allow(dead_code)]
 
+use crate::job::{self, JobBinding, MutationPosture};
+use crate::run::{RunLimits, RunVerifier};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU32;
@@ -306,6 +308,10 @@ pub(crate) struct JobFallbackPolicy {
     pub(crate) fallback_profile_ids: Vec<String>,
 }
 
+/// Closed native job bindings. Each row names only Bursar v2 profile IDs and
+/// structural policy; it does not define a workflow, plugin, or fleet scan.
+pub(crate) type NativeJobConfig = JobBinding;
+
 /// One enabled Conductor-owned profile weight for an opaque capability role.
 /// Bursar supplies the profile's facts; this configuration owns selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,6 +464,9 @@ pub(crate) struct Config {
     /// Runtime retry policy keyed by Bursar profile IDs. This remains static
     /// Conductor policy and is resolved against each Bursar snapshot.
     pub(crate) job_fallbacks: Vec<JobFallbackPolicy>,
+    /// Native v2 job configuration. An omitted registry remains unactivated;
+    /// a present registry must be a complete closed set.
+    pub(crate) jobs: Vec<NativeJobConfig>,
     /// Conductor-owned enabled role/profile weights. Empty means role routing
     /// is not configured and any caller must fail closed.
     pub(crate) role_bindings: Vec<RoleBindingConfig>,
@@ -900,6 +909,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
                 | "adversarial_review"
                 | "roster"
                 | "job_fallback"
+                | "job"
                 | "repo_policy"
         ) {
             return Err(ConfigError::new(format!("unknown config key: {key}")));
@@ -916,6 +926,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
     let review = parse_review(doc.get("review"))?;
     let role_bindings = parse_role_bindings(doc.get("role_binding"))?;
     let ratchet = parse_ratchet(doc.get("ratchet"))?;
+    let jobs = parse_native_jobs(doc.get("job"))?;
     let roster = parse_roster(doc.get("roster"))?;
     let job_fallbacks = parse_job_fallbacks(doc.get("job_fallback"))?;
     let adversarial_review = parse_adversarial_review(doc.get("adversarial_review"), &roster)?;
@@ -930,6 +941,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
         adversarial_review,
         roster,
         job_fallbacks,
+        jobs,
         role_bindings,
         repo_policies,
     })
@@ -1239,6 +1251,108 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
         });
     }
     Ok(out)
+}
+
+fn parse_native_jobs(node: Option<&Node>) -> Result<Vec<NativeJobConfig>> {
+    let entries = match node {
+        None => return Ok(Vec::new()),
+        Some(Node::Tables(entries)) => entries,
+        Some(_) => {
+            return Err(ConfigError::new("job must be an array of tables ([[job]])"));
+        }
+    };
+    let mut bindings = Vec::with_capacity(entries.len());
+    for (index, table) in entries.iter().enumerate() {
+        for key in table.keys() {
+            if !matches!(
+                key.as_str(),
+                "kind"
+                    | "profile_ids"
+                    | "fallback_profile_ids"
+                    | "mutation"
+                    | "item_wall_clock_mins"
+                    | "max_attempts"
+                    | "mechanical_verifier"
+                    | "qualitative_verifier"
+                    | "approval_required"
+                    | "role_policy"
+            ) {
+                return Err(ConfigError::new(format!(
+                    "unknown job key in entry {index}: {key}"
+                )));
+            }
+        }
+        let kind = get_required_str_at("job", table, index, "kind")?;
+        let job = job::parse_job(&kind).map_err(|error| ConfigError::new(error.to_string()))?;
+        let profile_ids = table
+            .get("profile_ids")
+            .ok_or_else(|| ConfigError::new(format!("job entry {index} missing profile_ids")))
+            .and_then(|value| expect_str_arr("job.profile_ids", value))?;
+        let fallback_profile_ids = table
+            .get("fallback_profile_ids")
+            .map(|value| expect_str_arr("job.fallback_profile_ids", value))
+            .transpose()?
+            .unwrap_or_default();
+        let mutation = match get_required_str_at("job", table, index, "mutation")?.as_str() {
+            "read_only" => MutationPosture::ReadOnly,
+            "repository_write" => MutationPosture::RepositoryWrite,
+            value => {
+                return Err(ConfigError::new(format!(
+                    "job entry {index} has unknown mutation posture: {value}"
+                )));
+            }
+        };
+        let item_wall_clock_mins = table
+            .get("item_wall_clock_mins")
+            .map(|value| expect_u32("job.item_wall_clock_mins", value).map(u64::from))
+            .transpose()?;
+        let max_attempts = table
+            .get("max_attempts")
+            .map(|value| expect_u32("job.max_attempts", value).map(u64::from))
+            .transpose()?;
+        if item_wall_clock_mins == Some(0) || max_attempts == Some(0) {
+            return Err(ConfigError::new(
+                "job limits must be greater than zero when configured",
+            ));
+        }
+        let approval_required = table
+            .get("approval_required")
+            .ok_or_else(|| ConfigError::new(format!("job entry {index} missing approval_required")))
+            .and_then(|value| expect_bool("job.approval_required", value))?;
+        let role_policy = table
+            .get("role_policy")
+            .map(|value| expect_str("job.role_policy", value))
+            .transpose()?;
+        let verifier = RunVerifier {
+            mechanical: table
+                .get("mechanical_verifier")
+                .map(|value| expect_str("job.mechanical_verifier", value))
+                .transpose()?,
+            qualitative: table
+                .get("qualitative_verifier")
+                .map(|value| expect_str("job.qualitative_verifier", value))
+                .transpose()?,
+        };
+        bindings.push(JobBinding {
+            job,
+            profile_ids,
+            fallback_profile_ids,
+            mutation,
+            limits: RunLimits {
+                item_wall_clock_mins,
+                max_attempts,
+            },
+            verifier,
+            approval_required,
+            role_policy,
+        });
+    }
+    if bindings.is_empty() {
+        return Ok(bindings);
+    }
+    job::JobRegistry::new(bindings)
+        .map_err(|error| ConfigError::new(error.to_string()))
+        .map(|registry| registry.bindings().to_vec())
 }
 
 fn parse_job_fallbacks(node: Option<&Node>) -> Result<Vec<JobFallbackPolicy>> {
@@ -2527,5 +2641,64 @@ clean_cycles_to_unlock = 3
     fn preflight_state_dir_fails_when_home_unset() {
         let checks = preflight_checks("", None);
         assert!(!check(&checks, "state dir").ok);
+    }
+    #[test]
+    fn native_jobs_are_closed_and_carry_execution_policy() {
+        let source = r#"
+[[job]]
+kind = "work"
+profile_ids = ["work-primary"]
+fallback_profile_ids = ["work-fallback"]
+mutation = "repository_write"
+approval_required = true
+role_policy = "implementer"
+item_wall_clock_mins = 30
+max_attempts = 2
+mechanical_verifier = "cargo test"
+
+[[job]]
+kind = "review"
+profile_ids = ["review-panel"]
+mutation = "read_only"
+approval_required = true
+role_policy = "reviewer-panel"
+max_attempts = 1
+qualitative_verifier = "schema-valid synthesis"
+
+[[job]]
+kind = "consult"
+profile_ids = ["consult"]
+mutation = "read_only"
+approval_required = false
+
+[[job]]
+kind = "plan"
+profile_ids = ["planner"]
+mutation = "read_only"
+approval_required = true
+role_policy = "planner"
+"#;
+        let config = parse_str(source).expect("native job config");
+        let registry = crate::job::JobRegistry::new(config.jobs).expect("closed job registry");
+        assert_eq!(registry.bindings().len(), 4);
+        assert_eq!(
+            registry
+                .binding(crate::run::RunJob::Review)
+                .expect("review binding")
+                .role_policy
+                .as_deref(),
+            Some("reviewer-panel")
+        );
+    }
+
+    #[test]
+    fn native_job_config_rejects_arena_unknown_and_write_capable_read_only_jobs() {
+        for source in [
+            "[[job]]\nkind = \"arena\"\n",
+            "[[job]]\nkind = \"fleet\"\n",
+            "[[job]]\nkind = \"review\"\nprofile_ids = [\"review\"]\nmutation = \"repository_write\"\napproval_required = true\n",
+        ] {
+            assert!(parse_str(source).is_err(), "unexpected success: {source}");
+        }
     }
 }

@@ -10,6 +10,7 @@ mod deck;
 mod dispatch;
 mod dispatch_cycle;
 mod fields;
+mod job;
 mod ledger;
 mod plan;
 mod quarantine;
