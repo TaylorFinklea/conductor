@@ -168,21 +168,6 @@ impl RoutingPolicy {
                     role_id.as_str()
                 )));
             }
-            let provider = snapshot
-                .providers
-                .iter()
-                .find(|provider| provider.provider_id == profile.provider_id)
-                .ok_or_else(|| {
-                    RoleRoutingError::new(format!(
-                        "role policy profile {} has no pinned provider",
-                        binding.profile_id
-                    ))
-                })?;
-            if provider.provider_id != profile.provider_id {
-                return Err(RoleRoutingError::new(
-                    "role policy execution coordinate is not pinned exactly",
-                ));
-            }
             bindings.push(RoleBinding::new(role_id, profile_id, binding.weight));
         }
         Self::new(snapshot.policy_sha256().to_string(), bindings)
@@ -363,6 +348,9 @@ impl RoleRouter {
         }
     }
 
+    /// Test-only low-level lane reservation. Production callers must use
+    /// `prepare_stage`, which enforces every hard eligibility and capacity gate.
+    #[cfg(test)]
     pub(crate) fn reserve(
         &self,
         run_id: RunId,
@@ -397,12 +385,7 @@ impl RoleRouter {
     ) -> Result<Reservation> {
         let lane = LaneKey::new(self.policy.digest(), role_id, plan_stage);
         let paths = LanePaths::new(&self.root, &lane);
-        std::fs::create_dir_all(&paths.dir).map_err(|error| {
-            RoleRoutingError::new(format!(
-                "failed to create role-routing lane {}: {error}",
-                paths.dir.display()
-            ))
-        })?;
+        create_lane_dir(&paths)?;
         let guard = open_lock(&paths.lock_path)?;
         guard.lock_exclusive().map_err(|error| {
             RoleRoutingError::new(format!(
@@ -774,6 +757,7 @@ impl RoleRouter {
     ) -> Result<Option<Reservation>> {
         let lane = LaneKey::new(self.policy.digest(), role_id.clone(), stage);
         let paths = LanePaths::new(&self.root, &lane);
+        create_lane_dir(&paths)?;
         let guard = open_lock(&paths.lock_path)?;
         guard.lock_exclusive().map_err(|error| {
             RoleRoutingError::new(format!(
@@ -798,6 +782,7 @@ impl RoleRouter {
     ) -> Result<Option<String>> {
         let lane = LaneKey::new(self.policy.digest(), role_id.clone(), stage);
         let paths = LanePaths::new(&self.root, &lane);
+        create_lane_dir(&paths)?;
         let guard = open_lock(&paths.lock_path)?;
         guard.lock_exclusive().map_err(|error| {
             RoleRoutingError::new(format!(
@@ -825,6 +810,7 @@ impl RoleRouter {
     ) -> Result<Vec<RunId>> {
         let lane = LaneKey::new(self.policy.digest(), role_id.clone(), plan_stage);
         let paths = LanePaths::new(&self.root, &lane);
+        create_lane_dir(&paths)?;
         let guard = open_lock(&paths.lock_path)?;
         guard.lock_exclusive().map_err(|error| {
             RoleRoutingError::new(format!(
@@ -1136,6 +1122,15 @@ fn apply_smooth_weighted_round_robin(
         .checked_sub(total)
         .ok_or_else(|| RoleRoutingError::new("role-routing score underflow"))?;
     Ok((winner.profile_id.clone(), total))
+}
+
+fn create_lane_dir(paths: &LanePaths) -> Result<()> {
+    std::fs::create_dir_all(&paths.dir).map_err(|error| {
+        RoleRoutingError::new(format!(
+            "failed to create role-routing lane {}: {error}",
+            paths.dir.display()
+        ))
+    })
 }
 
 fn open_lock(path: &Path) -> Result<File> {
@@ -1592,6 +1587,65 @@ mod tests {
                 .expect("reservation")
                 .sequence,
             1
+        );
+    }
+
+    #[test]
+    fn fresh_lane_reservation_returns_none() {
+        let temp = TempDir::new("fresh-reservation");
+        let router = RoleRouter::new(
+            temp.path(),
+            RoutingPolicy::new("a".repeat(64), vec![binding("planner", "profile-a", 1)])
+                .expect("policy"),
+        )
+        .expect("router");
+        assert_eq!(
+            router
+                .reservation(
+                    &RoleId::new("planner").expect("role"),
+                    PlanStage::Planner,
+                    &RunId::new("missing-run").expect("run"),
+                )
+                .expect("fresh lane query"),
+            None
+        );
+    }
+
+    #[test]
+    fn fresh_lane_policy_reset_returns_none() {
+        let temp = TempDir::new("fresh-reset");
+        let router = RoleRouter::new(
+            temp.path(),
+            RoutingPolicy::new("a".repeat(64), vec![binding("planner", "profile-a", 1)])
+                .expect("policy"),
+        )
+        .expect("router");
+        assert_eq!(
+            router
+                .policy_reset_from(&RoleId::new("planner").expect("role"), PlanStage::Planner)
+                .expect("fresh lane query"),
+            None
+        );
+    }
+
+    #[test]
+    fn fresh_lane_orphan_reconciliation_is_empty() {
+        let temp = TempDir::new("fresh-orphans");
+        let router = RoleRouter::new(
+            temp.path(),
+            RoutingPolicy::new("a".repeat(64), vec![binding("planner", "profile-a", 1)])
+                .expect("policy"),
+        )
+        .expect("router");
+        assert!(
+            router
+                .reconcile_orphans(
+                    &RoleId::new("planner").expect("role"),
+                    PlanStage::Planner,
+                    &[],
+                )
+                .expect("fresh lane reconciliation")
+                .is_empty()
         );
     }
 
