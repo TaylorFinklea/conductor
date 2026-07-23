@@ -1,7 +1,7 @@
 //! subcommand parsing, exit codes (0 ok; 1 cycle had flags/failures; 2 config/env error)
 
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 
 use crate::config;
 
@@ -29,6 +29,7 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
         Some("config") => run_config(&mut it),
         Some("cycle") => run_cycle(&mut it),
         Some("dispatch") => run_dispatch(&mut it),
+        Some("plan") => run_plan(&mut it),
         Some("roster") => run_roster(&mut it),
         Some("route") => run_route(&mut it),
         Some("scan") => run_scan(&mut it),
@@ -73,6 +74,439 @@ impl AdversarialPaths {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlanCliTarget {
+    Bead(String),
+    Artifact(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanPrepareOptions {
+    repo: PathBuf,
+    target: PlanCliTarget,
+    output_kind: crate::plan_job::PlanOutputKind,
+    tier: Option<crate::run::PlanTier>,
+    complexity: Option<crate::run::PlanComplexity>,
+    max_plan_revisions: u8,
+    require_second_opinion: bool,
+    config: PathBuf,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "strict flag grammar keeps every duplicate and mutual-exclusion rejection explicit"
+)]
+fn parse_plan_prepare_options(args: &[String]) -> Result<PlanPrepareOptions, String> {
+    let mut repo = None;
+    let mut target = None;
+    let mut output_kind = None;
+    let mut tier = None;
+    let mut complexity = None;
+    let mut max_plan_revisions = 0;
+    let mut revisions_seen = false;
+    let mut require_second_opinion = false;
+    let mut config = PathBuf::from("conductor.toml");
+    let mut config_seen = false;
+    let mut it = args.iter();
+    while let Some(argument) = it.next() {
+        let mut value = |flag: &str| {
+            it.next()
+                .ok_or_else(|| format!("{flag} requires a value"))
+                .cloned()
+        };
+        match argument.as_str() {
+            "--repo" => {
+                let value = value("--repo")?;
+                if repo.replace(PathBuf::from(value)).is_some() {
+                    return Err("--repo may only be supplied once".to_string());
+                }
+            }
+            "--bead" => {
+                let value = value("--bead")?;
+                if target.replace(PlanCliTarget::Bead(value)).is_some() {
+                    return Err(
+                        "plan prepare requires exactly one of --bead or --artifact".to_string()
+                    );
+                }
+            }
+            "--artifact" => {
+                let value = value("--artifact")?;
+                if target
+                    .replace(PlanCliTarget::Artifact(PathBuf::from(value)))
+                    .is_some()
+                {
+                    return Err(
+                        "plan prepare requires exactly one of --bead or --artifact".to_string()
+                    );
+                }
+            }
+            "--output-kind" => {
+                let value = value("--output-kind")?;
+                let parsed = match value.as_str() {
+                    "spec" => crate::plan_job::PlanOutputKind::Spec,
+                    "implementation-plan" => crate::plan_job::PlanOutputKind::ImplementationPlan,
+                    _ => {
+                        return Err("--output-kind must be spec or implementation-plan".to_string());
+                    }
+                };
+                if output_kind.replace(parsed).is_some() {
+                    return Err("--output-kind may only be supplied once".to_string());
+                }
+            }
+            "--tier-floor" => {
+                let value = value("--tier-floor")?;
+                let parsed = match value.as_str() {
+                    "junior" => crate::run::PlanTier::Junior,
+                    "senior" => crate::run::PlanTier::Senior,
+                    "lead" => crate::run::PlanTier::Lead,
+                    _ => return Err("--tier-floor must be lead, senior, or junior".to_string()),
+                };
+                if tier.replace(parsed).is_some() {
+                    return Err("--tier-floor may only be supplied once".to_string());
+                }
+            }
+            "--complexity" => {
+                let value = value("--complexity")?;
+                let parsed = match value.as_str() {
+                    "S" => crate::run::PlanComplexity::S,
+                    "M" => crate::run::PlanComplexity::M,
+                    "L" => crate::run::PlanComplexity::L,
+                    "XL" => crate::run::PlanComplexity::XL,
+                    _ => return Err("--complexity must be S, M, L, or XL".to_string()),
+                };
+                if complexity.replace(parsed).is_some() {
+                    return Err("--complexity may only be supplied once".to_string());
+                }
+            }
+            "--max-plan-revisions" => {
+                let value = value("--max-plan-revisions")?;
+                if revisions_seen {
+                    return Err("--max-plan-revisions may only be supplied once".to_string());
+                }
+                revisions_seen = true;
+                max_plan_revisions = value
+                    .parse()
+                    .map_err(|_| "--max-plan-revisions must be an integer in 0..=3".to_string())?;
+                if max_plan_revisions > 3 {
+                    return Err("--max-plan-revisions must be in 0..=3".to_string());
+                }
+            }
+            "--require-second-opinion" => {
+                if require_second_opinion {
+                    return Err("--require-second-opinion may only be supplied once".to_string());
+                }
+                require_second_opinion = true;
+            }
+            "--config" => {
+                let value = value("--config")?;
+                if config_seen {
+                    return Err("--config may only be supplied once".to_string());
+                }
+                config_seen = true;
+                config = PathBuf::from(value);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    let target = target
+        .ok_or_else(|| "plan prepare requires exactly one of --bead or --artifact".to_string())?;
+    match (&target, tier, complexity) {
+        (PlanCliTarget::Artifact(_), Some(_), Some(_)) | (PlanCliTarget::Bead(_), None, None) => {}
+        (PlanCliTarget::Artifact(_), _, _) => {
+            return Err("artifact input requires --tier-floor and --complexity".to_string());
+        }
+        (PlanCliTarget::Bead(_), _, _) => return Err(
+            "Bead input derives tier and complexity; do not supply --tier-floor or --complexity"
+                .to_string(),
+        ),
+    }
+    Ok(PlanPrepareOptions {
+        repo: repo.ok_or_else(|| "plan prepare requires --repo <path>".to_string())?,
+        target,
+        output_kind: output_kind.ok_or_else(|| {
+            "plan prepare requires --output-kind <spec|implementation-plan>".to_string()
+        })?,
+        tier,
+        complexity,
+        max_plan_revisions,
+        require_second_opinion,
+        config,
+    })
+}
+
+fn run_plan(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    match it.next().as_deref() {
+        Some("prepare") => run_plan_prepare(&it.collect::<Vec<_>>()),
+        Some("dispatch") => run_plan_dispatch(&it.collect::<Vec<_>>()),
+        Some("status") => run_plan_status(&it.collect::<Vec<_>>()),
+        Some("cancel") => run_plan_cancel(&it.collect::<Vec<_>>()),
+        Some(other) => {
+            eprintln!("unknown plan subcommand: {other}");
+            ExitCode::from(2)
+        }
+        None => {
+            eprintln!("usage: conductor plan <prepare|dispatch|status|cancel>");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn plan_paths() -> crate::plan_job::PlanJobPaths {
+    crate::plan_job::PlanJobPaths {
+        state_dir: state_dir(),
+        reports_home: reports_home(),
+    }
+}
+
+fn run_plan_prepare(args: &[String]) -> ExitCode {
+    let options = match parse_plan_prepare_options(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("plan prepare: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let config = match config::load(&options.config) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("config: invalid — {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let input = match plan_cli_input(&options) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("plan prepare: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    match crate::plan_job::prepare(
+        &plan_paths(),
+        &config,
+        &crate::bursar::CommandBursarClient::new(),
+        crate::plan_job::PlanPrepareRequest {
+            repo: options.repo,
+            input,
+            output_kind: options.output_kind,
+            max_plan_revisions: options.max_plan_revisions,
+            require_second_opinion: options.require_second_opinion,
+        },
+    ) {
+        Ok(prepared) => {
+            println!("plan {}: awaiting approval", prepared.run_id);
+            println!("report: {}", prepared.report_path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("plan prepare: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn plan_cli_input(
+    options: &PlanPrepareOptions,
+) -> Result<crate::plan_job::PlanPrepareInput, String> {
+    match &options.target {
+        PlanCliTarget::Artifact(path) => {
+            let bytes = std::fs::read(path)
+                .map_err(|error| format!("read plan artifact {}: {error}", path.display()))?;
+            Ok(crate::plan_job::PlanPrepareInput::Artifact {
+                bytes,
+                tier: options.tier.expect("artifact grammar sets tier"),
+                complexity: options
+                    .complexity
+                    .expect("artifact grammar sets complexity"),
+            })
+        }
+        PlanCliTarget::Bead(bead_id) => {
+            let output = Command::new("bd")
+                .args(["show", bead_id, "--json"])
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|error| format!("bd show {bead_id}: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "bd show {bead_id}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .map_err(|error| format!("bd show {bead_id} JSON: {error}"))?;
+            let tier = bead_tier(&value)?;
+            let complexity = bead_complexity(&value)?;
+            Ok(crate::plan_job::PlanPrepareInput::Bead {
+                bead_id: bead_id.clone(),
+                bytes: output.stdout,
+                tier,
+                complexity,
+            })
+        }
+    }
+}
+
+fn bead_tier(value: &serde_json::Value) -> Result<crate::run::PlanTier, String> {
+    match value.get("tier").and_then(serde_json::Value::as_str) {
+        Some("junior") => Ok(crate::run::PlanTier::Junior),
+        Some("senior") => Ok(crate::run::PlanTier::Senior),
+        Some("lead") => Ok(crate::run::PlanTier::Lead),
+        _ => Err("Bead JSON must contain tier: junior|senior|lead".to_string()),
+    }
+}
+
+fn bead_complexity(value: &serde_json::Value) -> Result<crate::run::PlanComplexity, String> {
+    match value.get("complexity").and_then(serde_json::Value::as_str) {
+        Some("S") => Ok(crate::run::PlanComplexity::S),
+        Some("M") => Ok(crate::run::PlanComplexity::M),
+        Some("L") => Ok(crate::run::PlanComplexity::L),
+        Some("XL") => Ok(crate::run::PlanComplexity::XL),
+        _ => Err("Bead JSON must contain complexity: S|M|L|XL".to_string()),
+    }
+}
+
+fn parse_plan_run_options(args: &[String], verb: &str) -> Result<(String, PathBuf), String> {
+    let Some(run_id) = args.first() else {
+        return Err(format!("plan {verb} requires <run-id>"));
+    };
+    if !valid_cli_review_id(run_id) {
+        return Err("plan run id must contain only alphanumeric, '_' or '-' bytes".to_string());
+    }
+    let mut config = PathBuf::from("conductor.toml");
+    if args.len() == 1 {
+        return Ok((run_id.clone(), config));
+    }
+    if args.len() == 3 && args[1] == "--config" {
+        config = PathBuf::from(&args[2]);
+        return Ok((run_id.clone(), config));
+    }
+    Err(format!(
+        "plan {verb} accepts only <run-id> [--config <path>]"
+    ))
+}
+
+fn run_plan_status(args: &[String]) -> ExitCode {
+    let (run_id, _) = match parse_plan_run_options(args, "status") {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("plan status: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    match crate::plan_job::status(&plan_paths(), &run_id) {
+        Ok(status) => {
+            println!("{status}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("plan status: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_plan_cancel(args: &[String]) -> ExitCode {
+    let (run_id, config_path) = match parse_plan_run_options(args, "cancel") {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("plan cancel: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let config = match config::load(&config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("config: invalid — {error}");
+            return ExitCode::from(2);
+        }
+    };
+    match crate::plan_job::cancel(&plan_paths(), &config, &run_id) {
+        Ok(()) => {
+            println!("canceled");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("plan cancel: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_plan_dispatch(args: &[String]) -> ExitCode {
+    let (run_id, config_path) = match parse_plan_run_options(args, "dispatch") {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("plan dispatch: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let config = match config::load(&config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("config: invalid — {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let author = CommandPlanAuthor { config: &config };
+    match crate::plan_job::dispatch(
+        &plan_paths(),
+        &config,
+        &crate::bursar::CommandBursarClient::new(),
+        &run_id,
+        &author,
+    ) {
+        Ok(()) => {
+            println!("awaiting_peer");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("plan dispatch: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+struct CommandPlanAuthor<'a> {
+    config: &'a crate::config::Config,
+}
+
+impl crate::plan_job::PlanAuthor for CommandPlanAuthor<'_> {
+    fn author(&self, request: &crate::plan_job::PlanAuthorRequest) -> Result<Vec<u8>, String> {
+        let entry = self
+            .config
+            .roster
+            .iter()
+            .find(|entry| entry.name == request.execution.profile_id)
+            .ok_or_else(|| "approved author is absent from conductor runtime roster".to_string())?;
+        let prompt = format!(
+            "Return only strict conductor/plan-document@1 {} JSON. Plan this immutable input without applying changes:\\n{}",
+            match request.output_kind {
+                crate::plan_job::PlanOutputKind::Spec => "spec",
+                crate::plan_job::PlanOutputKind::ImplementationPlan => "implementation-plan",
+            },
+            String::from_utf8_lossy(&request.input)
+        );
+        let (program, args) = match entry.backend {
+            crate::config::Backend::Claude => ("claude", vec!["-p".to_string(), prompt]),
+            crate::config::Backend::Pi => ("pi", vec!["-p".to_string(), prompt]),
+            crate::config::Backend::Codex => ("codex", vec!["exec".to_string(), prompt]),
+            crate::config::Backend::Omp => ("omp", vec!["-p".to_string(), prompt]),
+            crate::config::Backend::Agy => ("agy", vec!["-p".to_string(), prompt]),
+        };
+        let output = Command::new(program)
+            .args(args)
+            .current_dir(&request.worktree)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("plan author {program}: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "plan author {program}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(output.stdout)
+    }
+}
 fn run_adversarial(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     match it.next().as_deref() {
         Some("plan") => run_adversarial_plan(it),
@@ -1418,6 +1852,40 @@ mod tests {
         runs.pop().expect("one run")
     }
 
+    #[test]
+    fn plan_prepare_parser_requires_one_exact_target_and_artifact_metadata() {
+        let parsed = parse_plan_prepare_options(&[
+            "--repo".to_string(),
+            "/tmp/repo".to_string(),
+            "--artifact".to_string(),
+            "/tmp/input.md".to_string(),
+            "--output-kind".to_string(),
+            "implementation-plan".to_string(),
+            "--tier-floor".to_string(),
+            "senior".to_string(),
+            "--complexity".to_string(),
+            "L".to_string(),
+            "--max-plan-revisions".to_string(),
+            "2".to_string(),
+            "--require-second-opinion".to_string(),
+        ])
+        .expect("strict artifact prepare grammar");
+        assert_eq!(parsed.max_plan_revisions, 2);
+        assert!(parsed.require_second_opinion);
+        assert!(
+            parse_plan_prepare_options(&[
+                "--repo".to_string(),
+                "/tmp/repo".to_string(),
+                "--bead".to_string(),
+                "plan-1".to_string(),
+                "--artifact".to_string(),
+                "/tmp/input.md".to_string(),
+                "--output-kind".to_string(),
+                "spec".to_string(),
+            ])
+            .is_err()
+        );
+    }
     #[test]
     fn adversarial_plan_and_dispatch_parsers_enforce_exact_grammar() {
         let plan = parse_adversarial_plan_options(&[

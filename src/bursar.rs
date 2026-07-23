@@ -484,6 +484,14 @@ impl RosterSnapshot {
     pub(crate) fn policy_sha256(&self) -> &str {
         &self.policy_sha256
     }
+
+    pub(crate) fn snapshot_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn source_artifact(&self) -> &RosterSourceArtifact {
+        &self.source_artifact
+    }
 }
 
 fn backend_from_harness(harness: &str) -> Result<crate::config::Backend> {

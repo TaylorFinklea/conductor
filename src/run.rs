@@ -14,10 +14,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::bursar::RuntimeLimitEvidence;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use crate::bursar::RuntimeLimitEvidence;
 
 /// Schema tag stamped on every manifest written by this module.
 pub(crate) const RUN_SCHEMA: &str = "conductor/run@2";
@@ -670,6 +670,22 @@ pub(crate) struct NewRun {
     pub(crate) approval: Option<serde_json::Value>,
 }
 
+/// Fields pinned into a new native plan run before approval. The input bytes
+/// are copied once to the path declared by its immutable [`PlanTarget`].
+#[derive(Debug, Clone)]
+pub(crate) struct NewPlanRun {
+    pub(crate) run_id: String,
+    pub(crate) target: RunTarget,
+    pub(crate) details: PlanRunDetails,
+    pub(crate) approved_profiles: Vec<String>,
+    pub(crate) bursar_roster_artifact: Option<ArtifactRef>,
+    pub(crate) roster_snapshot: RosterSnapshotInput,
+    pub(crate) limits: RunLimits,
+    pub(crate) verifier: RunVerifier,
+    pub(crate) approval: serde_json::Value,
+    pub(crate) input_bytes: Vec<u8>,
+}
+
 /// Fields for one `conductor/event@2` row; `run_id`, `seq`, `ts`, `job`, and
 /// `target` are filled in by the owning [`RunHandle`].
 #[derive(Debug, Clone, Default)]
@@ -693,6 +709,11 @@ pub(crate) struct RunHandle {
 /// clock or this counter.
 static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+fn plan_input_artifact(input: &PlanInput) -> &ArtifactRef {
+    match input {
+        PlanInput::Bead { artifact, .. } | PlanInput::Artifact { artifact, .. } => artifact,
+    }
+}
 fn new_run_id(job: RunJob, now: DateTime<Utc>, counter: u64) -> String {
     format!(
         "run-{}-{}-p{}-{counter:06}",
@@ -873,6 +894,148 @@ impl RunHandle {
                     now,
                 )?;
             }
+            Ok(handle)
+        })();
+        if setup.is_err() {
+            let _ = std::fs::remove_dir_all(cleanup_dir);
+        }
+        setup
+    }
+
+    /// Creates the canonical durable state for an approval-gated native plan.
+    /// Unlike generic runs, every plan is born with its structural details,
+    /// copied input, exact roster snapshot, and immutable authorization.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "plan creation persists all immutable artifacts before the initial event"
+    )]
+    pub(crate) fn create_plan(state_dir: &Path, request: NewPlanRun) -> Result<Self> {
+        require_v2_activation_preflight(state_dir)?;
+        let NewPlanRun {
+            run_id,
+            target,
+            details,
+            approved_profiles,
+            bursar_roster_artifact,
+            roster_snapshot,
+            limits,
+            verifier,
+            approval,
+            input_bytes,
+        } = request;
+        validate_run_id(&run_id)?;
+        validate_sha256(&roster_snapshot.policy_sha256, "roster policy")?;
+        let parsed = crate::bursar::parse_roster_snapshot(&roster_snapshot.bytes)
+            .map_err(|error| RunError::new(format!("invalid roster snapshot: {error}")))?;
+        if parsed.policy_sha256() != roster_snapshot.policy_sha256 {
+            return Err(RunError::new(
+                "roster snapshot policy_sha256 does not match prepared policy",
+            ));
+        }
+        if let Some(artifact) = bursar_roster_artifact.as_ref() {
+            validate_artifact_ref(artifact, "bursar roster artifact")?;
+        }
+        let input_artifact = plan_input_artifact(&details.target.input).clone();
+        validate_artifact_ref(&input_artifact, "plan target input")?;
+        if format!("{:x}", Sha256::digest(&input_bytes)) != input_artifact.sha256 {
+            return Err(RunError::new(
+                "copied plan input bytes do not match the immutable plan target digest",
+            ));
+        }
+        let root = runs_dir(state_dir);
+        std::fs::create_dir_all(&root).map_err(|error| {
+            RunError::new(format!(
+                "failed to create runs dir {}: {error}",
+                root.display()
+            ))
+        })?;
+        let dir = root.join(&run_id);
+        std::fs::create_dir(&dir).map_err(|error| {
+            RunError::new(format!(
+                "failed to create plan run dir {}: {error}",
+                dir.display()
+            ))
+        })?;
+        let created_at = Utc::now().to_rfc3339();
+        let manifest = RunManifest {
+            schema: RUN_SCHEMA.to_string(),
+            run_id,
+            job: RunJob::Plan,
+            target,
+            details: RunDetails::Plan { state: details },
+            created_at: created_at.clone(),
+            updated_at: created_at,
+            approved_profiles: ApprovedProfileEnvelope {
+                profiles: approved_profiles,
+            },
+            bursar_roster_artifact,
+            roster_snapshot: None,
+            roster_policy_sha256: None,
+            limits,
+            verifier,
+            artifacts: Vec::new(),
+            lifecycle: RunLifecycle::Started,
+            outcome: None,
+        };
+        let mut handle = Self {
+            dir,
+            manifest,
+            next_seq: 1,
+        };
+        let cleanup_dir = handle.dir.clone();
+        let setup = (|| {
+            std::fs::create_dir(handle.dir.join("attempts")).map_err(|error| {
+                RunError::new(format!(
+                    "failed to create attempts dir {}: {error}",
+                    handle.dir.join("attempts").display()
+                ))
+            })?;
+            std::fs::create_dir(handle.dir.join("artifacts")).map_err(|error| {
+                RunError::new(format!(
+                    "failed to create artifacts dir {}: {error}",
+                    handle.dir.join("artifacts").display()
+                ))
+            })?;
+            let input_relative = Path::new(&input_artifact.path);
+            write_new_file(&handle.dir.join(input_relative), &input_bytes)?;
+            validate_plan_details(
+                &handle.manifest_path(),
+                match &handle.manifest.details {
+                    RunDetails::Plan { state } => state,
+                    _ => return Err(RunError::new("native plan run lost plan details")),
+                },
+            )?;
+            let approval_ref = handle.write_approval(&approval)?;
+            let roster_relative = Path::new("roster.json");
+            write_new_file(&handle.dir.join(roster_relative), &roster_snapshot.bytes)?;
+            let copied_roster = RosterSnapshotArtifact {
+                path: "roster.json".to_string(),
+                size_bytes: u64::try_from(roster_snapshot.bytes.len())
+                    .map_err(|_| RunError::new("roster snapshot exceeds u64"))?,
+                sha256: format!("{:x}", Sha256::digest(&roster_snapshot.bytes)),
+            };
+            handle.manifest.roster_policy_sha256 = Some(roster_snapshot.policy_sha256);
+            handle.manifest.roster_snapshot = Some(copied_roster.clone());
+            let mut initial_refs = vec![
+                input_artifact.clone(),
+                approval_ref,
+                ArtifactRef {
+                    path: copied_roster.path,
+                    sha256: copied_roster.sha256,
+                },
+            ];
+            if let Some(roster) = handle.manifest.bursar_roster_artifact.clone() {
+                initial_refs.push(roster);
+            }
+            handle.write_manifest()?;
+            handle.append_event(
+                EventKind::RunStarted,
+                EventInput {
+                    artifact_refs: initial_refs,
+                    outcome: Some("awaiting_approval".to_string()),
+                    ..EventInput::default()
+                },
+            )?;
             Ok(handle)
         })();
         if setup.is_err() {
@@ -1208,6 +1371,115 @@ impl RunHandle {
                 ..EventInput::default()
             },
         )
+    }
+
+    /// Returns the immutable and mutable structural state of a native plan.
+    pub(crate) fn plan(&self) -> Result<&PlanRunDetails> {
+        match &self.manifest.details {
+            RunDetails::Plan { state } => Ok(state),
+            _ => Err(RunError::new("operation requires a plan run")),
+        }
+    }
+
+    fn plan_mut(&mut self, operation: &str) -> Result<&mut PlanRunDetails> {
+        match &mut self.manifest.details {
+            RunDetails::Plan { state } => Ok(state),
+            _ => Err(RunError::new(format!("{operation} requires a plan run"))),
+        }
+    }
+
+    /// Copies generated plan bytes into the run exactly once and returns their
+    /// content-addressed identity.
+    pub(crate) fn capture_plan_artifact(
+        &self,
+        relative_destination: &Path,
+        bytes: &[u8],
+    ) -> Result<ArtifactRef> {
+        validate_relative_artifact_path(relative_destination)?;
+        let destination = self.dir.join(relative_destination);
+        match std::fs::read(&destination) {
+            Ok(existing) if existing == bytes => Ok(artifact_ref(relative_destination, bytes)),
+            Ok(_) => Err(RunError::new(
+                "plan artifact already exists with different bytes",
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                write_new_file(&destination, bytes)?;
+                Ok(artifact_ref(relative_destination, bytes))
+            }
+            Err(error) => Err(RunError::new(format!(
+                "failed to read plan artifact {}: {error}",
+                destination.display()
+            ))),
+        }
+    }
+
+    /// Durably records the selected immutable author before an invocation.
+    pub(crate) fn start_plan_authoring(&mut self, author: ApprovedExecution) -> Result<()> {
+        let attempt_limit = self.plan()?.stage_attempt_limit;
+        self.plan_mut("starting plan authoring")?
+            .progress
+            .start_authoring(author.clone(), attempt_limit)?;
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()?;
+        self.append_event(
+            EventKind::AttemptStarted,
+            EventInput {
+                profile_id: Some(author.profile_id),
+                outcome: Some("planner_authoring".to_string()),
+                ..EventInput::default()
+            },
+        )
+    }
+
+    /// Atomically checkpoints a validated author artifact at the structural
+    /// peer boundary. Peer verdict execution is intentionally a later phase.
+    pub(crate) fn await_plan_peer(&mut self, artifact: ArtifactRef) -> Result<()> {
+        validate_artifact_ref(&artifact, "plan author artifact")?;
+        validate_local_artifact(&self.manifest_path(), &artifact)?;
+        self.plan_mut("awaiting plan peer")?
+            .progress
+            .await_peer(artifact.clone())?;
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()?;
+        self.append_event(
+            EventKind::AttemptFinished,
+            EventInput {
+                artifact_refs: vec![artifact],
+                outcome: Some("plan_document_ready".to_string()),
+                ..EventInput::default()
+            },
+        )
+    }
+
+    /// Ends an unstarted plan run and never rewinds its scheduler rotation.
+    pub(crate) fn cancel_prepared_plan(&mut self) -> Result<()> {
+        if !matches!(self.plan()?.progress, PlanProgress::Prepared) {
+            return Err(RunError::new(
+                "plan cancellation is allowed only before authoring begins",
+            ));
+        }
+        self.plan_mut("canceling plan")?.progress = PlanProgress::Terminal {
+            verdict: PlanTerminalVerdict::Blocked,
+        };
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()?;
+        self.finish("canceled")
+    }
+
+    /// Marks a plan document with unresolved author questions as terminal
+    /// needs-input rather than allowing a schema-shaped artifact to proceed.
+    pub(crate) fn finish_plan_needs_input(&mut self, artifact: ArtifactRef) -> Result<()> {
+        if !matches!(self.plan()?.progress, PlanProgress::Authoring { .. }) {
+            return Err(RunError::new(
+                "needs-input plan completion requires active authoring",
+            ));
+        }
+        self.plan_mut("finishing plan needs input")?.progress = PlanProgress::Terminal {
+            verdict: PlanTerminalVerdict::NeedsInput,
+        };
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()?;
+        self.finish_with_artifacts("needs_input", vec![artifact])
     }
 
     /// Records a policy-approved fresh budget before resuming a verifier or
@@ -1617,7 +1889,6 @@ impl PendingWorkKey {
     }
 }
 
-
 impl PendingWorkIndex {
     /// Reads each lightweight manifest once. This intentionally does not
     /// validate artifact hashes: those can be large and are authentication
@@ -1626,7 +1897,9 @@ impl PendingWorkIndex {
         let root = runs_dir(state_dir);
         let entries = match std::fs::read_dir(&root) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
             Err(error) => {
                 return Err(RunError::new(format!(
                     "failed to read runs dir {}: {error}",
@@ -1666,7 +1939,11 @@ impl PendingWorkIndex {
             };
             index.candidates.entry(key).or_default().push(path);
         }
-        for paths in index.candidates.values_mut().chain(index.malformed.values_mut()) {
+        for paths in index
+            .candidates
+            .values_mut()
+            .chain(index.malformed.values_mut())
+        {
             paths.sort();
         }
         Ok(index)
@@ -1748,7 +2025,7 @@ fn pending_work_key_from_untrusted_manifest(value: &serde_json::Value) -> Option
         && details.get("job")?.as_str() == Some("work")
         && value.get("lifecycle")?.as_str() != Some("finished")
         && state.get("stage")?.as_str() == Some("pending_review"))
-        .then(|| PendingWorkKey::new(cycle_id, repo, bead))
+    .then(|| PendingWorkKey::new(cycle_id, repo, bead))
 }
 
 const DISCOVERY_MANIFEST_MAX_BYTES: u64 = 128 * 1024;
@@ -1833,8 +2110,9 @@ impl PartialJsonParser<'_> {
         fields: &mut PartialPendingWorkKey,
     ) -> Option<()> {
         let value = match (scope, key) {
-            (PartialScope::Target, "repo" | "bead")
-            | (PartialScope::WorkState, "cycle_id") => self.parse_string()?,
+            (PartialScope::Target, "repo" | "bead") | (PartialScope::WorkState, "cycle_id") => {
+                self.parse_string()?
+            }
             _ => return self.skip_value(fields),
         };
         match (scope, key) {
@@ -3074,13 +3352,8 @@ mod tests {
     #[test]
     fn find_pending_work_run_ignores_an_unrelated_run_with_corrupt_artifacts() {
         let temp = TempDir::new("pending-unrelated-corrupt");
-        let unrelated = pending_work_run(
-            &temp,
-            "cycle-other",
-            "/repo/other",
-            "other-1",
-            "unrelated",
-        );
+        let unrelated =
+            pending_work_run(&temp, "cycle-other", "/repo/other", "other-1", "unrelated");
         std::fs::remove_file(unrelated.dir().join("artifacts/mechanical.log"))
             .expect("prune unrelated artifact");
         let matching = pending_work_run(
@@ -3091,13 +3364,8 @@ mod tests {
             "matching",
         );
 
-        let found = find_pending_work_run(
-            temp.path(),
-            "cycle-target",
-            "/repo/target",
-            "target-1",
-        )
-        .expect("unrelated corruption must not block discovery");
+        let found = find_pending_work_run(temp.path(), "cycle-target", "/repo/target", "target-1")
+            .expect("unrelated corruption must not block discovery");
 
         assert_eq!(found.as_deref(), Some(matching.run_id()));
     }
@@ -3115,13 +3383,8 @@ mod tests {
         std::fs::remove_file(matching.dir().join("artifacts/mechanical.log"))
             .expect("prune matching artifact");
 
-        let error = find_pending_work_run(
-            temp.path(),
-            "cycle-target",
-            "/repo/target",
-            "target-1",
-        )
-        .expect_err("matching corruption must fail closed");
+        let error = find_pending_work_run(temp.path(), "cycle-target", "/repo/target", "target-1")
+            .expect_err("matching corruption must fail closed");
 
         assert!(
             error.to_string().contains("pending-review candidate"),
@@ -3132,30 +3395,13 @@ mod tests {
     #[test]
     fn find_pending_work_run_reports_matching_duplicates_in_run_id_order() {
         let temp = TempDir::new("pending-duplicates");
-        let first = pending_work_run(
-            &temp,
-            "cycle-target",
-            "/repo/target",
-            "target-1",
-            "first",
-        );
-        let second = pending_work_run(
-            &temp,
-            "cycle-target",
-            "/repo/target",
-            "target-1",
-            "second",
-        );
+        let first = pending_work_run(&temp, "cycle-target", "/repo/target", "target-1", "first");
+        let second = pending_work_run(&temp, "cycle-target", "/repo/target", "target-1", "second");
         let mut expected = [first.run_id().to_string(), second.run_id().to_string()];
         expected.sort();
 
-        let error = find_pending_work_run(
-            temp.path(),
-            "cycle-target",
-            "/repo/target",
-            "target-1",
-        )
-        .expect_err("multiple matching pending runs must fail closed");
+        let error = find_pending_work_run(temp.path(), "cycle-target", "/repo/target", "target-1")
+            .expect_err("multiple matching pending runs must fail closed");
 
         assert_eq!(
             error.to_string(),
@@ -3169,13 +3415,9 @@ mod tests {
     #[test]
     fn find_pending_work_run_ignores_pruned_finished_history_for_another_target() {
         let temp = TempDir::new("pending-pruned-finished");
-        let mut finished = RunHandle::create_at(
-            temp.path(),
-            RunJob::Work,
-            new_run_request(),
-            fixed_now(),
-        )
-        .expect("create finished history");
+        let mut finished =
+            RunHandle::create_at(temp.path(), RunJob::Work, new_run_request(), fixed_now())
+                .expect("create finished history");
         let history_log = temp.path().join("history.log");
         std::fs::write(&history_log, b"historic evidence\n").expect("write history log");
         finished
@@ -3192,13 +3434,8 @@ mod tests {
             "matching",
         );
 
-        let found = find_pending_work_run(
-            temp.path(),
-            "cycle-target",
-            "/repo/target",
-            "target-1",
-        )
-        .expect("pruned finished history must not block discovery");
+        let found = find_pending_work_run(temp.path(), "cycle-target", "/repo/target", "target-1")
+            .expect("pruned finished history must not block discovery");
 
         assert_eq!(found.as_deref(), Some(matching.run_id()));
     }
@@ -3304,28 +3541,11 @@ mod tests {
     #[test]
     fn pending_work_index_authenticates_multiple_targets_without_rescanning_history() {
         let temp = TempDir::new("pending-index");
-        let first = pending_work_run(
-            &temp,
-            "cycle-target",
-            "/repo/first",
-            "first-1",
-            "first",
-        );
-        let second = pending_work_run(
-            &temp,
-            "cycle-target",
-            "/repo/second",
-            "second-1",
-            "second",
-        );
+        let first = pending_work_run(&temp, "cycle-target", "/repo/first", "first-1", "first");
+        let second = pending_work_run(&temp, "cycle-target", "/repo/second", "second-1", "second");
         let index = PendingWorkIndex::scan(temp.path()).expect("build per-cycle discovery index");
-        let unrelated = pending_work_run(
-            &temp,
-            "cycle-other",
-            "/repo/other",
-            "other-1",
-            "unrelated",
-        );
+        let unrelated =
+            pending_work_run(&temp, "cycle-other", "/repo/other", "other-1", "unrelated");
         std::fs::remove_file(unrelated.dir().join("artifacts/mechanical.log"))
             .expect("corrupt post-index unrelated history");
 

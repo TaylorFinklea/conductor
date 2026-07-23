@@ -1148,7 +1148,7 @@ fn open_lock(path: &Path) -> Result<File> {
         })
 }
 
-fn approved_execution(
+pub(crate) fn approved_execution(
     profile: &crate::bursar::RosterProfile,
     provider: &crate::bursar::RosterProvider,
 ) -> crate::run::ApprovedExecution {
