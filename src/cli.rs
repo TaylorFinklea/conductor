@@ -5,7 +5,7 @@ use std::process::{Command, ExitCode, Stdio};
 
 use crate::config;
 
-const USAGE: &str = "usage: undertake [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [migrate state --from <legacy-root> --to <undertake-root> [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]]";
+const USAGE: &str = "usage: undertake [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [plan prepare --repo <path> (--bead <id>|--artifact <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL>) --output-kind <spec|implementation-plan> [--max-plan-revisions <0..3>] [--require-second-opinion] [--config <path>]] [plan dispatch <run-id> [--config <path>]] [plan status <run-id> [--config <path>]] [plan cancel <run-id> [--config <path>]] [migrate state --from <legacy-root> --to <undertake-root> [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]]";
 
 const DEFAULT_ADVERSARIAL_QUESTION: &str =
     "What are the highest-risk flaws in this artifact, and what must change before proceeding?";
@@ -2059,6 +2059,7 @@ fn print_help() {
     println!("Commands:");
     println!("  adversarial-review  Plan or dispatch an approval-gated read-only design review");
     println!("  config check   Validate undertake.toml and run preflight checks");
+    println!("  plan           Prepare, inspect, dispatch, or cancel a bounded native plan");
     println!("  migrate state  Copy quiescent legacy state into a new Undertake root");
     println!(
         "  roster         Musterroll owns execution profiles; inspect `musterroll roster snapshot --json`"
@@ -3307,6 +3308,7 @@ provider = "codex"
     #[test]
     fn active_cli_uses_only_undertake_identity() {
         assert!(USAGE.starts_with("usage: undertake "));
+        assert!(USAGE.contains("[plan prepare --repo <path>"));
         assert!(!USAGE.contains("conductor"));
         assert_eq!(
             parse_cycle_options(&["--dry-run".to_string()]).unwrap().config,

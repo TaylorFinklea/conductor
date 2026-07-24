@@ -42,7 +42,7 @@ repo = "guildhall"
 cost_policy = "oss"
 
 [[repo_policy]]
-repo = "hindsight"
+repo = "afterfact"
 cost_policy = "oss"
 
 [[repo_policy]]
@@ -58,7 +58,7 @@ repo = "tesela"
 cost_policy = "oss"
 
 [[repo_policy]]
-repo = "warden"
+repo = "cautionlight"
 cost_policy = "oss"
 
 [budgets]

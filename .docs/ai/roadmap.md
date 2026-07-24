@@ -4,7 +4,7 @@
 
 ## Vision
 
-Undertake: a single Rust binary that runs autonomous work-routing cycles over the ~24 beads-tracked repos under `~/git` — scan → triage → plan → approval → dispatch → verify → report — composing bd, pi/agy/claude, orchestra, and harness-deck over subprocess/file contracts. Historical v1 spec: `phases/conductor-v1-spec.md`.
+Undertake: a single Rust binary that runs autonomous work-routing cycles over the ~24 beads-tracked repos under `~/git` — scan → triage → plan → approval → dispatch → verify → report — composing bd, pi/agy/claude, orchestra, and harness-deck over subprocess/file contracts. The retained v1 specification is historical.
 
 ## Now / Next / Later
 
@@ -18,16 +18,16 @@ Undertake: a single Rust binary that runs autonomous work-routing cycles over th
   `phases/bounded-dispatch-approval-spec.md`, and
   `phases/adversarial-design-review-spec.md`. **Landmine:** adversarial review
   performs no bd/git/worktree/apply mutation and must not share normal-cycle
-  dispatch semantics. The later Conductor-core consolidation and migration to
+  dispatch semantics. The later Undertake-core consolidation and migration to
   a `review` job are not implemented here.
-- [x] Strict role-routing v2 cutover — COMPLETE (2026-07-23). Bursar owns
-  profile identity and unordered role capabilities through `bursar/roster@2`;
-  every active `conductor/run@2` pins its exact snapshot. Conductor owns
+- [x] Strict role-routing v2 cutover — COMPLETE (2026-07-23). Musterroll owns
+  profile identity and unordered role capabilities through `musterroll/roster@2`;
+  every active `undertake/run@2` pins its exact snapshot. Undertake owns
   durable role-lane scheduling, plan author/peer/second-opinion execution,
   generic ledger/event evidence, and fail-closed activation preflight.
   `runs-v2/` is isolated from inert legacy history. Arena is removed.
-  Canonical contract: Guildhall `conductor-core-consolidation-spec.md`.
-- [x] **Rebrand cutover `harness-conductor` → `conductor` — COMPLETE** (2026-07-12). In-repo refs + chezmoi-personal source (`f95115b`); GitHub repo + backlog repo renamed (`backlog-conductor` resolves); dir moved; `chezmoi apply` published to live HOME (verified zero stale refs across `~/AGENTS.md`, `ralph`, scorecard digest, all skill copies); formerly-unmanaged `~/.agents/skills/conductor-arena` is now chezmoi-managed (chezmoi-personal `2c46d98`, mirrors the `dot_claude` copy). `conductor config check` passes against `~/git/conductor/conductor.toml`. Old path-keyed session dir (`-Users-tfinklea-git-harness-conductor`) held only 2 transcripts, no memory — not migrated.
+  Canonical contract: Guildhall `undertake-core-consolidation-spec.md`.
+- [x] The prior suite rebrand and managed-source cutover are complete; their exact migration evidence remains in dated records and git history.
 - [ ] Cycle 1 COMPLETE (9 beads closed: m0a, m0b, m1a, m1b, m2a, m2b, prompt, bdro, rev1); `cargo test` passes 84 tests. Live ready queue (`bd ready`, 6 items): `undertake-m4a`/`undertake-m3a` (P1), `undertake-agy`/`undertake-m1c`/`undertake-m0c` (P2), `undertake-cov1` (P3). Routing fields are in bd metadata; every bead's Verify is its `verify_cmd`.
 
 ### Next
@@ -40,7 +40,7 @@ Undertake: a single Rust binary that runs autonomous work-routing cycles over th
 
 ## Milestones
 
-See `phases/conductor-v1-spec.md` § Milestones (M0–M6) — each has scope + Verify there; beads are the per-item backlog.
+See the retained v1 specification's Milestones section (M0–M6); each has scope and Verify, and beads are the per-item backlog.
 
 ## Backlog
 

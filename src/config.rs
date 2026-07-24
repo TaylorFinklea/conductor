@@ -1678,6 +1678,8 @@ const PATH_TOOLS: &[&str] = &[
     "bun",
     "harness-deck",
     "musterroll",
+    "afterfact",
+    "cautionlight",
 ];
 
 #[derive(Debug, Clone)]
@@ -2659,6 +2661,8 @@ clean_cycles_to_unlock = 3
         assert!(!check(&checks, "bun").ok);
         assert!(!check(&checks, "harness-deck").ok);
         assert!(!check(&checks, "musterroll").ok);
+        assert!(!check(&checks, "afterfact").ok);
+        assert!(!check(&checks, "cautionlight").ok);
         assert!(check(&checks, "state dir").ok);
     }
 
