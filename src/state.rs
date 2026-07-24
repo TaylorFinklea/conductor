@@ -242,11 +242,17 @@ fn migrate_runs(source: &Path, destination: &Path) -> io::Result<u64> {
         let run_target = target.join(entry.file_name());
         fs::create_dir(&run_target)?;
         let source_run = entry.path();
-        let roster_hash = migrate_roster_snapshot(&source_run, &run_target)?;
-        if roster_hash.is_some() {
+        let roster_identity = migrate_roster_snapshot(&source_run, &run_target)?;
+        if roster_identity.is_some() {
             copied = copied.saturating_add(1);
         }
-        copied += migrate_run_manifest(&source_run, &run_target, roster_hash.as_deref())?;
+        copied += migrate_run_manifest(
+            &source_run,
+            &run_target,
+            roster_identity
+                .as_ref()
+                .map(|(hash, size)| (hash.as_str(), *size)),
+        )?;
         copied += migrate_run_events(&source_run, &run_target)?;
         copied += copy_run_payloads(&source_run, &run_target)?;
         crate::run::read_manifest(&run_target.join("manifest.json")).map_err(io::Error::other)?;
@@ -255,7 +261,7 @@ fn migrate_runs(source: &Path, destination: &Path) -> io::Result<u64> {
     Ok(copied)
 }
 
-fn migrate_roster_snapshot(source: &Path, destination: &Path) -> io::Result<Option<String>> {
+fn migrate_roster_snapshot(source: &Path, destination: &Path) -> io::Result<Option<(String, u64)>> {
     let path = source.join("roster.json");
     if !path.exists() {
         return Ok(None);
@@ -273,14 +279,16 @@ fn migrate_roster_snapshot(source: &Path, destination: &Path) -> io::Result<Opti
     bytes.push(b'\n');
     crate::musterroll::parse_roster_snapshot(&bytes).map_err(io::Error::other)?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
+    let size = u64::try_from(bytes.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "roster snapshot too large"))?;
     fs::write(destination.join("roster.json"), bytes)?;
-    Ok(Some(hash))
+    Ok(Some((hash, size)))
 }
 
 fn migrate_run_manifest(
     source: &Path,
     destination: &Path,
-    roster_hash: Option<&str>,
+    roster_identity: Option<(&str, u64)>,
 ) -> io::Result<u64> {
     let mut value: serde_json::Value =
         serde_json::from_slice(&fs::read(source.join("manifest.json"))?)
@@ -298,8 +306,8 @@ fn migrate_run_manifest(
     )?;
     value["schema"] = serde_json::Value::String(crate::run::RUN_SCHEMA.to_string());
     rewrite_owned_strings(&mut value);
-    if let Some(hash) = roster_hash {
-        rewrite_artifact_hash(&mut value, "roster.json", hash);
+    if let Some((hash, size)) = roster_identity {
+        rewrite_artifact_identity(&mut value, "roster.json", hash, size);
     }
     serde_json::from_value::<crate::run::RunManifest>(value.clone()).map_err(io::Error::other)?;
     let mut bytes = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
@@ -417,11 +425,11 @@ fn rewrite_owned_strings(value: &mut serde_json::Value) {
     }
 }
 
-fn rewrite_artifact_hash(value: &mut serde_json::Value, path: &str, hash: &str) {
+fn rewrite_artifact_identity(value: &mut serde_json::Value, path: &str, hash: &str, size: u64) {
     match value {
         serde_json::Value::Array(values) => {
             for value in values {
-                rewrite_artifact_hash(value, path, hash);
+                rewrite_artifact_identity(value, path, hash, size);
             }
         }
         serde_json::Value::Object(values) => {
@@ -430,9 +438,15 @@ fn rewrite_artifact_hash(value: &mut serde_json::Value, path: &str, hash: &str) 
                     "sha256".to_string(),
                     serde_json::Value::String(hash.to_string()),
                 );
+                if values.contains_key("size_bytes") {
+                    values.insert(
+                        "size_bytes".to_string(),
+                        serde_json::Value::Number(size.into()),
+                    );
+                }
             }
             for value in values.values_mut() {
-                rewrite_artifact_hash(value, path, hash);
+                rewrite_artifact_identity(value, path, hash, size);
             }
         }
         _ => {}
@@ -473,7 +487,6 @@ fn tree_digest(root: &Path) -> io::Result<String> {
                 ));
             }
         }
-        let _ = root;
         Ok(())
     }
 
@@ -803,6 +816,15 @@ mod tests {
         lane["schema"] = serde_json::json!("conductor/role-lane@1");
         std::fs::write(&lane_path, serde_json::to_vec_pretty(&lane).unwrap()).unwrap();
 
+        let roster_bytes = br#"{
+          "schema":"musterroll/roster@2",
+          "generated_at":"2026-07-24T12:00:00Z",
+          "source_artifact":{"path":"/source/roster.toml","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+          "policy_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "providers":[],
+          "profiles":[]
+        }"#
+        .to_vec();
         let mut run = crate::run::RunHandle::create(
             &source,
             crate::run::RunJob::Review,
@@ -811,6 +833,10 @@ mod tests {
                     repo: "/repo/example".to_string(),
                     bead: None,
                 },
+                roster_snapshot: Some(crate::run::RosterSnapshotInput {
+                    bytes: roster_bytes,
+                    policy_sha256: "b".repeat(64),
+                }),
                 ..crate::run::NewRun::default()
             },
         )
@@ -822,10 +848,20 @@ mod tests {
             .unwrap()
             .unwrap()
             .path();
+        let roster_path = run_dir.join("roster.json");
+        let mut legacy_roster: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&roster_path).unwrap()).unwrap();
+        legacy_roster["schema"] = serde_json::json!("bursar/roster@2");
+        let mut legacy_roster_bytes = serde_json::to_vec_pretty(&legacy_roster).unwrap();
+        legacy_roster_bytes.push(b'\n');
+        std::fs::write(&roster_path, &legacy_roster_bytes).unwrap();
         let manifest_path = run_dir.join("manifest.json");
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         manifest["schema"] = serde_json::json!("conductor/run@2");
+        manifest["roster_snapshot"]["size_bytes"] = serde_json::json!(legacy_roster_bytes.len());
+        manifest["roster_snapshot"]["sha256"] =
+            serde_json::json!(format!("{:x}", Sha256::digest(&legacy_roster_bytes)));
         std::fs::write(
             &manifest_path,
             serde_json::to_vec_pretty(&manifest).unwrap(),
@@ -864,7 +900,21 @@ mod tests {
             .unwrap()
             .unwrap()
             .path();
-        crate::run::read_manifest(&migrated_run_dir.join("manifest.json")).unwrap();
+        let migrated_manifest =
+            crate::run::read_manifest(&migrated_run_dir.join("manifest.json")).unwrap();
+        let migrated_roster_bytes = std::fs::read(migrated_run_dir.join("roster.json")).unwrap();
+        let migrated_roster: serde_json::Value =
+            serde_json::from_slice(&migrated_roster_bytes).unwrap();
+        assert_eq!(migrated_roster["schema"], "musterroll/roster@2");
+        let migrated_identity = migrated_manifest.roster_snapshot.unwrap();
+        assert_eq!(
+            migrated_identity.size_bytes,
+            migrated_roster_bytes.len() as u64
+        );
+        assert_eq!(
+            migrated_identity.sha256,
+            format!("{:x}", Sha256::digest(&migrated_roster_bytes))
+        );
         crate::run::read_events(&migrated_run_dir.join("events.jsonl")).unwrap();
 
         let restarted = crate::role_routing::RoleRouter::new(&destination, policy.clone()).unwrap();
