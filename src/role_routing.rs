@@ -516,7 +516,9 @@ impl RoleRouter {
         constraints: HardEligibility,
     ) -> Result<PreparedPlanner> {
         let snapshot = self.snapshot.as_ref().ok_or_else(|| {
-            RoleRoutingError::new("planner preparation requires a pinned Musterroll roster snapshot")
+            RoleRoutingError::new(
+                "planner preparation requires a pinned Musterroll roster snapshot",
+            )
         })?;
         let mut audited_pool = Vec::new();
         let mut allowed = BTreeSet::new();
@@ -630,7 +632,9 @@ impl RoleRouter {
         require_three_way_team: bool,
     ) -> Result<()> {
         let snapshot = self.snapshot.as_ref().ok_or_else(|| {
-            RoleRoutingError::new("contingency validation requires a pinned Musterroll roster snapshot")
+            RoleRoutingError::new(
+                "contingency validation requires a pinned Musterroll roster snapshot",
+            )
         })?;
         validate_preapproval_contingencies_for_snapshot(
             &self.policy,
@@ -1230,6 +1234,33 @@ const fn capacity_active_default() -> bool {
 
 const LEGACY_LANE_SCHEMA: &str = "conductor/role-lane@1";
 
+fn is_quiescent_lock_only_lane(path: &Path) -> Result<bool> {
+    let mut entries = std::fs::read_dir(path)
+        .map_err(|error| RoleRoutingError::new(format!("failed to read legacy lane: {error}")))?;
+    let Some(entry) = entries
+        .next()
+        .transpose()
+        .map_err(|error| RoleRoutingError::new(format!("failed to read legacy lane: {error}")))?
+    else {
+        return Ok(false);
+    };
+    if entries.next().is_some()
+        || entry.file_name() != "lane.lock"
+        || !entry
+            .file_type()
+            .map_err(|error| RoleRoutingError::new(error.to_string()))?
+            .is_file()
+        || entry
+            .metadata()
+            .map_err(|error| RoleRoutingError::new(error.to_string()))?
+            .len()
+            != 0
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// Copies only the current legacy scheduler lanes into the Undertake namespace.
 ///
 /// Historical policy lanes remain in the source snapshot. Current scores and
@@ -1273,6 +1304,14 @@ pub(crate) fn migrate_legacy_state(
             ));
         }
         let path = entry.path().join("state.json");
+        if !path.exists() {
+            if is_quiescent_lock_only_lane(&entry.path())? {
+                continue;
+            }
+            return Err(RoleRoutingError::new(
+                "legacy role-routing lane has no state envelope",
+            ));
+        }
         let bytes = std::fs::read(&path).map_err(|error| {
             RoleRoutingError::new(format!(
                 "failed to read legacy role-routing lane {}: {error}",
@@ -1290,11 +1329,7 @@ pub(crate) fn migrate_legacy_state(
                 "unknown legacy role-routing lane schema or policy",
             ));
         }
-        let old_lane = LaneKey::new(
-            &state.policy_digest,
-            state.role_id.clone(),
-            state.stage,
-        );
+        let old_lane = LaneKey::new(&state.policy_digest, state.role_id.clone(), state.stage);
         if entry.file_name().to_string_lossy() != hex_digest(old_lane.identity().as_bytes()) {
             return Err(RoleRoutingError::new(
                 "legacy role-routing lane path does not match its identity",
@@ -1721,8 +1756,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        HardEligibility, PlanStage, ProfileId, RoleBinding, RoleId, RoleRouter, RoutingPolicy,
-        RunId,
+        is_quiescent_lock_only_lane, HardEligibility, PlanStage, ProfileId, RoleBinding, RoleId,
+        RoleRouter, RoutingPolicy, RunId,
     };
 
     #[test]
@@ -2547,7 +2582,10 @@ mod tests {
         crate::musterroll::parse_roster_snapshot(&bytes).expect("valid snapshot")
     }
 
-    fn strict_constraints(snapshot: &crate::musterroll::RosterSnapshot, role: &str) -> HardEligibility {
+    fn strict_constraints(
+        snapshot: &crate::musterroll::RosterSnapshot,
+        role: &str,
+    ) -> HardEligibility {
         let allowed_profile_ids = snapshot
             .profiles
             .iter()
@@ -2582,6 +2620,23 @@ mod tests {
             max_in_flight_per_profile: 1.try_into().expect("nonzero"),
             provider_distinct_from: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn only_exact_zero_byte_lock_only_lanes_are_quiescent_residue() {
+        let temp = TempDir::new("lock-only-lane");
+        assert!(!is_quiescent_lock_only_lane(temp.path()).unwrap());
+
+        let lock = temp.path().join("lane.lock");
+        std::fs::write(&lock, b"").unwrap();
+        assert!(is_quiescent_lock_only_lane(temp.path()).unwrap());
+
+        std::fs::write(&lock, b"owner").unwrap();
+        assert!(!is_quiescent_lock_only_lane(temp.path()).unwrap());
+
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::write(temp.path().join("extra"), b"").unwrap();
+        assert!(!is_quiescent_lock_only_lane(temp.path()).unwrap());
     }
 
     struct TempDir {
