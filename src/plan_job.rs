@@ -2818,7 +2818,31 @@ pub(crate) fn cancel(
 ) -> Result<(), String> {
     let run = crate::run::RunHandle::open(&paths.state_dir, run_id)
         .map_err(|error| format!("plan run: {error}"))?;
-    plan_cancel_mode(&run)?;
+    let mode = plan_cancel_mode(&run)?;
+    let reservation_run_id = crate::role_routing::RunId::new(run_id.to_string())
+        .map_err(|error| error.to_string())?;
+    if matches!(mode, PlanCancelMode::FailedAuthoring) {
+        let _guard = crate::role_routing::RoleRouter::acquire_persisted_run_transition(
+            &paths.state_dir,
+            &reservation_run_id,
+        )
+        .map_err(|error| format!("plan run guard: {error}"))?;
+        let mut run = crate::run::RunHandle::open(&paths.state_dir, run_id)
+            .map_err(|error| format!("plan run after guard: {error}"))?;
+        if !matches!(plan_cancel_mode(&run)?, PlanCancelMode::FailedAuthoring) {
+            return Err("plan cancellation state changed while acquiring the run guard".to_string());
+        }
+        let approval = load_approval(&run)?;
+        crate::role_routing::RoleRouter::release_persisted_capacity(
+            &paths.state_dir,
+            &approval.reservation,
+        )
+        .map_err(|error| format!("planner reservation capacity: {error}"))?;
+        return run
+            .cancel_failed_authoring_plan()
+            .map_err(|error| format!("plan cancellation: {error}"));
+    }
+
     let roster_bytes = std::fs::read(run.dir().join("roster.json"))
         .map_err(|error| format!("captured Musterroll roster: {error}"))?;
     let snapshot = crate::musterroll::parse_roster_snapshot(&roster_bytes)
@@ -2828,14 +2852,14 @@ pub(crate) fn cancel(
     let router =
         crate::role_routing::RoleRouter::with_pinned_snapshot(&paths.state_dir, policy, snapshot)
             .map_err(|error| format!("role router: {error}"))?;
-    let reservation_run_id = crate::role_routing::RunId::new(run_id.to_string())
-        .map_err(|error| error.to_string())?;
     let _guard = router
         .acquire_run_transition(&reservation_run_id)
         .map_err(|error| format!("plan run guard: {error}"))?;
     let mut run = crate::run::RunHandle::open(&paths.state_dir, run_id)
         .map_err(|error| format!("plan run after guard: {error}"))?;
-    let mode = plan_cancel_mode(&run)?;
+    if !matches!(plan_cancel_mode(&run)?, PlanCancelMode::PreAuthoring) {
+        return Err("plan cancellation state changed while acquiring the run guard".to_string());
+    }
     let role = crate::role_routing::RoleId::new("plan").map_err(|error| error.to_string())?;
     let reservation = router
         .reservation(
@@ -2845,21 +2869,11 @@ pub(crate) fn cancel(
         )
         .map_err(|error| format!("planner reservation: {error}"))?
         .ok_or_else(|| "planner reservation is missing".to_string())?;
-    match mode {
-        PlanCancelMode::PreAuthoring => {
-            router
-                .cancel(&reservation)
-                .map_err(|error| format!("planner reservation: {error}"))?;
-            run.cancel_prepared_plan()
-        }
-        PlanCancelMode::FailedAuthoring => {
-            router
-                .release_capacity(&reservation)
-                .map_err(|error| format!("planner reservation capacity: {error}"))?;
-            run.cancel_failed_authoring_plan()
-        }
-    }
-    .map_err(|error| format!("plan cancellation: {error}"))
+    router
+        .cancel(&reservation)
+        .map_err(|error| format!("planner reservation: {error}"))?;
+    run.cancel_prepared_plan()
+        .map_err(|error| format!("plan cancellation: {error}"))
 }
 
 pub(crate) fn status(paths: &PlanJobPaths, run_id: &str) -> Result<String, String> {
@@ -4977,7 +4991,16 @@ enabled = true
 
         assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).is_err());
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "authoring");
-        cancel(&paths, &config, &prepared.run_id).expect("cancel failed authoring");
+        let mut changed_config = config.clone();
+        changed_config
+            .role_bindings
+            .push(crate::config::RoleBindingConfig {
+                role: "plan".to_string(),
+                profile_id: "profile-absent-from-pinned-snapshot".to_string(),
+                weight: std::num::NonZeroU32::new(1).expect("nonzero"),
+            });
+        cancel(&paths, &changed_config, &prepared.run_id)
+            .expect("cancel failed authoring despite live policy drift");
 
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         assert!(matches!(

@@ -324,7 +324,14 @@ impl RoleRouter {
     }
 
     pub(crate) fn acquire_run_transition(&self, run_id: &RunId) -> Result<RunTransitionGuard> {
-        let directory = self.root.join("role-routing").join("run-locks");
+        Self::acquire_persisted_run_transition(&self.root, run_id)
+    }
+
+    pub(crate) fn acquire_persisted_run_transition(
+        root: &Path,
+        run_id: &RunId,
+    ) -> Result<RunTransitionGuard> {
+        let directory = root.join("role-routing").join("run-locks");
         std::fs::create_dir_all(&directory).map_err(|error| {
             RoleRoutingError::new(format!(
                 "failed to create per-run role-routing lock directory {}: {error}",
@@ -845,6 +852,68 @@ impl RoleRouter {
     /// reservation and its irreversible score transition remain durable.
     pub(crate) fn release_capacity(&self, reservation: &Reservation) -> Result<bool> {
         self.set_capacity_active(reservation, false, u32::MAX)
+    }
+
+    pub(crate) fn release_persisted_capacity(
+        root: &Path,
+        reservation: &Reservation,
+    ) -> Result<bool> {
+        if !is_sha256(&reservation.score_evidence.policy_digest) {
+            return Err(RoleRoutingError::new(
+                "persisted reservation has an invalid policy digest",
+            ));
+        }
+        let lane = LaneKey::new(
+            &reservation.score_evidence.policy_digest,
+            reservation.role_id.clone(),
+            reservation.stage,
+        );
+        let paths = LanePaths::new(root, &lane);
+        create_lane_dir(&paths)?;
+        let guard = open_lock(&paths.lock_path)?;
+        guard.lock_exclusive().map_err(|error| {
+            RoleRoutingError::new(format!(
+                "failed to lock role-routing lane {}: {error}",
+                paths.lock_path.display()
+            ))
+        })?;
+        let outcome = (|| {
+            let mut state = load_lane(&paths.state_path, &lane)?;
+            let Some(stored) = state.reservations.get(reservation.run_id.as_str()) else {
+                return Err(RoleRoutingError::new(
+                    "persisted role-routing reservation does not exist",
+                ));
+            };
+            let current = &stored.reservation;
+            if current.run_id != reservation.run_id
+                || current.role_id != reservation.role_id
+                || current.stage != reservation.stage
+                || current.selected_profile_id != reservation.selected_profile_id
+                || current.sequence != reservation.sequence
+                || current.score_evidence != reservation.score_evidence
+            {
+                return Err(RoleRoutingError::new(
+                    "persisted role-routing reservation identity does not match",
+                ));
+            }
+            if !matches!(current.state, ReservationState::Committed) {
+                return Err(RoleRoutingError::new(
+                    "failed-authoring cancellation requires a committed reservation",
+                ));
+            }
+            if !stored.capacity_active {
+                return Ok(false);
+            }
+            state
+                .reservations
+                .get_mut(reservation.run_id.as_str())
+                .expect("existing reservation was checked")
+                .capacity_active = false;
+            store_lane(&paths.state_path, &state)?;
+            Ok(true)
+        })();
+        let _ = fs2::FileExt::unlock(&guard);
+        outcome
     }
 
     fn set_capacity_active(
