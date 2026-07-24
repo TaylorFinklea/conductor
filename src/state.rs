@@ -61,9 +61,9 @@ pub(crate) struct MigrationSummary {
 /// Copies quiescent live Conductor state into a new Undertake-owned root.
 ///
 /// The source remains untouched. The destination must not exist. Exact legacy
-/// archive roots (`runs`, `logs`, `worker-commit-hooks`, `leases`, and `arena`)
-/// are intentionally left behind; any other unknown live state fails closed
-/// before the staging directory is published.
+/// archive roots (`plans`, `runs`, `logs`, `worker-commit-hooks`, `leases`, and
+/// `arena`) are intentionally left behind; any other unknown live state fails
+/// closed before the staging directory is published.
 pub(crate) fn migrate_live_state(
     source: &Path,
     destination: &Path,
@@ -115,7 +115,6 @@ pub(crate) fn migrate_live_state(
         files_copied += copy_typed_file::<Journal>(&source, &staging, "journal.json")?;
         files_copied +=
             copy_typed_file::<crate::ratchet::RatchetStore>(&source, &staging, "ratchet.json")?;
-        files_copied += migrate_plans(&source, &staging)?;
         files_copied += migrate_runs(&source, &staging)?;
         files_copied += crate::role_routing::migrate_legacy_state(&source, &staging, policy)
             .map_err(io::Error::other)?;
@@ -222,42 +221,6 @@ fn copy_typed_file<T: serde::de::DeserializeOwned>(
     serde_json::from_slice::<T>(&bytes).map_err(io::Error::other)?;
     fs::write(destination.join(name), bytes)?;
     Ok(1)
-}
-
-fn migrate_plans(source: &Path, destination: &Path) -> io::Result<u64> {
-    let plans = source.join("plans");
-    if !plans.exists() {
-        return Ok(0);
-    }
-    let target = destination.join("plans");
-    fs::create_dir(&target)?;
-    let mut copied = 0_u64;
-    for entry in fs::read_dir(plans)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file()
-            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unknown legacy plan entry",
-            ));
-        }
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&fs::read(entry.path())?).map_err(io::Error::other)?;
-        rename_object_key(
-            &mut value,
-            "bursar_roster_source_artifact",
-            "musterroll_roster_source_artifact",
-        )?;
-        rewrite_owned_strings(&mut value);
-        serde_json::from_value::<crate::plan::CyclePlan>(value.clone())
-            .map_err(io::Error::other)?;
-        let mut bytes = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
-        bytes.push(b'\n');
-        fs::write(target.join(entry.file_name()), bytes)?;
-        copied = copied.saturating_add(1);
-    }
-    Ok(copied)
 }
 
 fn migrate_runs(source: &Path, destination: &Path) -> io::Result<u64> {
@@ -405,28 +368,6 @@ fn copy_run_payloads(source: &Path, destination: &Path) -> io::Result<u64> {
     Ok(copied)
 }
 
-fn rename_object_key(value: &mut serde_json::Value, old: &str, new: &str) -> io::Result<()> {
-    let object = value.as_object_mut().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "legacy state envelope is not an object",
-        )
-    })?;
-    let field = object.remove(old).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("legacy state envelope is missing {old}"),
-        )
-    })?;
-    if object.insert(new.to_string(), field).is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("legacy state envelope already contains {new}"),
-        ));
-    }
-    Ok(())
-}
-
 fn rename_optional_object_key(
     value: &mut serde_json::Value,
     old: &str,
@@ -507,7 +448,7 @@ fn is_archive_path(root: &Path, path: &Path) -> bool {
     };
     matches!(
         top_level.as_os_str().to_str(),
-        Some("runs" | "logs" | "worker-commit-hooks" | "leases" | "arena")
+        Some("plans" | "runs" | "logs" | "worker-commit-hooks" | "leases" | "arena")
     )
 }
 
@@ -674,9 +615,8 @@ mod tests {
         let root = migration_root("runtime-special");
         let source = root.join("source");
         let destination = root.join("destination");
-        let plans = source.join("plans");
-        std::fs::create_dir_all(&plans).unwrap();
-        let fifo = plans.join("live.fifo");
+        std::fs::create_dir_all(&source).unwrap();
+        let fifo = source.join("ratchet.json");
         let status = std::process::Command::new("mkfifo")
             .arg(&fifo)
             .status()
@@ -696,7 +636,14 @@ mod tests {
         let source = root.join("source");
         let destination = root.join("destination");
         std::fs::create_dir_all(&source).unwrap();
-        for archive in ["runs", "logs", "worker-commit-hooks", "leases", "arena"] {
+        for archive in [
+            "plans",
+            "runs",
+            "logs",
+            "worker-commit-hooks",
+            "leases",
+            "arena",
+        ] {
             let archive_root = source.join(archive);
             std::fs::create_dir_all(&archive_root).unwrap();
             std::fs::write(archive_root.join("retained-in-snapshot"), archive).unwrap();
@@ -713,7 +660,14 @@ mod tests {
         migrate_live_state(&source, &destination, &migration_policy()).unwrap();
 
         assert_eq!(tree_digest(&source).unwrap(), source_digest);
-        for archive in ["runs", "logs", "worker-commit-hooks", "leases", "arena"] {
+        for archive in [
+            "plans",
+            "runs",
+            "logs",
+            "worker-commit-hooks",
+            "leases",
+            "arena",
+        ] {
             assert!(
                 !destination.join(archive).exists(),
                 "archive-only root was copied: {archive}"
@@ -902,7 +856,8 @@ mod tests {
                 .unwrap(),
             ratchet
         );
-        crate::plan::CyclePlan::load(&destination, "cycle-migrated").unwrap();
+        assert!(plan_path.is_file());
+        assert!(!destination.join("plans").exists());
         let migrated_run_dir = std::fs::read_dir(crate::run::runs_dir(&destination))
             .unwrap()
             .next()
