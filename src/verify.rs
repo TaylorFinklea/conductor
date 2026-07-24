@@ -19,14 +19,14 @@ const ORCHESTRA_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const REVIEW_KILL_GRACE: Duration = Duration::from_secs(3);
 
-/// Metadata key where Conductor stores the bounded revision findings from
+/// Metadata key where Undertake stores the bounded revision findings from
 /// a qualitative-review revise result, so the next dispatch can render
 /// them into the worker prompt without the worker needing bd access.
-/// The key is owned by Conductor: only `review_revise` writes to it, and
+/// The key is owned by Undertake: only `review_revise` writes to it, and
 /// dispatch reads it verbatim as untrusted task data. A user-supplied
 /// value (if any) still lands inside the bounded task-data envelope, so
 /// it cannot become a privileged instruction.
-const CONDUCTOR_REVISE_FINDINGS_METADATA_KEY: &str = "conductor_revise_findings";
+const UNDERTAKE_REVISE_FINDINGS_METADATA_KEY: &str = "undertake_revise_findings";
 
 pub(crate) type Result<T> = std::result::Result<T, VerifyError>;
 
@@ -275,7 +275,7 @@ pub(crate) fn run_review_stage_deferred_until<E: Exec + ?Sized>(
     match decision {
         ReviewDecision::NotNeeded => {
             let reason = format!(
-                "conductor {}: verified via {}",
+                "undertake {}: verified via {}",
                 request.cycle_id, request.verify_cmd
             );
             Ok(DeferredReviewOutcome {
@@ -292,7 +292,7 @@ pub(crate) fn run_review_stage_deferred_until<E: Exec + ?Sized>(
         }
         ReviewDecision::Ship { record, attempts } => {
             let reason = format!(
-                "conductor {}: verified via {}",
+                "undertake {}: verified via {}",
                 request.cycle_id, request.verify_cmd
             );
             Ok(DeferredReviewOutcome {
@@ -313,10 +313,10 @@ pub(crate) fn run_review_stage_deferred_until<E: Exec + ?Sized>(
             attempts,
         } => {
             let summary = review_findings_summary(&findings);
-            let metadata_key = CONDUCTOR_REVISE_FINDINGS_METADATA_KEY.to_string();
+            let metadata_key = UNDERTAKE_REVISE_FINDINGS_METADATA_KEY.to_string();
             let metadata_value = review_findings_metadata_value(&findings);
             let comment = format!(
-                "conductor: {} {} qualitative review requested revisions:\n{}",
+                "undertake: {} {} qualitative review requested revisions:\n{}",
                 request.cycle_id,
                 request.issue.id,
                 review_findings_bullets(&findings)
@@ -516,7 +516,7 @@ fn pass_with_review<B: BdClient + ?Sized>(
     review_attempts: Vec<ReviewRecord>,
 ) -> Result<VerifyOutcome> {
     let reason = format!(
-        "conductor {}: verified via {}",
+        "undertake {}: verified via {}",
         request.cycle_id, request.verify_cmd
     );
     bd.close(&request.repo, &request.issue.id, &reason)?;
@@ -552,7 +552,7 @@ fn fail_with_review<B: BdClient + ?Sized>(
         bd.release(&request.repo, &request.issue.id)?;
     }
     let comment = format!(
-        "conductor: {} {} verify failed: {}",
+        "undertake: {} {} verify failed: {}",
         request.cycle_id, request.issue.id, summary
     );
     bd.comment(&request.repo, &request.issue.id, &comment)?;
@@ -815,7 +815,7 @@ fn review_revise<B: BdClient + ?Sized>(
     bd.set_metadata(
         &request.repo,
         &request.issue.id,
-        CONDUCTOR_REVISE_FINDINGS_METADATA_KEY,
+        UNDERTAKE_REVISE_FINDINGS_METADATA_KEY,
         &metadata_value,
     )?;
     // 2. Release only work which has not already been promoted. Once the
@@ -832,7 +832,7 @@ fn review_revise<B: BdClient + ?Sized>(
     //    still propagates a comment failure so callers see a failed verify.
     let summary = review_findings_summary(findings);
     let comment = format!(
-        "conductor: {} {} qualitative review requested revisions:\n{}",
+        "undertake: {} {} qualitative review requested revisions:\n{}",
         request.cycle_id,
         request.issue.id,
         review_findings_bullets(findings)
@@ -1096,7 +1096,7 @@ fn review_prompt(
     reviewer: &RosterEntry,
 ) -> String {
     format!(
-        "READ-ONLY qualitative review for Conductor.\n\
+        "READ-ONLY qualitative review for Undertake.\n\
          Reviewer model: {}\n\
          Worker model: {}\n\
          Repo: {}\n\
@@ -1223,7 +1223,7 @@ fn review_findings_bullets(findings: &[String]) -> String {
 }
 
 /// Encode revision findings as a JSON array string for storage in
-/// `CONDUCTOR_REVISE_FINDINGS_METADATA_KEY`. Dispatch reads this back
+/// `UNDERTAKE_REVISE_FINDINGS_METADATA_KEY`. Dispatch reads this back
 /// via `serde_json::from_str`, so the format must stay round-trippable.
 /// `[]` represents "no findings supplied" and renders as the empty
 /// block in the worker prompt.
@@ -1405,7 +1405,7 @@ mod tests {
             vec![BdEvent::Close {
                 repo: request.repo.clone(),
                 id: "bead-1".to_string(),
-                reason: "conductor cycle-1: verified via cargo test verify".to_string(),
+                reason: "undertake cycle-1: verified via cargo test verify".to_string(),
             }]
         );
         let spawns = exec.spawns();
@@ -1774,7 +1774,7 @@ mod tests {
             deferred.action,
             Some(DeferredReviewAction::Close {
                 reason: format!(
-                    "conductor {}: verified via {}",
+                    "undertake {}: verified via {}",
                     request.cycle_id, request.verify_cmd
                 ),
             })
@@ -2060,8 +2060,8 @@ mod tests {
 
     #[test]
     fn review_revise_records_findings_in_bd_metadata_with_exact_round_trippable_value() {
-        // Regression for conductor-0ya: the bounded revision findings must
-        // land in `conductor_revise_findings` metadata, not just the
+        // Regression for undertake-0ya: the bounded revision findings must
+        // land in `undertake_revise_findings` metadata, not just the
         // comment, so the next dispatch can render them into the worker
         // prompt verbatim after the claim is released. The value must be
         // round-trippable (JSON array) so dispatch can parse it back.
@@ -2130,11 +2130,11 @@ mod tests {
             _ => unreachable!("set_metadata_index points to a SetMetadata event"),
         };
         assert_eq!(id, "bead-1");
-        assert_eq!(key, "conductor_revise_findings");
+        assert_eq!(key, "undertake_revise_findings");
         // The value is a JSON array of strings; round-trip through
         // serde_json to prove dispatch can re-parse it exactly.
         let parsed: Vec<String> = serde_json::from_str(&value)
-            .expect("conductor_revise_findings value must be a JSON array of strings");
+            .expect("undertake_revise_findings value must be a JSON array of strings");
         assert_eq!(
             parsed,
             vec![
@@ -2151,7 +2151,7 @@ mod tests {
 
     #[test]
     fn review_revise_persists_metadata_before_release_so_released_bead_never_races_retry_context() {
-        // Failure-path regression for conductor-0ya: if the durable
+        // Failure-path regression for undertake-0ya: if the durable
         // metadata write fails, the claim must NOT be released. The
         // invariant is "released ⇒ retry context durable" — releasing
         // a bead whose retry context is missing would let the next
@@ -2529,7 +2529,7 @@ mod tests {
             status: "in_progress".to_string(),
             priority: 1,
             issue_type: "task".to_string(),
-            assignee: Some("conductor".to_string()),
+            assignee: Some("undertake".to_string()),
             owner: "test".to_string(),
             created_at: "2026-07-02T00:00:00Z".to_string(),
             created_by: "test".to_string(),
@@ -2819,7 +2819,7 @@ mod tests {
                 id: "comment-1".to_string(),
                 issue_id: id.to_string(),
                 text: text.to_string(),
-                author: "conductor".to_string(),
+                author: "undertake".to_string(),
                 created_at: "2026-07-02T00:00:00Z".to_string(),
                 schema_version: Some(1),
             })
@@ -2859,7 +2859,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("conductor-verify-{label}-{nanos}"));
+            let path = std::env::temp_dir().join(format!("undertake-verify-{label}-{nanos}"));
             std::fs::create_dir_all(&path).expect("mkdir temp dir");
             Self(path)
         }

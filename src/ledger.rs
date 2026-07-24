@@ -30,7 +30,7 @@ impl fmt::Display for LedgerError {
 
 impl std::error::Error for LedgerError {}
 
-/// One Conductor dispatch row for `~/.claude/model-bench.jsonl`.
+/// One Undertake dispatch row for `~/.claude/model-bench.jsonl`.
 ///
 /// The row carries dispatch identity and verifier evidence. Review-specific
 /// evidence lives in `AdversarialLedgerRow`; Arena result fields are retired.
@@ -45,7 +45,7 @@ pub(crate) struct LedgerRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) role: String,
-    /// Generic Conductor job category, when this row records a staged run.
+    /// Generic Undertake job category, when this row records a staged run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) job: Option<String>,
     /// Generic stage within a staged run.
@@ -189,7 +189,7 @@ mod tests {
             verify_passed: true,
             complexity: "S".to_string(),
             project: "sandbox-repo".to_string(),
-            notes: "conductor cycle-1: verified".to_string(),
+            notes: "undertake cycle-1: verified".to_string(),
             failure_reason: None,
             duration_ms: None,
         };
@@ -205,7 +205,7 @@ mod tests {
         assert_eq!(parsed["verify_passed"], json!(true));
         assert_eq!(parsed["complexity"], json!("S"));
         assert_eq!(parsed["project"], json!("sandbox-repo"));
-        assert_eq!(parsed["notes"], json!("conductor cycle-1: verified"));
+        assert_eq!(parsed["notes"], json!("undertake cycle-1: verified"));
         assert!(parsed.get("reasoning_effort").is_none());
     }
 
@@ -233,7 +233,7 @@ mod tests {
                 task: "review-123".to_string(),
                 verify_passed: false,
                 complexity: "L".to_string(),
-                project: "conductor".to_string(),
+                project: "undertake".to_string(),
                 notes: "reviewer schema failure".to_string(),
                 failure_reason: Some("invalid JSON".to_string()),
                 duration_ms: Some(17),
@@ -324,7 +324,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("conductor-{label}-{nanos}"));
+            let path = std::env::temp_dir().join(format!("undertake-{label}-{nanos}"));
             std::fs::create_dir_all(&path).expect("mkdir temp");
             Self(path)
         }

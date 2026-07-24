@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 pub(crate) use crate::run::PlanStage;
 
-const LANE_SCHEMA: &str = "conductor/role-lane@1";
+const LANE_SCHEMA: &str = "undertake/role-lane@1";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) type Result<T, E = RoleRoutingError> = std::result::Result<T, E>;
@@ -116,7 +116,7 @@ impl RoutingPolicy {
     ) -> Result<Self> {
         if !is_sha256(&roster_policy_digest) {
             return Err(RoleRoutingError::new(
-                "pinned Bursar roster policy digest must be lowercase 64-hex",
+                "pinned Musterroll roster policy digest must be lowercase 64-hex",
             ));
         }
         if bindings.is_empty() {
@@ -145,7 +145,7 @@ impl RoutingPolicy {
 
     pub(crate) fn from_config(
         config: &crate::config::Config,
-        snapshot: &crate::bursar::RosterSnapshot,
+        snapshot: &crate::musterroll::RosterSnapshot,
     ) -> Result<Self> {
         let mut bindings = Vec::with_capacity(config.role_bindings.len());
         for binding in &config.role_bindings {
@@ -157,7 +157,7 @@ impl RoutingPolicy {
                 .find(|profile| profile.profile_id == binding.profile_id)
                 .ok_or_else(|| {
                     RoleRoutingError::new(format!(
-                        "role policy references profile absent from pinned Bursar snapshot: {}",
+                        "role policy references profile absent from pinned Musterroll snapshot: {}",
                         binding.profile_id
                     ))
                 })?;
@@ -277,7 +277,7 @@ impl Reservation {
 pub(crate) struct RoleRouter {
     root: PathBuf,
     policy: RoutingPolicy,
-    snapshot: Option<crate::bursar::RosterSnapshot>,
+    snapshot: Option<crate::musterroll::RosterSnapshot>,
 }
 
 /// Stable per-run filesystem guard for every dispatch, resume, or cancel
@@ -311,11 +311,11 @@ impl RoleRouter {
     pub(crate) fn with_pinned_snapshot(
         root: &Path,
         policy: RoutingPolicy,
-        snapshot: crate::bursar::RosterSnapshot,
+        snapshot: crate::musterroll::RosterSnapshot,
     ) -> Result<Self> {
         if policy.roster_policy_digest() != snapshot.policy_sha256() {
             return Err(RoleRoutingError::new(
-                "role policy digest does not match the pinned Bursar roster snapshot",
+                "role policy digest does not match the pinned Musterroll roster snapshot",
             ));
         }
         let mut router = Self::new(root, policy)?;
@@ -509,7 +509,7 @@ impl RoleRouter {
         constraints: HardEligibility,
     ) -> Result<PreparedPlanner> {
         let snapshot = self.snapshot.as_ref().ok_or_else(|| {
-            RoleRoutingError::new("planner preparation requires a pinned Bursar roster snapshot")
+            RoleRoutingError::new("planner preparation requires a pinned Musterroll roster snapshot")
         })?;
         let mut audited_pool = Vec::new();
         let mut allowed = BTreeSet::new();
@@ -623,7 +623,7 @@ impl RoleRouter {
         require_three_way_team: bool,
     ) -> Result<()> {
         let snapshot = self.snapshot.as_ref().ok_or_else(|| {
-            RoleRoutingError::new("contingency validation requires a pinned Bursar roster snapshot")
+            RoleRoutingError::new("contingency validation requires a pinned Musterroll roster snapshot")
         })?;
         validate_preapproval_contingencies_for_snapshot(
             &self.policy,
@@ -635,13 +635,13 @@ impl RoleRouter {
     }
 }
 
-/// Validates author/reviewer contingencies from a Bursar snapshot without
+/// Validates author/reviewer contingencies from a Musterroll snapshot without
 /// allocating a scheduler reservation. This is used by both plan preparation
 /// and config activation preflight so approval cannot be the first place a
 /// broken initial team is discovered.
 pub(crate) fn validate_preapproval_contingencies_for_snapshot(
     policy: &RoutingPolicy,
-    snapshot: &crate::bursar::RosterSnapshot,
+    snapshot: &crate::musterroll::RosterSnapshot,
     role_id: &RoleId,
     constraints: &HardEligibility,
     require_three_way_team: bool,
@@ -706,7 +706,7 @@ impl RoleRouter {
 
     /// Binds a reviewer only after the actual author (and for second opinion,
     /// actual peer) identity is immutable. It always consumes its own stage
-    /// lane and never consults live Bursar or config state.
+    /// lane and never consults live Musterroll or config state.
     #[expect(
         clippy::too_many_arguments,
         reason = "the delayed binding boundary records each immutable review identity explicitly"
@@ -758,7 +758,7 @@ impl RoleRouter {
 
     fn validate_pinned_execution(&self, execution: &crate::run::ApprovedExecution) -> Result<()> {
         let snapshot = self.snapshot.as_ref().ok_or_else(|| {
-            RoleRoutingError::new("reviewer binding requires a pinned Bursar roster snapshot")
+            RoleRoutingError::new("reviewer binding requires a pinned Musterroll roster snapshot")
         })?;
         let profile = snapshot
             .profiles
@@ -1159,6 +1159,126 @@ const fn capacity_active_default() -> bool {
     true
 }
 
+const LEGACY_LANE_SCHEMA: &str = "conductor/role-lane@1";
+
+/// Copies only the current legacy scheduler lanes into the Undertake namespace.
+///
+/// Historical policy lanes remain in the source snapshot. Current scores and
+/// reservation history are retained while the ownership schema and policy
+/// digest are rebound to the identity-only renamed policy.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the one-shot lane transaction validates and rewrites one complete typed scheduler envelope"
+)]
+pub(crate) fn migrate_legacy_state(
+    source_root: &Path,
+    destination_root: &Path,
+    policy: &RoutingPolicy,
+) -> Result<u64> {
+    let source = source_root.join("role-routing");
+    if !source.exists() {
+        return Ok(0);
+    }
+    let lanes = source.join("lanes");
+    let families = source.join("families");
+    if !lanes.is_dir() || !families.is_dir() {
+        return Err(RoleRoutingError::new(
+            "legacy role-routing state must contain lanes and families directories",
+        ));
+    }
+
+    let mut migrated = 0_u64;
+    for entry in std::fs::read_dir(&lanes).map_err(|error| {
+        RoleRoutingError::new(format!("failed to read legacy role-routing lanes: {error}"))
+    })? {
+        let entry = entry.map_err(|error| {
+            RoleRoutingError::new(format!("failed to read legacy role-routing lane: {error}"))
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|error| RoleRoutingError::new(error.to_string()))?
+            .is_dir()
+        {
+            return Err(RoleRoutingError::new(
+                "unknown legacy role-routing lane entry",
+            ));
+        }
+        let path = entry.path().join("state.json");
+        let bytes = std::fs::read(&path).map_err(|error| {
+            RoleRoutingError::new(format!(
+                "failed to read legacy role-routing lane {}: {error}",
+                path.display()
+            ))
+        })?;
+        let mut state: LaneState = serde_json::from_slice(&bytes).map_err(|error| {
+            RoleRoutingError::new(format!(
+                "failed to parse legacy role-routing lane {}: {error}",
+                path.display()
+            ))
+        })?;
+        if state.schema != LEGACY_LANE_SCHEMA || !is_sha256(&state.policy_digest) {
+            return Err(RoleRoutingError::new(
+                "unknown legacy role-routing lane schema or policy",
+            ));
+        }
+        let old_lane = LaneKey::new(
+            &state.policy_digest,
+            state.role_id.clone(),
+            state.stage,
+        );
+        if entry.file_name().to_string_lossy() != hex_digest(old_lane.identity().as_bytes()) {
+            return Err(RoleRoutingError::new(
+                "legacy role-routing lane path does not match its identity",
+            ));
+        }
+        let family_path = LanePaths::new(source_root, &old_lane).family_path;
+        let Some(current_digest) = load_previous_policy(&family_path)? else {
+            return Err(RoleRoutingError::new(
+                "legacy role-routing lane has no family policy",
+            ));
+        };
+        if current_digest != state.policy_digest {
+            continue;
+        }
+        if policy.bindings_for(&state.role_id).next().is_none() {
+            return Err(RoleRoutingError::new(
+                "current legacy role-routing lane has no renamed policy binding",
+            ));
+        }
+        for (run_id, stored) in &mut state.reservations {
+            if stored.reservation.run_id.as_str() != run_id
+                || stored.reservation.role_id != state.role_id
+                || stored.reservation.stage != state.stage
+                || stored.reservation.score_evidence.policy_digest != state.policy_digest
+            {
+                return Err(RoleRoutingError::new(
+                    "legacy role-routing reservation identity is inconsistent",
+                ));
+            }
+            if stored.capacity_active
+                && matches!(
+                    stored.reservation.state,
+                    ReservationState::PendingApproval | ReservationState::Committed
+                )
+            {
+                return Err(RoleRoutingError::new(
+                    "state migration requires zero in-flight scheduler reservations",
+                ));
+            }
+            stored.reservation.score_evidence.policy_digest = policy.digest().to_string();
+        }
+        state.schema = LANE_SCHEMA.to_string();
+        state.policy_digest = policy.digest().to_string();
+        let new_lane = LaneKey::new(policy.digest(), state.role_id.clone(), state.stage);
+        let destination = LanePaths::new(destination_root, &new_lane);
+        create_lane_dir(&destination)?;
+        store_lane(&destination.state_path, &state)?;
+        store_current_policy(&destination.family_path, policy.digest())?;
+        migrated = migrated.saturating_add(2);
+    }
+    Ok(migrated)
+}
+
 fn load_lane(path: &Path, expected: &LaneKey) -> Result<LaneState> {
     match std::fs::read(path) {
         Ok(bytes) => {
@@ -1305,8 +1425,8 @@ fn open_lock(path: &Path) -> Result<File> {
 }
 
 pub(crate) fn approved_execution(
-    profile: &crate::bursar::RosterProfile,
-    provider: &crate::bursar::RosterProvider,
+    profile: &crate::musterroll::RosterProfile,
+    provider: &crate::musterroll::RosterProvider,
 ) -> crate::run::ApprovedExecution {
     let coordinate = [
         profile.provider_id.as_str(),
@@ -1331,8 +1451,8 @@ pub(crate) fn approved_execution(
 }
 
 fn hard_rejection_reasons(
-    profile: &crate::bursar::RosterProfile,
-    provider: &crate::bursar::RosterProvider,
+    profile: &crate::musterroll::RosterProfile,
+    provider: &crate::musterroll::RosterProvider,
     role_id: &RoleId,
     constraints: &HardEligibility,
     execution: &crate::run::ApprovedExecution,
@@ -1367,7 +1487,7 @@ fn hard_rejection_reasons(
         || !provider.eligible
         || !matches!(
             provider.availability,
-            crate::bursar::Availability::Healthy | crate::bursar::Availability::Caution
+            crate::musterroll::Availability::Healthy | crate::musterroll::Availability::Caution
         )
     {
         reasons.push("provider_unavailable".to_string());
@@ -1486,7 +1606,7 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn policy_digest(roster_policy_digest: &str, bindings: &[RoleBinding]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"conductor/role-policy@1\0");
+    hasher.update(b"undertake/role-policy@1\0");
     hasher.update(roster_policy_digest.as_bytes());
     hasher.update(b"\0");
     for binding in bindings {
@@ -2029,7 +2149,7 @@ mod tests {
     fn shipped_config_has_exact_initial_plan_weights() {
         let cfg = crate::config::load(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/conductor.toml"
+            "/undertake.toml"
         )))
         .expect("shipped config");
         let weights = cfg
@@ -2256,9 +2376,9 @@ mod tests {
         profile_id: &str,
         provider_id: &str,
         roles: &[&str],
-    ) -> crate::bursar::RosterSnapshot {
+    ) -> crate::musterroll::RosterSnapshot {
         let bytes = serde_json::to_vec(&serde_json::json!({
-            "schema": "bursar/roster@2",
+            "schema": "musterroll/roster@2",
             "generated_at": "2026-07-22T00:00:00Z",
             "source_artifact": {
                 "path": "/tmp/roster.toml",
@@ -2298,10 +2418,10 @@ mod tests {
             }],
         }))
         .expect("snapshot json");
-        crate::bursar::parse_roster_snapshot(&bytes).expect("valid snapshot")
+        crate::musterroll::parse_roster_snapshot(&bytes).expect("valid snapshot")
     }
 
-    fn pinned_snapshot_many(profiles: &[(&str, &str)]) -> crate::bursar::RosterSnapshot {
+    fn pinned_snapshot_many(profiles: &[(&str, &str)]) -> crate::musterroll::RosterSnapshot {
         let providers = profiles
             .iter()
             .map(|(_, provider_id)| {
@@ -2344,7 +2464,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let bytes = serde_json::to_vec(&serde_json::json!({
-            "schema": "bursar/roster@2",
+            "schema": "musterroll/roster@2",
             "generated_at": "2026-07-22T00:00:00Z",
             "source_artifact": {
                 "path": "/tmp/roster.toml",
@@ -2355,10 +2475,10 @@ mod tests {
             "profiles": profiles,
         }))
         .expect("snapshot json");
-        crate::bursar::parse_roster_snapshot(&bytes).expect("valid snapshot")
+        crate::musterroll::parse_roster_snapshot(&bytes).expect("valid snapshot")
     }
 
-    fn strict_constraints(snapshot: &crate::bursar::RosterSnapshot, role: &str) -> HardEligibility {
+    fn strict_constraints(snapshot: &crate::musterroll::RosterSnapshot, role: &str) -> HardEligibility {
         let allowed_profile_ids = snapshot
             .profiles
             .iter()
@@ -2402,7 +2522,7 @@ mod tests {
     impl TempDir {
         fn new(label: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "conductor-role-routing-{label}-{}-{}",
+                "undertake-role-routing-{label}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

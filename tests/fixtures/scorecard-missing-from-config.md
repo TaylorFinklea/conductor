@@ -1,6 +1,6 @@
 # Model Scorecard — Test Fixture (Missing from Config)
 
-This scorecard has a model that's not in conductor.toml.
+This scorecard has a model that's not in undertake.toml.
 
 ## Live Roster
 

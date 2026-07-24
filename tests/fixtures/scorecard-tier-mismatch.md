@@ -1,6 +1,6 @@
 # Model Scorecard — Test Fixture (Tier Mismatch)
 
-This scorecard has a different tier for sonnet-5 than conductor.toml.
+This scorecard has a different tier for sonnet-5 than undertake.toml.
 
 ## Live Roster
 

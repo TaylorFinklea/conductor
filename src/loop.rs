@@ -25,7 +25,7 @@ use crate::run::{
 };
 
 const LOOP_STATE_PATH: &str = "loop.json";
-const LOOP_SCHEMA: &str = "conductor/loop@1";
+const LOOP_SCHEMA: &str = "undertake/loop@1";
 pub(crate) type Result<T, E = LoopError> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone)]
@@ -591,7 +591,7 @@ mod tests {
     impl TestHarness {
         fn new(workers: Vec<TestProcess>, verifiers: Vec<TestProcess>, direct: bool) -> Self {
             let state_dir = std::env::temp_dir().join(format!(
-                "conductor-loop-test-{}-{}",
+                "undertake-loop-test-{}-{}",
                 std::process::id(),
                 TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
@@ -624,7 +624,7 @@ mod tests {
             LoopRequest {
                 state_dir: self.inner.borrow().state_dir.clone(),
                 repo: self.inner.borrow().state_dir.join("synthetic-repo"),
-                target: LoopTarget::Bead("conductor-loop-kernel".to_string()),
+                target: LoopTarget::Bead("undertake-loop-kernel".to_string()),
                 profile_id: "lead".to_string(),
                 verifier_command: "cargo test loop".to_string(),
                 max_iterations: 3,
@@ -875,6 +875,25 @@ mod tests {
         let harness = TestHarness::new(vec![success_worker('b')], vec![success_verifier()], true);
         assert_eq!(LoopKernel::run(&harness, &harness, &harness, &harness, &harness.request()).expect("terminal"), LoopTerminal::Completed);
         assert!(harness.finished_run_before_close());
+    }
+
+    #[test]
+    fn loop_state_rejects_legacy_conductor_schema() {
+        let harness = TestHarness::new(Vec::new(), Vec::new(), true);
+        let run_dir = harness.inner.borrow().state_dir.join("legacy-loop");
+        fs::create_dir_all(&run_dir).unwrap();
+        let mut state = LoopState::new(&LoopTarget::Bead("loop-target".to_string()));
+        state.schema = "conductor/loop@1".to_string();
+        fs::write(
+            run_dir.join(LOOP_STATE_PATH),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        let error = read_state(&run_dir, &LoopTarget::Bead("loop-target".to_string()))
+            .expect_err("legacy loop schema must fail closed");
+
+        assert!(error.to_string().contains("identity"));
     }
 
     trait RequestExt { fn with_max_iterations(self, max_iterations: u64) -> Self; }

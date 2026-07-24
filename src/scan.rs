@@ -470,7 +470,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("conductor-scan-{label}-{nanos}"));
+            let path = std::env::temp_dir().join(format!("undertake-scan-{label}-{nanos}"));
             std::fs::create_dir_all(&path).expect("mkdir temp dir");
             Self(path)
         }

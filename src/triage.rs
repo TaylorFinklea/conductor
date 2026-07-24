@@ -1,6 +1,6 @@
 //! routing algorithm + gates + budgets (pure — the invariant test suite lives here)
 //!
-//! Pinned rules (conductor-v1-spec.md, "Routing algorithm" + "Invariants" — encoded
+//! Pinned rules (undertake-v1-spec.md, "Routing algorithm" + "Invariants" — encoded
 //! exactly, not reinterpreted).
 //!
 //! Orders: complexity `S<M<L<XL`; tier `junior<senior<lead`; efficiency `lean<std<heavy`.
@@ -96,7 +96,7 @@ pub(crate) enum Flag {
     },
     /// Repo-level scan coverage gap; `bd ready --json` could not be parsed.
     ScanGap { repo: String, detail: String },
-    /// Reserved for `conductor roster drift` (scorecard-vs-`conductor.toml`
+    /// Reserved for `undertake roster drift` (scorecard-vs-`undertake.toml`
     /// comparison) — a separate check outside this module's pure algorithm;
     /// never constructed here.
     RosterDrift,
@@ -556,7 +556,7 @@ mod tests {
             max_dispatches_per_cycle: max_cycle,
             max_active_per_repo: max_repo,
             max_external_dispatches: max_external,
-            use_bursar: true,
+            use_musterroll: true,
             unknown_429_cooldown_mins: 15,
             item_wall_clock_mins: 45,
             max_plan_revisions: 1,
@@ -1804,9 +1804,9 @@ mod tests {
     // --- real roster sanity check (guards against roster drift silently changing routing) ---
 
     #[test]
-    #[ignore = "Bursar owns the live roster after conductor-bursar-roster cutover"]
+    #[ignore = "Musterroll owns the live roster after undertake-musterroll-roster cutover"]
     fn real_roster_routes_the_specs_tesela_headline_fixture_to_a_lean_senior_model() {
-        let cfg = crate::config::parse_str(include_str!("../conductor.toml"))
+        let cfg = crate::config::parse_str(include_str!("../undertake.toml"))
             .expect("checked-in config parses");
         let notes = "tier_floor: senior · complexity: S-M · verify_type: wrangler dev + cargo test";
         let mut i = issue(

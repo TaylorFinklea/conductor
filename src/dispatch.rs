@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::config::{Backend, ReasoningEffort};
 
 const PI_THINKING: &str = "xhigh";
-const ATTEMPT_IDENTITY_NAME: &str = "Conductor Worker Attempt";
+const ATTEMPT_IDENTITY_NAME: &str = "Undertake Worker Attempt";
 const KILL_GRACE: Duration = Duration::from_secs(3);
 const WAIT_POLL: Duration = Duration::from_millis(50);
 
@@ -112,7 +112,7 @@ pub(crate) fn attempt_commit_identity() -> String {
     for byte in hasher.finalize().iter().take(16) {
         let _ = write!(nonce, "{byte:02x}");
     }
-    format!("conductor-attempt-{nonce}@invalid")
+    format!("undertake-attempt-{nonce}@invalid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,7 +478,7 @@ fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnReq
                 hook_dir.display().to_string(),
             ),
             (
-                "CONDUCTOR_COMMIT_RECEIPT_SOCKET".to_string(),
+                "UNDERTAKE_COMMIT_RECEIPT_SOCKET".to_string(),
                 receipt_socket.display().to_string(),
             ),
         ],
@@ -722,7 +722,7 @@ where
 /// observe the grace-period exit) never skips the harder escalation that
 /// follows it. Used only on an already-erroring path, where the caller is
 /// about to propagate a different error and cannot usefully report this
-/// one too — an orphaned worker that keeps writing after Conductor has
+/// one too — an orphaned worker that keeps writing after Undertake has
 /// moved on is worse than losing a diagnostic about noisy termination.
 fn terminate_and_reap_best_effort(child: &mut dyn ChildProcess) -> bool {
     let _ = child.terminate();
@@ -822,7 +822,7 @@ fn commit_receipt_socket_path(attempt_identity: &str) -> PathBuf {
         let _ = write!(suffix, "{byte:02x}");
     }
     std::env::temp_dir().join(format!(
-        "conductor-receipt-{}-{suffix}.sock",
+        "undertake-receipt-{}-{suffix}.sock",
         std::process::id()
     ))
 }
@@ -851,7 +851,7 @@ fn prepare_authenticated_commit_hook(state_dir: &Path, attempt_identity: &str) -
         &hook,
         br#"#!/bin/sh
 commit=$(/usr/bin/git rev-parse --verify HEAD) || exit 1
-reply=$(printf '%s\n' "$commit" | /usr/bin/nc -w 3 -U "$CONDUCTOR_COMMIT_RECEIPT_SOCKET" 2>/dev/null) || exit 1
+reply=$(printf '%s\n' "$commit" | /usr/bin/nc -w 3 -U "$UNDERTAKE_COMMIT_RECEIPT_SOCKET" 2>/dev/null) || exit 1
 [ "$reply" = "ok" ]
 "#,
     )
@@ -1150,7 +1150,7 @@ fn process_in_live_worker_lineage(_peer: u32, _root: u32) -> Result<bool> {
 const WORKER_LINEAGE_LEASE_FILE: &str = "worker-lineage.fifo";
 
 /// The pre-isolation FIFO path retained only to recover runs created by older
-/// Conductor versions. New workers never inherit this descriptor.
+/// Undertake versions. New workers never inherit this descriptor.
 pub(crate) fn worker_lineage_lease_path(run_dir: &Path) -> PathBuf {
     run_dir.join(WORKER_LINEAGE_LEASE_FILE)
 }
@@ -1778,7 +1778,7 @@ mod tests {
                 .join("post-commit")
                 .exists()
         );
-        assert_eq!(env["CONDUCTOR_COMMIT_RECEIPT_SOCKET"], receipt_socket);
+        assert_eq!(env["UNDERTAKE_COMMIT_RECEIPT_SOCKET"], receipt_socket);
     }
 
     #[test]
@@ -2381,7 +2381,7 @@ mod tests {
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
         let exec = FakeExec::success(
-            "CONDUCTOR_WORKER_COMMIT: 2222222222222222222222222222222222222222\n",
+            "UNDERTAKE_WORKER_COMMIT: 2222222222222222222222222222222222222222\n",
             "",
         );
         let commits = FakeCommits::new([
@@ -2416,10 +2416,10 @@ mod tests {
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
         git(&repo, &["init"]);
-        git(&repo, &["config", "user.name", "Conductor Test"]);
+        git(&repo, &["config", "user.name", "Undertake Test"]);
         git(
             &repo,
-            &["config", "user.email", "conductor-test@example.invalid"],
+            &["config", "user.email", "undertake-test@example.invalid"],
         );
         std::fs::write(repo.join("README.md"), b"base\n").expect("write base");
         git(&repo, &["add", "README.md"]);
@@ -2454,10 +2454,10 @@ mod tests {
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
         git(&repo, &["init"]);
-        git(&repo, &["config", "user.name", "Conductor Test"]);
+        git(&repo, &["config", "user.name", "Undertake Test"]);
         git(
             &repo,
-            &["config", "user.email", "conductor-test@example.invalid"],
+            &["config", "user.email", "undertake-test@example.invalid"],
         );
         std::fs::write(repo.join("README.md"), b"base\n").expect("write base");
         git(&repo, &["add", "README.md"]);
@@ -2486,7 +2486,7 @@ mod tests {
     }
 
     const PROMPT: &str = "work on the bead";
-    const TEST_ATTEMPT_IDENTITY: &str = "conductor-attempt-test@invalid";
+    const TEST_ATTEMPT_IDENTITY: &str = "undertake-attempt-test@invalid";
 
     fn request(
         repo: &Path,
@@ -2518,7 +2518,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("conductor-dispatch-{label}-{nanos}"));
+            let path = std::env::temp_dir().join(format!("undertake-dispatch-{label}-{nanos}"));
             std::fs::create_dir_all(&path).expect("mkdir temp");
             Self(path)
         }
@@ -2611,7 +2611,7 @@ mod tests {
 
             std::fs::write(
                 &request.stdout_path,
-                format!("CONDUCTOR_WORKER_COMMIT: {worker_commit}\n"),
+                format!("UNDERTAKE_WORKER_COMMIT: {worker_commit}\n"),
             )
             .expect("write worker stdout");
             std::fs::write(&request.stderr_path, b"").expect("write worker stderr");
@@ -2805,7 +2805,7 @@ mod tests {
         // A worker CLI can fork children of its own (subshells, tool
         // invocations); if the timeout path only kills the direct child, a
         // grandchild can outlive it and keep writing to the repository
-        // after Conductor has already declared the tree state. Spawning the
+        // after Undertake has already declared the tree state. Spawning the
         // worker as the leader of its own process group and signaling
         // `-pid` on timeout must reach every descendant, not just the one
         // process std::process::Child knows about directly.

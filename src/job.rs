@@ -54,8 +54,8 @@ impl MutationPosture {
     }
 }
 
-/// One static Conductor-owned binding to opaque Bursar v2 profile identities.
-/// Bursar owns the profile facts and availability; this policy owns only the
+/// One static Undertake-owned binding to opaque Musterroll v2 profile identities.
+/// Musterroll owns the profile facts and availability; this policy owns only the
 /// legal order and execution posture for a named native job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JobBinding {
@@ -122,11 +122,11 @@ impl JobRegistry {
     }
 
     /// Confirms every configured opaque identity is present in the exact
-    /// Bursar v2 snapshot captured for this run. Availability is deliberately
+    /// Musterroll v2 snapshot captured for this run. Availability is deliberately
     /// not inferred here: it belongs in selection evidence.
     pub(crate) fn validate_pinned_profiles(
         &self,
-        snapshot: &crate::bursar::RosterSnapshot,
+        snapshot: &crate::musterroll::RosterSnapshot,
     ) -> Result<()> {
         for binding in &self.bindings {
             for profile_id in binding.pinned_profile_ids() {
@@ -136,7 +136,7 @@ impl JobRegistry {
                     .any(|profile| profile.profile_id == profile_id)
                 {
                     return Err(JobError::new(format!(
-                        "{} job references profile absent from pinned Bursar snapshot: {profile_id}",
+                        "{} job references profile absent from pinned Musterroll snapshot: {profile_id}",
                         job_name(binding.job)
                     )));
                 }
@@ -202,7 +202,7 @@ fn validate_binding(binding: &JobBinding) -> Result<()> {
     }
     if binding.profile_ids.is_empty() {
         return Err(JobError::new(format!(
-            "{} job must bind at least one Bursar profile ID",
+            "{} job must bind at least one Musterroll profile ID",
             job_name(binding.job)
         )));
     }
@@ -210,7 +210,7 @@ fn validate_binding(binding: &JobBinding) -> Result<()> {
     for profile_id in binding.pinned_profile_ids() {
         if profile_id.is_empty() || !seen.insert(profile_id) {
             return Err(JobError::new(format!(
-                "{} job has an empty or duplicate Bursar profile ID",
+                "{} job has an empty or duplicate Musterroll profile ID",
                 job_name(binding.job)
             )));
         }
@@ -372,7 +372,7 @@ mod tests {
         assert_eq!(binding.role_policy.as_deref(), Some("reviewer-panel"));
     }
     #[test]
-    fn pinned_bursar_snapshot_must_contain_every_bound_identity() {
+    fn pinned_musterroll_snapshot_must_contain_every_bound_identity() {
         let registry = JobRegistry::new(vec![
             binding(RunJob::Work, MutationPosture::RepositoryWrite),
             binding(RunJob::Review, MutationPosture::ReadOnly),
@@ -380,9 +380,9 @@ mod tests {
             binding(RunJob::Plan, MutationPosture::ReadOnly),
         ])
         .expect("registry");
-        let snapshot = crate::bursar::parse_roster_snapshot(
+        let snapshot = crate::musterroll::parse_roster_snapshot(
             serde_json::json!({
-                "schema": "bursar/roster@2",
+                "schema": "musterroll/roster@2",
                 "generated_at": "2026-07-17T12:00:00Z",
                 "source_artifact": {
                     "path": "/fixture/roster.toml",

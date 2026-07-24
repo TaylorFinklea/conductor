@@ -1,8 +1,8 @@
-//! Conductor — fleet cycles plus approval-gated, read-only adversarial design review.
+//! Undertake — fleet cycles plus approval-gated, read-only adversarial design review.
 
 mod adversarial;
 mod bd;
-mod bursar;
+mod musterroll;
 mod cli;
 mod config;
 mod cycle;

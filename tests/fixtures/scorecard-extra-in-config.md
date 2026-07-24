@@ -1,6 +1,6 @@
 # Model Scorecard — Test Fixture (Extra in Config)
 
-This scorecard is missing a model that's in conductor.toml.
+This scorecard is missing a model that's in undertake.toml.
 
 ## Live Roster
 
@@ -30,4 +30,4 @@ This scorecard is missing a model that's in conductor.toml.
 | **ollama-kimi-k2.6** | ollama-cloud/kimi-k2.6 | **Senior** | M | good | Test fixture |
 | **ollama-minimax-m3** | ollama-cloud/minimax-m3 | **Senior** | M | good | Test fixture |
 
-Note: gemini-3.5-flash-free is missing (it's in conductor.toml but not here)
+Note: gemini-3.5-flash-free is missing (it's in undertake.toml but not here)

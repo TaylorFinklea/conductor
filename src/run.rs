@@ -1,4 +1,4 @@
-//! `conductor/run@2` manifest + `conductor/event@2` JSONL run artifacts.
+//! `undertake/run@2` manifest + `undertake/event@2` JSONL run artifacts.
 //!
 //! Every active run lives under `<state_dir>/runs-v2/<run-id>/`: a whole-file
 //! atomic `manifest.json` replacement and an append-only `events.jsonl`.
@@ -14,15 +14,15 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::bursar::RuntimeLimitEvidence;
+use crate::musterroll::RuntimeLimitEvidence;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Schema tag stamped on every manifest written by this module.
-pub(crate) const RUN_SCHEMA: &str = "conductor/run@2";
+pub(crate) const RUN_SCHEMA: &str = "undertake/run@2";
 /// Schema tag stamped on every event line written by this module.
-pub(crate) const EVENT_SCHEMA: &str = "conductor/event@2";
+pub(crate) const EVENT_SCHEMA: &str = "undertake/event@2";
 const TERMINAL_TRANSITION_PATH: &str = "artifacts/terminal-transition.json";
 
 pub(crate) type Result<T> = std::result::Result<T, RunError>;
@@ -94,7 +94,7 @@ pub(crate) enum RunLifecycle {
     Finished,
 }
 
-/// One event kind from the spec's stable `conductor/event@2` list.
+/// One event kind from the spec's stable `undertake/event@2` list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
@@ -116,7 +116,7 @@ pub(crate) struct ArtifactRef {
     pub(crate) sha256: String,
 }
 
-/// The content-addressed identity of the exact Bursar snapshot copied into a
+/// The content-addressed identity of the exact Musterroll snapshot copied into a
 /// v2 run directory before profile selection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -232,7 +232,7 @@ pub(crate) struct WorkState {
     /// not as a match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) before_head: Option<String>,
-    /// pid of the `conductor` process that created this run, recorded once
+    /// pid of the `undertake` process that created this run, recorded once
     /// at creation and never mutated — the same OS process drives worker
     /// dispatch, mechanical verification, and qualitative review for a run's
     /// entire lifetime, so this single value authenticates ownership across
@@ -245,7 +245,7 @@ pub(crate) struct WorkState {
     /// [`RunHandle::record_worker_group`] immediately after each worker is
     /// spawned (workers lead their own process group, so the group id equals
     /// the worker pid) and before that worker can meaningfully mutate the
-    /// repository. A dead `conductor` owner is *not* proof that a separately
+    /// repository. A dead `undertake` owner is *not* proof that a separately
     /// grouped worker it launched has also died: an orphaned worker survives
     /// its parent and can keep writing. Stale-claim recovery therefore refuses
     /// to reclaim until this worker group is provably gone, in addition to the
@@ -812,7 +812,7 @@ pub(crate) enum RunDetails {
     Plan { state: PlanRunDetails },
 }
 
-/// `conductor/run@2` — the atomic, versioned run manifest.
+/// `undertake/run@2` — the atomic, versioned run manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunManifest {
@@ -825,7 +825,7 @@ pub(crate) struct RunManifest {
     pub(crate) updated_at: String,
     pub(crate) approved_profiles: ApprovedProfileEnvelope,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) bursar_roster_artifact: Option<ArtifactRef>,
+    pub(crate) musterroll_roster_artifact: Option<ArtifactRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) roster_snapshot: Option<RosterSnapshotArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -866,7 +866,7 @@ pub(crate) struct PlanInvocationEvidence {
     pub(crate) tokens: Option<u64>,
 }
 
-/// `conductor/event@2` — one append-only event line.
+/// `undertake/event@2` — one append-only event line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunEvent {
@@ -895,7 +895,7 @@ pub(crate) struct RunEvent {
 pub(crate) struct NewRun {
     pub(crate) target: RunTarget,
     pub(crate) approved_profiles: Vec<String>,
-    pub(crate) bursar_roster_artifact: Option<ArtifactRef>,
+    pub(crate) musterroll_roster_artifact: Option<ArtifactRef>,
     pub(crate) roster_snapshot: Option<RosterSnapshotInput>,
     pub(crate) limits: RunLimits,
     pub(crate) verifier: RunVerifier,
@@ -911,7 +911,7 @@ pub(crate) struct NewPlanRun {
     pub(crate) target: RunTarget,
     pub(crate) details: PlanRunDetails,
     pub(crate) approved_profiles: Vec<String>,
-    pub(crate) bursar_roster_artifact: Option<ArtifactRef>,
+    pub(crate) musterroll_roster_artifact: Option<ArtifactRef>,
     pub(crate) roster_snapshot: RosterSnapshotInput,
     pub(crate) limits: RunLimits,
     pub(crate) verifier: RunVerifier,
@@ -919,7 +919,7 @@ pub(crate) struct NewPlanRun {
     pub(crate) input_bytes: Vec<u8>,
 }
 
-/// Fields for one `conductor/event@2` row; `run_id`, `seq`, `ts`, `job`, and
+/// Fields for one `undertake/event@2` row; `run_id`, `seq`, `ts`, `job`, and
 /// `target` are filled in by the owning [`RunHandle`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EventInput {
@@ -990,19 +990,19 @@ impl RunHandle {
         let NewRun {
             target,
             approved_profiles,
-            bursar_roster_artifact,
+            musterroll_roster_artifact,
             roster_snapshot,
             limits,
             verifier,
             work,
             approval,
         } = request;
-        if let Some(artifact) = bursar_roster_artifact.as_ref() {
-            validate_artifact_ref(artifact, "bursar roster artifact")?;
+        if let Some(artifact) = musterroll_roster_artifact.as_ref() {
+            validate_artifact_ref(artifact, "musterroll roster artifact")?;
         }
         if let Some(snapshot) = roster_snapshot.as_ref() {
             validate_sha256(&snapshot.policy_sha256, "roster policy")?;
-            let parsed = crate::bursar::parse_roster_snapshot(&snapshot.bytes)
+            let parsed = crate::musterroll::parse_roster_snapshot(&snapshot.bytes)
                 .map_err(|error| RunError::new(format!("invalid roster snapshot: {error}")))?;
             if parsed.policy_sha256() != snapshot.policy_sha256 {
                 return Err(RunError::new(
@@ -1055,7 +1055,7 @@ impl RunHandle {
             approved_profiles: ApprovedProfileEnvelope {
                 profiles: approved_profiles,
             },
-            bursar_roster_artifact,
+            musterroll_roster_artifact,
             roster_snapshot: None,
             roster_policy_sha256: None,
             limits,
@@ -1103,7 +1103,7 @@ impl RunHandle {
                     sha256: copied.sha256,
                 });
             }
-            if let Some(roster) = handle.manifest.bursar_roster_artifact.clone() {
+            if let Some(roster) = handle.manifest.musterroll_roster_artifact.clone() {
                 initial_refs.push(roster);
             }
             handle.write_manifest()?;
@@ -1117,12 +1117,12 @@ impl RunHandle {
                 now,
             )?;
             if handle.manifest.roster_snapshot.is_none()
-                && handle.manifest.bursar_roster_artifact.is_none()
+                && handle.manifest.musterroll_roster_artifact.is_none()
             {
                 handle.append_event_at(
                     EventKind::CoverageGap,
                     EventInput {
-                        outcome: Some("bursar_roster_artifact_unavailable".to_string()),
+                        outcome: Some("musterroll_roster_artifact_unavailable".to_string()),
                         ..EventInput::default()
                     },
                     now,
@@ -1150,7 +1150,7 @@ impl RunHandle {
             target,
             details,
             approved_profiles,
-            bursar_roster_artifact,
+            musterroll_roster_artifact,
             roster_snapshot,
             limits,
             verifier,
@@ -1159,15 +1159,15 @@ impl RunHandle {
         } = request;
         validate_run_id(&run_id)?;
         validate_sha256(&roster_snapshot.policy_sha256, "roster policy")?;
-        let parsed = crate::bursar::parse_roster_snapshot(&roster_snapshot.bytes)
+        let parsed = crate::musterroll::parse_roster_snapshot(&roster_snapshot.bytes)
             .map_err(|error| RunError::new(format!("invalid roster snapshot: {error}")))?;
         if parsed.policy_sha256() != roster_snapshot.policy_sha256 {
             return Err(RunError::new(
                 "roster snapshot policy_sha256 does not match prepared policy",
             ));
         }
-        if let Some(artifact) = bursar_roster_artifact.as_ref() {
-            validate_artifact_ref(artifact, "bursar roster artifact")?;
+        if let Some(artifact) = musterroll_roster_artifact.as_ref() {
+            validate_artifact_ref(artifact, "musterroll roster artifact")?;
         }
         let input_artifact = plan_input_artifact(&details.target.input).clone();
         validate_artifact_ref(&input_artifact, "plan target input")?;
@@ -1202,7 +1202,7 @@ impl RunHandle {
             approved_profiles: ApprovedProfileEnvelope {
                 profiles: approved_profiles,
             },
-            bursar_roster_artifact,
+            musterroll_roster_artifact,
             roster_snapshot: None,
             roster_policy_sha256: None,
             limits,
@@ -1258,7 +1258,7 @@ impl RunHandle {
                     sha256: copied_roster.sha256,
                 },
             ];
-            if let Some(roster) = handle.manifest.bursar_roster_artifact.clone() {
+            if let Some(roster) = handle.manifest.musterroll_roster_artifact.clone() {
                 initial_refs.push(roster);
             }
             handle.write_manifest()?;
@@ -1342,7 +1342,7 @@ impl RunHandle {
         &self.manifest
     }
 
-    /// The pid recorded at creation for this run's owning `conductor`
+    /// The pid recorded at creation for this run's owning `undertake`
     /// process, if any (see [`WorkState::owner_pid`]).
     pub(crate) fn owner_pid(&self) -> Option<u32> {
         self.work().and_then(|work| work.owner_pid)
@@ -2115,7 +2115,7 @@ impl RunHandle {
         )
     }
 
-    /// Touches this run's heartbeat file, recording that the `conductor`
+    /// Touches this run's heartbeat file, recording that the `undertake`
     /// process driving it is still alive. Read back by
     /// [`find_implementing_work_run`] staleness checks so a `dispatch
     /// --resume` invocation can tell an actively-running worker from one
@@ -2267,7 +2267,7 @@ pub(crate) fn legacy_v1_preflight(state_dir: &Path) -> Result<LegacyV1Preflight>
             result.reclaimable += 1;
             continue;
         };
-        if value.get("schema").and_then(serde_json::Value::as_str) != Some("conductor/run@1") {
+        if value.get("schema").and_then(serde_json::Value::as_str) != Some("undertake/run@1") {
             continue;
         }
         if value.get("lifecycle").and_then(serde_json::Value::as_str) == Some("finished") {
@@ -2336,8 +2336,8 @@ pub(crate) fn read_manifest(path: &Path) -> Result<RunManifest> {
     let manifest: RunManifest = serde_json::from_value(value)
         .map_err(|e| RunError::new(format!("failed to parse manifest {}: {e}", path.display())))?;
     validate_run_id(&manifest.run_id)?;
-    if let Some(artifact) = manifest.bursar_roster_artifact.as_ref() {
-        validate_artifact_ref(artifact, "manifest bursar roster artifact")?;
+    if let Some(artifact) = manifest.musterroll_roster_artifact.as_ref() {
+        validate_artifact_ref(artifact, "manifest musterroll roster artifact")?;
     }
     if let Some(snapshot) = manifest.roster_snapshot.as_ref() {
         validate_roster_snapshot(path, snapshot, manifest.roster_policy_sha256.as_deref())?;
@@ -3293,7 +3293,7 @@ fn validate_roster_snapshot(
     if actual != snapshot.sha256 {
         return Err(RunError::new("copied roster snapshot hash mismatch"));
     }
-    let parsed = crate::bursar::parse_roster_snapshot(&bytes)
+    let parsed = crate::musterroll::parse_roster_snapshot(&bytes)
         .map_err(|error| RunError::new(format!("copied roster snapshot invalid: {error}")))?;
     if parsed.policy_sha256() != policy_sha256 {
         return Err(RunError::new(
@@ -3434,7 +3434,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("conductor-run-{label}-{nanos}"));
+            let path = std::env::temp_dir().join(format!("undertake-run-{label}-{nanos}"));
             std::fs::create_dir_all(&path).expect("mkdir temp");
             Self(path)
         }
@@ -3457,12 +3457,12 @@ mod tests {
     fn new_run_request() -> NewRun {
         NewRun {
             target: RunTarget {
-                repo: "/repo/conductor".to_string(),
-                bead: Some("conductor-run-contract".to_string()),
+                repo: "/repo/undertake".to_string(),
+                bead: Some("undertake-run-contract".to_string()),
             },
             approved_profiles: vec!["claude-sonnet-5".to_string(), "gpt-5.6-luna".to_string()],
-            bursar_roster_artifact: Some(ArtifactRef {
-                path: "/home/.config/bursar/roster.toml".to_string(),
+            musterroll_roster_artifact: Some(ArtifactRef {
+                path: "/home/.config/musterroll/roster.toml".to_string(),
                 sha256: "a".repeat(64),
             }),
             roster_snapshot: None,
@@ -3492,10 +3492,10 @@ mod tests {
         let manifest = read_manifest(&handle.manifest_path()).expect("read manifest");
         assert_eq!(manifest.schema, RUN_SCHEMA);
         assert_eq!(manifest.job, RunJob::Work);
-        assert_eq!(manifest.target.repo, "/repo/conductor");
+        assert_eq!(manifest.target.repo, "/repo/undertake");
         assert_eq!(
             manifest.target.bead.as_deref(),
-            Some("conductor-run-contract")
+            Some("undertake-run-contract")
         );
         assert_eq!(
             manifest.approved_profiles.profiles,
@@ -3503,7 +3503,7 @@ mod tests {
         );
         assert_eq!(
             manifest
-                .bursar_roster_artifact
+                .musterroll_roster_artifact
                 .as_ref()
                 .map(|a| a.sha256.clone()),
             Some("a".repeat(64))
@@ -3580,7 +3580,7 @@ mod tests {
         // Otherwise-complete manifest so the failure is unambiguously the
         // schema check, not a missing-field parse error.
         let mut manifest = serde_json::to_value(RunManifest {
-            schema: "conductor/run@2".to_string(),
+            schema: "undertake/run@2".to_string(),
             run_id: "x".to_string(),
             job: RunJob::Work,
             target: RunTarget {
@@ -3591,7 +3591,7 @@ mod tests {
             created_at: "2026-07-16T12:00:00Z".to_string(),
             updated_at: "2026-07-16T12:00:00Z".to_string(),
             approved_profiles: ApprovedProfileEnvelope::default(),
-            bursar_roster_artifact: None,
+            musterroll_roster_artifact: None,
             roster_snapshot: None,
             roster_policy_sha256: None,
             limits: RunLimits::default(),
@@ -3601,7 +3601,7 @@ mod tests {
             outcome: None,
         })
         .unwrap();
-        manifest["schema"] = serde_json::json!("conductor/run@1");
+        manifest["schema"] = serde_json::json!("conductor/run@2");
         std::fs::write(&path, manifest.to_string()).unwrap();
 
         let err = read_manifest(&path).expect_err("unknown schema must fail closed");
@@ -3613,7 +3613,7 @@ mod tests {
         let temp = TempDir::new("bad-event-schema");
         let path = temp.path().join("events.jsonl");
         let bad_line = serde_json::json!({
-            "schema": "conductor/event@1",
+            "schema": "conductor/event@2",
             "event_id": "x-1",
             "run_id": "x",
             "seq": 1,
@@ -3645,7 +3645,7 @@ mod tests {
         // Simulate a crash mid-write: a truncated JSON line appended directly,
         // bypassing the atomic append helper.
         let mut raw = std::fs::read_to_string(handle.events_path()).unwrap();
-        raw.push_str("{\"schema\":\"conductor/event@1\",\"event_id\":\"trunc");
+        raw.push_str("{\"schema\":\"undertake/event@1\",\"event_id\":\"trunc");
         std::fs::write(handle.events_path(), raw).unwrap();
 
         let err = read_events(&handle.events_path()).expect_err("partial line must fail closed");
@@ -3714,7 +3714,7 @@ mod tests {
         assert_eq!(events[2].seq, 3);
 
         // Corrupt the manifest after the fact and confirm reopen fails closed.
-        std::fs::write(reopened.manifest_path(), br#"{"schema":"conductor/run@9"}"#).unwrap();
+        std::fs::write(reopened.manifest_path(), br#"{"schema":"undertake/run@9"}"#).unwrap();
         assert!(RunHandle::open(temp.path(), &run_id).is_err());
     }
 
@@ -4071,7 +4071,7 @@ mod tests {
                 .expect("create run");
         let transition = TerminalTransition {
             action: TerminalTransitionAction::Close,
-            reason: "conductor cycle-1: verified via cargo test".to_string(),
+            reason: "undertake cycle-1: verified via cargo test".to_string(),
             metadata: None,
             comment: None,
         };
@@ -4152,10 +4152,10 @@ mod tests {
     }
 
     #[test]
-    fn run_event_missing_bursar_roster_emits_explicit_coverage_gap() {
-        let temp = TempDir::new("bursar-gap");
+    fn run_event_missing_musterroll_roster_emits_explicit_coverage_gap() {
+        let temp = TempDir::new("musterroll-gap");
         let mut request = new_run_request();
-        request.bursar_roster_artifact = None;
+        request.musterroll_roster_artifact = None;
         let handle = RunHandle::create_at(temp.path(), RunJob::Work, request, fixed_now())
             .expect("create run");
 
@@ -4165,7 +4165,7 @@ mod tests {
         assert_eq!(events[1].kind, EventKind::CoverageGap);
         assert_eq!(
             events[1].outcome.as_deref(),
-            Some("bursar_roster_artifact_unavailable")
+            Some("musterroll_roster_artifact_unavailable")
         );
     }
 
@@ -4396,8 +4396,8 @@ mod tests {
 
     #[test]
     fn run_event_cross_process_same_second_creation_is_exclusive() {
-        const STATE_ENV: &str = "CONDUCTOR_RUN_TEST_CHILD_STATE";
-        const RESULT_ENV: &str = "CONDUCTOR_RUN_TEST_CHILD_RESULT";
+        const STATE_ENV: &str = "UNDERTAKE_RUN_TEST_CHILD_STATE";
+        const RESULT_ENV: &str = "UNDERTAKE_RUN_TEST_CHILD_RESULT";
         if let (Some(state), Some(result)) =
             (std::env::var_os(STATE_ENV), std::env::var_os(RESULT_ENV))
         {
@@ -4516,12 +4516,12 @@ mod tests {
         finished.finish("stale_claim_reaped").expect("finish run");
 
         assert_eq!(
-            find_implementing_work_run(temp.path(), cycle_id, "/repo/conductor", "impl-bead")
+            find_implementing_work_run(temp.path(), cycle_id, "/repo/undertake", "impl-bead")
                 .expect("lookup implementing"),
             Some(implementing.run_id().to_string())
         );
         assert_eq!(
-            find_implementing_work_run(temp.path(), cycle_id, "/repo/conductor", "finished-bead")
+            find_implementing_work_run(temp.path(), cycle_id, "/repo/undertake", "finished-bead")
                 .expect("lookup finished bead"),
             None,
             "a finished implementing-stage run must never be reclaimable"
@@ -4549,7 +4549,7 @@ mod tests {
             });
             request
         };
-        let repo = "/repo/conductor";
+        let repo = "/repo/undertake";
 
         // No runs yet.
         assert_eq!(
@@ -4634,7 +4634,7 @@ mod tests {
         .expect("create second unfinished");
 
         assert!(
-            find_reclaimable_work_run(temp.path(), cycle_id, "/repo/conductor", "conflict-bead")
+            find_reclaimable_work_run(temp.path(), cycle_id, "/repo/undertake", "conflict-bead")
                 .is_err(),
             "two unfinished generations is an invariant violation and must fail closed"
         );
@@ -4645,18 +4645,18 @@ mod tests {
         let temp = TempDir::new("strict-v2-schema");
         let path = temp.path().join("manifest.json");
         let mut value = serde_json::to_value(RunManifest {
-            schema: "conductor/run@1".to_string(),
+            schema: "undertake/run@1".to_string(),
             run_id: "run-work-20260716T120000.000000000-p1-000000".to_string(),
             job: RunJob::Work,
             target: RunTarget {
-                repo: "/repo/conductor".to_string(),
-                bead: Some("conductor-run-v2".to_string()),
+                repo: "/repo/undertake".to_string(),
+                bead: Some("undertake-run-v2".to_string()),
             },
             details: RunDetails::Work { state: None },
             created_at: "2026-07-16T12:00:00Z".to_string(),
             updated_at: "2026-07-16T12:00:00Z".to_string(),
             approved_profiles: ApprovedProfileEnvelope::default(),
-            bursar_roster_artifact: None,
+            musterroll_roster_artifact: None,
             roster_snapshot: None,
             roster_policy_sha256: None,
             limits: RunLimits::default(),
@@ -4672,7 +4672,7 @@ mod tests {
             "the v2 reader must not parse a v1 manifest"
         );
 
-        value["schema"] = serde_json::json!("conductor/run@2");
+        value["schema"] = serde_json::json!("undertake/run@2");
         value["unexpected"] = serde_json::json!(true);
         std::fs::write(&path, value.to_string()).expect("write malformed v2 manifest");
         assert!(
@@ -4685,7 +4685,7 @@ mod tests {
     fn prepared_run_copies_and_pins_exact_roster_snapshot_bytes() {
         let temp = TempDir::new("copied-roster-snapshot");
         let snapshot_bytes = br#"{
-          "schema":"bursar/roster@2",
+          "schema":"musterroll/roster@2",
           "generated_at":"2026-07-16T12:00:00Z",
           "source_artifact":{"path":"/source/roster.toml","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
           "policy_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -4834,7 +4834,7 @@ mod tests {
             std::fs::write(
                 dir.join("manifest.json"),
                 serde_json::json!({
-                    "schema": "conductor/run@1",
+                    "schema": "undertake/run@1",
                     "lifecycle": lifecycle,
                     "work": { "stage": stage }
                 })

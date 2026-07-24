@@ -1,23 +1,23 @@
-//! ratchet counters (`~/.local/state/conductor/ratchet.json`)
+//! ratchet counters (`~/.local/state/undertake/ratchet.json`)
 //!
-//! Pinned by `conductor-v1-spec.md` § Ratchet:
-//! - State: `~/.local/state/conductor/ratchet.json` shaped
+//! Pinned by `undertake-v1-spec.md` § Ratchet:
+//! - State: `~/.local/state/undertake/ratchet.json` shaped
 //!   `{repo: {clean_cycles: N, unlocked: bool}}`.
 //! - 3 consecutive clean cycles for a repo → unlocked.
 //! - Clean cycle for a repo = every proposal touching it was approved
 //!   unmodified AND every dispatch in it verified-closed.
-//! - Unlocked repos: `conductor cycle` may auto-dispatch items with
+//! - Unlocked repos: `undertake cycle` may auto-dispatch items with
 //!   `tier_floor ∈ {senior, junior}` AND `complexity ≤ M` AND a runnable
 //!   `verify_cmd`, within budgets, WITHOUT waiting for approval — but they
 //!   still appear in the report. Lead-floor items are ALWAYS propose-only
 //!   (invariant 5). Anything else still proposes.
 //! - ANY rejected proposal / failed verify / worker failure → that repo's
 //!   counter resets to 0 and relocks (invariant 9: "Ratchet failure re-locks").
-//! - Global override: `autonomy = "propose"` in `conductor.toml` disables
+//! - Global override: `autonomy = "propose"` in `undertake.toml` disables
 //!   auto-dispatch everywhere.
 //!
 //! Month-1 CONFIG DEFAULT (decisions.md 2026-07-03, ADR comment on
-//! `conductor-m6`): the *mechanism* ships at the spec ceiling
+//! `undertake-m6`): the *mechanism* ships at the spec ceiling
 //! (`{senior, junior}` + `≤ M`); the *config* ships narrower (junior + S).
 //! Widening toward the spec ceiling is a HUMAN config change backed by
 //! ratchet evidence. See `Config::ratchet` for the defaults.
@@ -41,7 +41,7 @@ use crate::triage::RatchetState;
 /// dispatch. Spec § Ratchet pins this at 3.
 pub(crate) const CLEAN_CYCLES_TO_UNLOCK: u32 = 3;
 
-/// Filename of the persisted ratchet state under the conductor state dir.
+/// Filename of the persisted ratchet state under the undertake state dir.
 pub(crate) const RATCHET_FILE_NAME: &str = "ratchet.json";
 
 /// Spec ceiling for the ratchet mechanism itself: the MECHANISM auto-
@@ -180,7 +180,7 @@ pub(crate) struct ItemShape<'a> {
 /// show *why* auto-dispatch was withheld.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProposeReason {
-    /// Global kill-switch: `autonomy = "propose"` in `conductor.toml`.
+    /// Global kill-switch: `autonomy = "propose"` in `undertake.toml`.
     AutonomyPropose,
     /// Repo has not earned unlock (`clean_cycles` < threshold or explicit
     /// relock after a failure).
@@ -278,7 +278,7 @@ fn complexity_exceeds_ceiling(c: Ceiling, max: Ceiling) -> bool {
 // File-backed store
 // ---------------------------------------------------------------------------
 
-/// The on-disk ratchet store, rooted at the conductor state dir. Provides
+/// The on-disk ratchet store, rooted at the undertake state dir. Provides
 /// the cycle orchestrator with the load/record surface; tests construct
 /// one pointed at a temp dir.
 pub(crate) struct RatchetFileStore {
@@ -433,7 +433,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("conductor-ratchet-{label}-{nanos}"));
+            let path = std::env::temp_dir().join(format!("undertake-ratchet-{label}-{nanos}"));
             std::fs::create_dir_all(&path).expect("mkdir temp dir");
             Self(path)
         }

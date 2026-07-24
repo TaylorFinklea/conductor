@@ -1,4 +1,4 @@
-//! cycle plan build/serialize (~/.local/state/conductor/plans/<cycle-id>.json)
+//! cycle plan build/serialize (~/.local/state/undertake/plans/<cycle-id>.json)
 
 #![allow(dead_code)]
 
@@ -26,7 +26,7 @@ pub(crate) struct CyclePlan {
     #[serde(default)]
     pub(crate) provider_routes: Vec<ProviderRouteRecord>,
     #[serde(default)]
-    pub(crate) bursar_roster_source_artifact: Option<crate::bursar::RosterSourceArtifact>,
+    pub(crate) musterroll_roster_source_artifact: Option<crate::musterroll::RosterSourceArtifact>,
     pub(crate) approval_scope: ApprovalScope,
     pub(crate) item_authorizations: Vec<ItemAuthorizationRecord>,
 }
@@ -316,7 +316,7 @@ pub(crate) fn item_authorization_hash(
         ));
     }
     let input = AuthorizationInput {
-        schema: "conductor-item-authorization-v1",
+        schema: "undertake-item-authorization-v1",
         repo_path,
         issue_id: &issue.id,
         title: &issue.title,
@@ -415,7 +415,7 @@ impl CyclePlan {
             flags,
             skips,
             provider_routes: Vec::new(),
-            bursar_roster_source_artifact: None,
+            musterroll_roster_source_artifact: None,
             approval_scope: ApprovalScope {
                 max_dispatch_count: plan.dispatches.len(),
                 ..ApprovalScope::default()
@@ -609,7 +609,7 @@ fn flag_entry(flag: &Flag) -> FlagEntry {
             kind: "roster-drift".to_string(),
             repo: String::new(),
             issue_id: String::new(),
-            detail: "scorecard and conductor.toml disagree".to_string(),
+            detail: "scorecard and undertake.toml disagree".to_string(),
         },
     }
 }
@@ -629,7 +629,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use crate::bursar::{Availability, BudgetAction};
+    use crate::musterroll::{Availability, BudgetAction};
     use crate::config::{Backend, Cost};
     use crate::route::{ProviderEvidence, RouteReason};
     use crate::triage::{Dispatch, Proposal, Skip};
@@ -662,7 +662,7 @@ mod tests {
         assert_eq!(cp.skips.len(), 1);
         assert_eq!(cp.skips[0].reason, "budget");
 
-        let tmp = std::env::temp_dir().join("conductor-plan-test");
+        let tmp = std::env::temp_dir().join("undertake-plan-test");
         let _ = std::fs::remove_dir_all(&tmp);
         let path = cp.save(&tmp).unwrap();
         assert!(path.is_file());
@@ -686,7 +686,7 @@ mod tests {
             provider: "codex".to_string(),
             model: Some("observed-gpt".to_string()),
             availability: Some(Availability::Healthy),
-            source: Some("bursar-api".to_string()),
+            source: Some("musterroll-api".to_string()),
             checked_at: Some("2026-07-13T12:00:00Z".to_string()),
             data_as_of: Some("2026-07-13T11:59:00Z".to_string()),
             expires_at: Some("2026-07-13T12:15:00Z".to_string()),
@@ -746,21 +746,21 @@ mod tests {
     }
 
     #[test]
-    fn cycle_plan_pins_the_bursar_roster_source_artifact() {
+    fn cycle_plan_pins_the_musterroll_roster_source_artifact() {
         let plan = CyclePlan::from_triage("cycle", "2026-07-16T12:00:00Z", &Plan::default());
-        let artifact = crate::bursar::RosterSourceArtifact {
+        let artifact = crate::musterroll::RosterSourceArtifact {
             path: "/absolute/roster.toml".to_string(),
             sha256: "a".repeat(64),
         };
         let cycle = CyclePlan {
-            bursar_roster_source_artifact: Some(artifact.clone()),
+            musterroll_roster_source_artifact: Some(artifact.clone()),
             ..plan
         };
 
         let json = serde_json::to_value(cycle).expect("serialize pinned plan");
-        assert_eq!(json["bursar_roster_source_artifact"]["path"], artifact.path);
+        assert_eq!(json["musterroll_roster_source_artifact"]["path"], artifact.path);
         assert_eq!(
-            json["bursar_roster_source_artifact"]["sha256"],
+            json["musterroll_roster_source_artifact"]["sha256"],
             artifact.sha256
         );
     }
@@ -865,7 +865,7 @@ mod tests {
                 .expect("hash");
         assert_eq!(
             baseline,
-            "c0491080e93873b421a1dc1437fc02eeafdf5dddee39d5a5dc535bfec3a3fb73"
+            "5d86841b7d3763920cc800b686e0205a372cd70b87a41f2e4fcbc1ed10b0acb3"
         );
         assert_eq!(
             baseline,
@@ -961,7 +961,7 @@ mod tests {
 
     #[test]
     fn cycle_plan_load_rejects_noncanonical_persisted_scope() {
-        let tmp = std::env::temp_dir().join("conductor-invalid-scope-plan-test");
+        let tmp = std::env::temp_dir().join("undertake-invalid-scope-plan-test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("plans")).unwrap();
         let invalid = serde_json::json!({

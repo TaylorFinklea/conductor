@@ -1,7 +1,7 @@
-# Conductor fleet cycle runner — static configuration.
+# Undertake fleet cycle runner — static configuration.
 #
-# Execution profiles, providers, and invocation identities are owned by Bursar.
-# Every launch consumes `bursar/roster@2`; Conductor copies and pins its exact
+# Execution profiles, providers, and invocation identities are owned by Musterroll.
+# Every launch consumes `musterroll/roster@2`; Undertake copies and pins its exact
 # snapshot bytes in the prepared run artifact.
 
 autonomy = "propose"
@@ -14,15 +14,15 @@ root = "~/git"
 # independent of this list — never scan/dispatch either (invariant 5).
 exclude = []
 
-# Per-repo data policy. `proprietary`/`internal` exclude profiles whose Bursar
+# Per-repo data policy. `proprietary`/`internal` exclude profiles whose Musterroll
 # data policy permits training on submitted input. A repo absent from this table
 # defaults to `proprietary` (fail closed).
 [[repo_policy]]
-repo = "bursar"
+repo = "musterroll"
 cost_policy = "oss"
 
 [[repo_policy]]
-repo = "conductor"
+repo = "undertake"
 cost_policy = "oss"
 
 [[repo_policy]]
@@ -86,8 +86,8 @@ always_orchestra = false
 enabled = true
 min_tier_gap = 1
 
-# Generic Conductor-owned role routing. IDs are opaque Bursar profile labels;
-# Bursar retains capability and eligibility ownership, while these weights
+# Generic Undertake-owned role routing. IDs are opaque Musterroll profile labels;
+# Musterroll retains capability and eligibility ownership, while these weights
 # control the enabled `plan` pool. Weights are relative, not percentages.
 [[role_binding]]
 role = "plan"
@@ -121,8 +121,8 @@ judge = "openai-codex--codex--gpt-5.6-sol--max"
 judge_fallbacks = ["openai-codex--codex--gpt-5.6-terra--xhigh", "anthropic--claude-code--claude-opus-4-8--none"]
 
 
-# Retry order is Conductor job policy, not roster ownership. Each ID must be
-# present in the Bursar snapshot; unavailable fallback profiles are omitted at
+# Retry order is Undertake job policy, not roster ownership. Each ID must be
+# present in the Musterroll snapshot; unavailable fallback profiles are omitted at
 # launch so a disabled provider can never be selected at dispatch time.
 [[job_fallback]]
 profile_id = "anthropic--claude-code--claude-sonnet-5--none"

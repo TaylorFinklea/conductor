@@ -5,7 +5,7 @@ use std::process::{Command, ExitCode, Stdio};
 
 use crate::config;
 
-const USAGE: &str = "usage: conductor [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]]";
+const USAGE: &str = "usage: undertake [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [migrate state --from <legacy-root> --to <undertake-root> [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]]";
 
 const DEFAULT_ADVERSARIAL_QUESTION: &str =
     "What are the highest-risk flaws in this artifact, and what must change before proceeding?";
@@ -22,7 +22,7 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("--version") => {
-            println!("conductor {}", env!("CARGO_PKG_VERSION"));
+            println!("undertake {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Some("adversarial-review") => run_adversarial(&mut it),
@@ -30,6 +30,7 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
         Some("cycle") => run_cycle(&mut it),
         Some("dispatch") => run_dispatch(&mut it),
         Some("plan") => run_plan(&mut it),
+        Some("migrate") => run_migrate(&mut it),
         Some("roster") => run_roster(&mut it),
         Some("route") => run_route(&mut it),
         Some("scan") => run_scan(&mut it),
@@ -105,7 +106,7 @@ fn parse_plan_prepare_options(args: &[String]) -> Result<PlanPrepareOptions, Str
     let mut max_plan_revisions = 1;
     let mut revisions_seen = false;
     let mut require_second_opinion = false;
-    let mut config = PathBuf::from("conductor.toml");
+    let mut config = PathBuf::from("undertake.toml");
     let mut config_seen = false;
     let mut it = args.iter();
     while let Some(argument) = it.next() {
@@ -248,7 +249,7 @@ fn run_plan(it: &mut std::vec::IntoIter<String>) -> ExitCode {
             ExitCode::from(2)
         }
         None => {
-            eprintln!("usage: conductor plan <prepare|dispatch|status|cancel>");
+            eprintln!("usage: undertake plan <prepare|dispatch|status|cancel>");
             ExitCode::from(2)
         }
     }
@@ -287,7 +288,7 @@ fn run_plan_prepare(args: &[String]) -> ExitCode {
     match crate::plan_job::prepare(
         &plan_paths(),
         &config,
-        &crate::bursar::CommandBursarClient::new(),
+        &crate::musterroll::CommandMusterrollClient::new(),
         crate::plan_job::PlanPrepareRequest {
             repo: options.repo,
             input,
@@ -366,7 +367,7 @@ pub(crate) fn parse_plan_run_options(
     if !valid_cli_review_id(run_id) {
         return Err("plan run id must contain only alphanumeric, '_' or '-' bytes".to_string());
     }
-    let mut config = PathBuf::from("conductor.toml");
+    let mut config = PathBuf::from("undertake.toml");
     if args.len() == 1 {
         return Ok((run_id.clone(), config));
     }
@@ -446,7 +447,7 @@ fn run_plan_dispatch(args: &[String]) -> ExitCode {
     match crate::plan_job::dispatch(
         &paths,
         &config,
-        &crate::bursar::CommandBursarClient::new(),
+        &crate::musterroll::CommandMusterrollClient::new(),
         &run_id,
         &author,
     ) {
@@ -596,7 +597,7 @@ fn plan_second_opinion_prompt(
 }
 
 fn run_plan_backend(
-    profile: &crate::bursar::RosterProfile,
+    profile: &crate::musterroll::RosterProfile,
     execution: &crate::run::ApprovedExecution,
     prompt: &str,
     worktree: &Path,
@@ -633,7 +634,7 @@ fn plan_author_argv(
 }
 
 fn plan_backend_argv(
-    profile: &crate::bursar::RosterProfile,
+    profile: &crate::musterroll::RosterProfile,
     execution: &crate::run::ApprovedExecution,
     prompt: &str,
     worktree: &Path,
@@ -641,7 +642,7 @@ fn plan_backend_argv(
     if profile.profile_id != execution.profile_id || profile.provider_id != execution.provider_id {
         return Err("plan profile differs from approved execution".to_string());
     }
-    let backend = crate::bursar::backend_from_harness(&profile.harness)
+    let backend = crate::musterroll::backend_from_harness(&profile.harness)
         .map_err(|error| format!("plan harness: {error}"))?;
     let reasoning_effort = profile
         .reasoning_effort
@@ -664,7 +665,7 @@ fn run_adversarial(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         Some("dispatch") => run_adversarial_dispatch(it),
         None => {
             eprintln!(
-                "usage: conductor adversarial-review <plan --artifact <path> --reviewers <N>|dispatch <review-id>> [options]"
+                "usage: undertake adversarial-review <plan --artifact <path> --reviewers <N>|dispatch <review-id>> [options]"
             );
             ExitCode::from(2)
         }
@@ -680,7 +681,7 @@ fn parse_adversarial_plan_options(args: &[String]) -> Result<AdversarialPlanOpti
     let mut reviewers = None;
     let mut question = None;
     let mut models = None;
-    let mut config_path = PathBuf::from("conductor.toml");
+    let mut config_path = PathBuf::from("undertake.toml");
     let mut config_seen = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -778,7 +779,7 @@ fn parse_adversarial_dispatch_options(
     if !valid_cli_review_id(review_id) {
         return Err("review id must contain only alphanumeric, '_' or '-' bytes".to_string());
     }
-    let mut config_path = PathBuf::from("conductor.toml");
+    let mut config_path = PathBuf::from("undertake.toml");
     let mut config_seen = false;
     let mut it = args[1..].iter();
     while let Some(arg) = it.next() {
@@ -836,7 +837,7 @@ fn run_adversarial_plan(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         return ExitCode::from(2);
     }
     let paths = AdversarialPaths::from_environment();
-    let bursar = crate::bursar::CommandBursarClient::new();
+    let musterroll = crate::musterroll::CommandMusterrollClient::new();
     let validator = crate::deck::CommandDeckValidator::new();
     let review_id = new_adversarial_review_id();
     let created_at = chrono::Utc::now().to_rfc3339();
@@ -844,7 +845,7 @@ fn run_adversarial_plan(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         &cfg,
         &options,
         &paths,
-        &bursar,
+        &musterroll,
         &validator,
         &review_id,
         &created_at,
@@ -876,16 +877,16 @@ fn execute_adversarial_plan<C, V>(
     cfg: &crate::config::Config,
     options: &AdversarialPlanOptions,
     paths: &AdversarialPaths,
-    bursar: &C,
+    musterroll: &C,
     validator: &V,
     review_id: &str,
     created_at: &str,
 ) -> Result<crate::adversarial::PublishedApproval, String>
 where
-    C: crate::bursar::BursarClient + ?Sized,
+    C: crate::musterroll::MusterrollClient + ?Sized,
     V: crate::deck::DeckValidator,
 {
-    let provider_snapshot = adversarial_provider_snapshot(cfg, bursar);
+    let provider_snapshot = adversarial_provider_snapshot(cfg, musterroll);
     let panel = crate::adversarial::plan_panel(
         &cfg.roster,
         &cfg.adversarial_review,
@@ -930,9 +931,9 @@ fn run_adversarial_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         }
     };
     let paths = AdversarialPaths::from_environment();
-    let bursar = crate::bursar::CommandBursarClient::new();
+    let musterroll = crate::musterroll::CommandMusterrollClient::new();
     let exec = crate::dispatch::CommandExec;
-    let result = execute_adversarial_dispatch(&cfg, &options, &paths, &bursar, &exec);
+    let result = execute_adversarial_dispatch(&cfg, &options, &paths, &musterroll, &exec);
     match &result {
         Ok(run) => {
             let outcome = match run.outcome {
@@ -957,20 +958,20 @@ fn execute_adversarial_dispatch<C, E>(
     cfg: &crate::config::Config,
     options: &AdversarialDispatchOptions,
     paths: &AdversarialPaths,
-    bursar: &C,
+    musterroll: &C,
     exec: &E,
 ) -> Result<crate::adversarial::AdversarialRun, String>
 where
-    C: crate::bursar::BursarClient + ?Sized,
+    C: crate::musterroll::MusterrollClient + ?Sized,
     E: crate::dispatch::Exec + Sync,
 {
     let review_dir = paths.state_root.join(&options.review_id);
     let plan =
         crate::adversarial::load_review_plan(&review_dir).map_err(|error| error.to_string())?;
     let artifact_path = PathBuf::from(plan.artifact_source_path());
-    let resolved_roster = crate::bursar::resolve_roster(cfg, bursar)
-        .map_err(|error| format!("bursar roster snapshot: {error}"))?;
-    let provider_snapshot = adversarial_provider_snapshot(cfg, bursar);
+    let resolved_roster = crate::musterroll::resolve_roster(cfg, musterroll)
+        .map_err(|error| format!("musterroll roster snapshot: {error}"))?;
+    let provider_snapshot = adversarial_provider_snapshot(cfg, musterroll);
     let authorized = crate::adversarial::authorize_approved_execution(
         &review_dir,
         &paths.reports_home,
@@ -982,7 +983,7 @@ where
     .map_err(|error| error.to_string())?;
     let approved_profiles = adversarial_approved_profiles(&authorized.plan);
     let approval = serde_json::json!({
-        "schema": "conductor/review-approval@1",
+        "schema": "undertake/review-approval@1",
         "decision": "approved",
         "plan": &authorized.plan,
     });
@@ -996,7 +997,7 @@ where
                 bead: None,
             },
             approved_profiles,
-            bursar_roster_artifact: Some(crate::run::ArtifactRef {
+            musterroll_roster_artifact: Some(crate::run::ArtifactRef {
                 path: resolved_roster.source_artifact.path,
                 sha256: resolved_roster.source_artifact.sha256,
             }),
@@ -1034,7 +1035,7 @@ where
         };
     record_adversarial_reviewer_events(&mut run_artifacts, &reviewer_run)?;
 
-    let judge_provider_snapshot = adversarial_provider_snapshot(cfg, bursar);
+    let judge_provider_snapshot = adversarial_provider_snapshot(cfg, musterroll);
     let adversarial_run =
         match crate::adversarial::finalize_review(crate::adversarial::SynthesisRequest {
             authorized: &authorized,
@@ -1247,14 +1248,14 @@ fn adversarial_judge_outcome(outcome: &crate::adversarial::JudgeAttemptOutcome) 
     }
 }
 
-fn adversarial_provider_snapshot<C: crate::bursar::BursarClient + ?Sized>(
+fn adversarial_provider_snapshot<C: crate::musterroll::MusterrollClient + ?Sized>(
     cfg: &crate::config::Config,
-    bursar: &C,
-) -> std::collections::BTreeMap<String, crate::bursar::BudgetDecision> {
-    crate::bursar::evaluate_provider_snapshot(
-        bursar,
+    musterroll: &C,
+) -> std::collections::BTreeMap<String, crate::musterroll::BudgetDecision> {
+    crate::musterroll::evaluate_provider_snapshot(
+        musterroll,
         cfg.roster.iter().map(|entry| entry.provider.as_str()),
-        cfg.budgets.use_bursar,
+        cfg.budgets.use_musterroll,
     )
 }
 
@@ -1284,7 +1285,7 @@ fn run_route(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         Some("explain") => run_route_explain(it),
         None => {
             eprintln!(
-                "usage: conductor route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]"
+                "usage: undertake route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]"
             );
             ExitCode::from(2)
         }
@@ -1311,7 +1312,7 @@ fn parse_route_explain_options(args: &[String]) -> Result<RouteExplainOptions, S
     let mut complexity = None;
     let mut intent = None;
     let mut json = false;
-    let mut config_path = PathBuf::from("conductor.toml");
+    let mut config_path = PathBuf::from("undertake.toml");
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -1389,17 +1390,17 @@ fn run_route_explain(it: &mut std::vec::IntoIter<String>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let bursar = crate::bursar::CommandBursarClient::new();
-    let resolved_roster = match crate::bursar::resolve_roster(&config, &bursar) {
+    let musterroll = crate::musterroll::CommandMusterrollClient::new();
+    let resolved_roster = match crate::musterroll::resolve_roster(&config, &musterroll) {
         Ok(roster) => roster,
         Err(error) => {
-            eprintln!("bursar roster snapshot: invalid — {error}");
+            eprintln!("musterroll roster snapshot: invalid — {error}");
             return ExitCode::from(2);
         }
     };
     let mut runtime_config = config;
     runtime_config.roster = resolved_roster.roster;
-    let output = route_explain_output(&runtime_config, &options, &bursar);
+    let output = route_explain_output(&runtime_config, &options, &musterroll);
     println!("{output}");
     ExitCode::SUCCESS
 }
@@ -1407,7 +1408,7 @@ fn run_route_explain(it: &mut std::vec::IntoIter<String>) -> ExitCode {
 fn route_explain_output(
     config: &crate::config::Config,
     options: &RouteExplainOptions,
-    bursar: &dyn crate::bursar::BursarClient,
+    musterroll: &dyn crate::musterroll::MusterrollClient,
 ) -> String {
     let routing = crate::fields::RoutingFields {
         tier_floor: options.tier_floor,
@@ -1415,7 +1416,7 @@ fn route_explain_output(
         verify_cmd: None,
         trains_ok: false,
     };
-    let advice = crate::route::explain(config, &options.repo, &routing, options.intent, bursar);
+    let advice = crate::route::explain(config, &options.repo, &routing, options.intent, musterroll);
     if options.json {
         serde_json::to_string_pretty(&advice.to_json()).expect("route advice JSON is serializable")
     } else {
@@ -1426,7 +1427,7 @@ fn route_explain_output(
 fn run_config(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     match it.next().as_deref() {
         None => {
-            eprintln!("usage: conductor config check [--config <path>]");
+            eprintln!("usage: undertake config check [--config <path>]");
             ExitCode::from(2)
         }
         Some("check") => run_config_check(it),
@@ -1438,7 +1439,7 @@ fn run_config(it: &mut std::vec::IntoIter<String>) -> ExitCode {
 }
 
 fn run_config_check(it: &mut std::vec::IntoIter<String>) -> ExitCode {
-    let mut config_path = PathBuf::from("conductor.toml");
+    let mut config_path = PathBuf::from("undertake.toml");
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--config" => {
@@ -1462,19 +1463,19 @@ fn run_config_check(it: &mut std::vec::IntoIter<String>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let bursar = crate::bursar::CommandBursarClient::new();
-    let resolved_roster = match crate::bursar::resolve_roster(&cfg, &bursar) {
+    let musterroll = crate::musterroll::CommandMusterrollClient::new();
+    let resolved_roster = match crate::musterroll::resolve_roster(&cfg, &musterroll) {
         Ok(roster) => roster,
         Err(error) => {
-            eprintln!("bursar roster snapshot: invalid — {error}");
+            eprintln!("musterroll roster snapshot: invalid — {error}");
             return ExitCode::from(2);
         }
     };
     let pinned_snapshot =
-        match crate::bursar::parse_roster_snapshot(&resolved_roster.snapshot_bytes) {
+        match crate::musterroll::parse_roster_snapshot(&resolved_roster.snapshot_bytes) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                eprintln!("bursar roster snapshot: invalid — {error}");
+                eprintln!("musterroll roster snapshot: invalid — {error}");
                 return ExitCode::from(2);
             }
         };
@@ -1486,7 +1487,7 @@ fn run_config_check(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         "plan policy: valid (every author has a provider-distinct peer and pairwise-distinct spec team)"
     );
     println!(
-        "config: valid ({} Bursar profiles; snapshot source {}#{}, policy {})",
+        "config: valid ({} Musterroll profiles; snapshot source {}#{}, policy {})",
         resolved_roster.roster.len(),
         resolved_roster.source_artifact.path,
         resolved_roster.source_artifact.sha256,
@@ -1520,12 +1521,12 @@ fn home_state_dir() -> Option<PathBuf> {
         PathBuf::from(home)
             .join(".local")
             .join("state")
-            .join("conductor"),
+            .join("undertake"),
     )
 }
 
 fn reports_home() -> PathBuf {
-    std::env::var("CONDUCTOR_REPORTS_HOME").map_or_else(
+    std::env::var("UNDERTAKE_REPORTS_HOME").map_or_else(
         |_| {
             let home = std::env::var("HOME").unwrap_or_default();
             PathBuf::from(home)
@@ -1535,20 +1536,20 @@ fn reports_home() -> PathBuf {
 }
 
 fn state_dir() -> PathBuf {
-    std::env::var("CONDUCTOR_STATE_DIR").map_or_else(
+    std::env::var("UNDERTAKE_STATE_DIR").map_or_else(
         |_| {
             let home = std::env::var("HOME").unwrap_or_default();
             PathBuf::from(home)
                 .join(".local")
                 .join("state")
-                .join("conductor")
+                .join("undertake")
         },
         PathBuf::from,
     )
 }
 
 fn ledger_path() -> PathBuf {
-    std::env::var("CONDUCTOR_LEDGER_PATH").map_or_else(
+    std::env::var("UNDERTAKE_LEDGER_PATH").map_or_else(
         |_| {
             let home = std::env::var("HOME").unwrap_or_default();
             PathBuf::from(home)
@@ -1563,13 +1564,13 @@ fn run_roster(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     match it.next().as_deref() {
         None => {
             eprintln!(
-                "usage: conductor roster is owned by Bursar; use `bursar roster snapshot --json`"
+                "usage: undertake roster is owned by Musterroll; use `musterroll roster snapshot --json`"
             );
             ExitCode::from(2)
         }
         Some("drift") => {
             eprintln!(
-                "roster drift is retired: Conductor does not parse scorecards; use the pinned Bursar snapshot"
+                "roster drift is retired: Undertake does not parse scorecards; use the pinned Musterroll snapshot"
             );
             ExitCode::from(2)
         }
@@ -1582,7 +1583,7 @@ fn run_roster(it: &mut std::vec::IntoIter<String>) -> ExitCode {
 
 fn run_scan(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     let mut json_output = false;
-    let mut config_path = PathBuf::from("conductor.toml");
+    let mut config_path = PathBuf::from("undertake.toml");
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--json" => json_output = true,
@@ -1804,7 +1805,7 @@ struct CycleOptions {
 
 fn parse_cycle_options(args: &[String]) -> Result<CycleOptions, String> {
     let mut dry_run = false;
-    let mut config_path = PathBuf::from("conductor.toml");
+    let mut config_path = PathBuf::from("undertake.toml");
     let mut repos = Vec::new();
     let mut only = Vec::new();
     let mut it = args.iter();
@@ -1864,11 +1865,11 @@ fn run_cycle(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     let state_dir = state_dir();
 
     let client = crate::bd::CommandBdClient::new();
-    let bursar = crate::bursar::CommandBursarClient::new();
+    let musterroll = crate::musterroll::CommandMusterrollClient::new();
     match crate::cycle::run_dry_run_scoped(
         &cfg,
         &client,
-        &bursar,
+        &musterroll,
         &reports_home,
         &state_dir,
         &options.scope,
@@ -1891,10 +1892,10 @@ fn run_cycle(it: &mut std::vec::IntoIter<String>) -> ExitCode {
 
 fn run_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     let Some(cycle_id) = it.next() else {
-        eprintln!("usage: conductor dispatch <cycle-id> [--resume] [--config <path>]");
+        eprintln!("usage: undertake dispatch <cycle-id> [--resume] [--config <path>]");
         return ExitCode::from(2);
     };
-    let mut config_path = PathBuf::from("conductor.toml");
+    let mut config_path = PathBuf::from("undertake.toml");
     let mut resume = false;
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -1924,7 +1925,7 @@ fn run_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     };
 
     let bd = crate::bd::CommandBdClient::new();
-    let bursar = crate::bursar::CommandBursarClient::new();
+    let musterroll = crate::musterroll::CommandMusterrollClient::new();
     let exec = crate::dispatch::CommandExec;
     let commits = crate::dispatch::GitCommitProbe;
     let live = crate::dispatch_cycle::DeckLiveSink;
@@ -1940,7 +1941,7 @@ fn run_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         &cycle_id,
         &options,
         &live,
-        &bursar,
+        &musterroll,
     ) {
         Ok(result) => match result.gate {
             crate::dispatch_cycle::ApprovalGate::Approved => {
@@ -1970,6 +1971,84 @@ fn run_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MigrateStateOptions {
+    source: PathBuf,
+    destination: PathBuf,
+    config: PathBuf,
+}
+
+fn parse_migrate_state_options(args: &[String]) -> Result<MigrateStateOptions, String> {
+    if args.first().map(String::as_str) != Some("state") {
+        return Err("usage: undertake migrate state --from <legacy-root> --to <undertake-root> [--config <path>]".to_string());
+    }
+    let mut source = None;
+    let mut destination = None;
+    let mut config = PathBuf::from("undertake.toml");
+    let mut index = 1;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        index += 1;
+        let value = args
+            .get(index)
+            .ok_or_else(|| format!("{flag} requires a path argument"))?;
+        index += 1;
+        match flag {
+            "--from" if source.is_none() => source = Some(PathBuf::from(value)),
+            "--to" if destination.is_none() => destination = Some(PathBuf::from(value)),
+            "--config" => config = PathBuf::from(value),
+            other => return Err(format!("unknown or duplicate migrate argument: {other}")),
+        }
+    }
+    Ok(MigrateStateOptions {
+        source: source.ok_or_else(|| "--from is required".to_string())?,
+        destination: destination.ok_or_else(|| "--to is required".to_string())?,
+        config,
+    })
+}
+
+fn run_migrate(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let options = match parse_migrate_state_options(&it.collect::<Vec<_>>()) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(2);
+        }
+    };
+    let config = match config::load(&options.config) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("config: invalid — {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let client = crate::musterroll::CommandMusterrollClient::new();
+    let snapshot = match crate::musterroll::MusterrollClient::roster_snapshot(&client) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("migrate state: Musterroll roster snapshot: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let policy = match crate::role_routing::RoutingPolicy::from_config(&config, &snapshot) {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("migrate state: role policy: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    match crate::state::migrate_live_state(&options.source, &options.destination, &policy) {
+        Ok(summary) => {
+            println!("state: migrated {} files", summary.files_copied);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("migrate state: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn print_usage() {
     eprintln!("{USAGE}");
 }
@@ -1979,9 +2058,10 @@ fn print_help() {
     println!();
     println!("Commands:");
     println!("  adversarial-review  Plan or dispatch an approval-gated read-only design review");
-    println!("  config check   Validate conductor.toml and run preflight checks");
+    println!("  config check   Validate undertake.toml and run preflight checks");
+    println!("  migrate state  Copy quiescent legacy state into a new Undertake root");
     println!(
-        "  roster         Bursar owns execution profiles; inspect `bursar roster snapshot --json`"
+        "  roster         Musterroll owns execution profiles; inspect `musterroll roster snapshot --json`"
     );
     println!("  scan           Enumerate fleet repos and snapshot ready work");
     println!("  status         Show the most recently recorded cycle");
@@ -1992,7 +2072,7 @@ fn print_help() {
     println!("  adversarial-review dispatch exits 0 only for complete validated synthesis.");
     println!("  cycle --dry-run still writes a report file even though it makes no bd writes.");
     println!(
-        "  dispatch --resume reclaims a bd claim stranded by a crashed conductor process (e.g."
+        "  dispatch --resume reclaims a bd claim stranded by a crashed undertake process (e.g."
     );
     println!(
         "    kill -9 mid-worker) once its run's heartbeat has gone stale, then retries the item."
@@ -2002,7 +2082,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bursar::Availability;
+    use crate::musterroll::Availability;
     use crate::scan::{Freshness, RepoSnapshot, SkipReason, ZeroState};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -2054,8 +2134,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_author_argv_uses_pinned_bursar_dispatch_identity() {
-        let profile: crate::bursar::RosterProfile = serde_json::from_value(serde_json::json!({
+    fn plan_author_argv_uses_pinned_musterroll_dispatch_identity() {
+        let profile: crate::musterroll::RosterProfile = serde_json::from_value(serde_json::json!({
             "profile_id": "planner-pi",
             "provider_id": "opencode-go",
             "model": "glm-5.2",
@@ -2110,7 +2190,7 @@ mod tests {
         reason = "one production-path regression exercises each independently shaped prompt"
     )]
     fn production_plan_prompts_embed_complete_strict_wire_contracts() {
-        let profile: crate::bursar::RosterProfile = serde_json::from_value(serde_json::json!({
+        let profile: crate::musterroll::RosterProfile = serde_json::from_value(serde_json::json!({
             "profile_id": "planner-pi",
             "provider_id": "opencode-go",
             "model": "glm-5.2",
@@ -2155,7 +2235,7 @@ mod tests {
         };
         let author_prompt = plan_author_prompt(&author).expect("author prompt");
         for required in [
-            "\"schema\":\"conductor/plan-document@1\"",
+            "\"schema\":\"undertake/plan-document@1\"",
             "\"kind\":\"spec\"",
             "\"title\"",
             "\"context\"",
@@ -2208,7 +2288,7 @@ mod tests {
         };
         let peer_prompt = plan_peer_review_prompt(&peer).expect("peer prompt");
         for required in [
-            "\"schema\":\"conductor/plan-peer-review@1\"",
+            "\"schema\":\"undertake/plan-peer-review@1\"",
             "\"verdict\":\"revise\"",
             "\"findings\"",
             "\"id\"",
@@ -2238,7 +2318,7 @@ mod tests {
         };
         let second_prompt = plan_second_opinion_prompt(&second).expect("second prompt");
         for required in [
-            "\"schema\":\"conductor/plan-second-opinion@1\"",
+            "\"schema\":\"undertake/plan-second-opinion@1\"",
             "\"verdict\":\"accept\"",
             "accept",
             "reject",
@@ -2282,7 +2362,7 @@ mod tests {
             "--models".to_string(),
             "reviewer-one,reviewer-two".to_string(),
             "--config".to_string(),
-            "/tmp/conductor.toml".to_string(),
+            "/tmp/undertake.toml".to_string(),
         ])
         .expect("exact plan grammar");
         assert_eq!(plan.artifact, PathBuf::from("/tmp/design.md"));
@@ -2292,16 +2372,16 @@ mod tests {
             plan.models,
             Some(vec!["reviewer-one".to_string(), "reviewer-two".to_string()])
         );
-        assert_eq!(plan.config, PathBuf::from("/tmp/conductor.toml"));
+        assert_eq!(plan.config, PathBuf::from("/tmp/undertake.toml"));
 
         let dispatch = parse_adversarial_dispatch_options(&[
             "review-123".to_string(),
             "--config".to_string(),
-            "/tmp/conductor.toml".to_string(),
+            "/tmp/undertake.toml".to_string(),
         ])
         .expect("exact dispatch grammar");
         assert_eq!(dispatch.review_id, "review-123");
-        assert_eq!(dispatch.config, PathBuf::from("/tmp/conductor.toml"));
+        assert_eq!(dispatch.config, PathBuf::from("/tmp/undertake.toml"));
 
         for invalid in [
             vec![],
@@ -2365,7 +2445,7 @@ mod tests {
                 "dispatch".to_string(),
                 "review-123".to_string(),
                 "--config".to_string(),
-                "/definitely/missing/conductor.toml".to_string(),
+                "/definitely/missing/undertake.toml".to_string(),
             ]),
             ExitCode::from(2)
         );
@@ -2381,7 +2461,7 @@ mod tests {
             &fixture.config,
             &options,
             &fixture.paths,
-            &fixture.bursar,
+            &fixture.musterroll,
             &NoopDeckValidator,
             "review-explicit-count",
             "2026-07-15T12:00:00Z",
@@ -2403,7 +2483,7 @@ mod tests {
             &fixture.config,
             &options,
             &fixture.paths,
-            &fixture.bursar,
+            &fixture.musterroll,
             &NoopDeckValidator,
             "review-upper-bound",
             "2026-07-15T12:00:00Z",
@@ -2439,7 +2519,7 @@ mod tests {
                 config: fixture.config_path.clone(),
             },
             &fixture.paths,
-            &fixture.bursar,
+            &fixture.musterroll,
             &exec,
         );
 
@@ -2466,7 +2546,7 @@ mod tests {
                 config: fixture.config_path.clone(),
             },
             &fixture.paths,
-            &fixture.bursar,
+            &fixture.musterroll,
             &exec,
         );
 
@@ -2511,7 +2591,7 @@ mod tests {
         assert_eq!(manifest.job, crate::run::RunJob::Review);
         assert!(
             manifest.roster_snapshot.is_some(),
-            "every prepared v2 run pins a copied Bursar roster snapshot"
+            "every prepared v2 run pins a copied Musterroll roster snapshot"
         );
         assert_eq!(
             manifest.target.repo,
@@ -2549,7 +2629,7 @@ mod tests {
                 config: fixture.config_path.clone(),
             },
             &fixture.paths,
-            &fixture.bursar,
+            &fixture.musterroll,
             &exec,
         );
 
@@ -2648,7 +2728,7 @@ mod tests {
         let config = crate::config::parse_str(
             r#"
 [budgets]
-use_bursar = false
+use_musterroll = false
 
 [[roster]]
 name = "fixture-model"
@@ -2680,8 +2760,8 @@ provider = "fixture-provider"
             "M".to_string(),
         ])
         .expect("complete options parse");
-        let bursar = crate::bursar::test_support::FakeBursarClient::unavailable();
-        let human = route_explain_output(&config, &options, &bursar);
+        let musterroll = crate::musterroll::test_support::FakeMusterrollClient::unavailable();
+        let human = route_explain_output(&config, &options, &musterroll);
         assert!(human.contains("selected: fixture-model"));
         assert!(human.contains("backend=pi"));
         assert!(human.contains("dispatch_id=fixture-dispatch"));
@@ -2693,7 +2773,7 @@ provider = "fixture-provider"
             json: true,
             ..options
         };
-        let json = route_explain_output(&config, &json_options, &bursar);
+        let json = route_explain_output(&config, &json_options, &musterroll);
         assert!(json.contains("\"selected\""));
         assert!(json.contains("\"audit\""));
     }
@@ -2792,14 +2872,14 @@ provider = "fixture-provider"
             "--only",
             "/repos/bravo:b-2",
             "--config",
-            "/tmp/conductor.toml",
+            "/tmp/undertake.toml",
         ]
         .map(str::to_string);
         let options = parse_cycle_options(&args).expect("cycle options");
         assert!(options.dry_run);
         assert_eq!(options.scope.repos, ["alpha", "/repos/bravo"]);
         assert_eq!(options.scope.only, ["alpha:a-1", "/repos/bravo:b-2"]);
-        assert_eq!(options.config, PathBuf::from("/tmp/conductor.toml"));
+        assert_eq!(options.config, PathBuf::from("/tmp/undertake.toml"));
     }
 
     #[test]
@@ -2910,7 +2990,7 @@ provider = "fixture-provider"
         config_path: PathBuf,
         config: crate::config::Config,
         paths: AdversarialPaths,
-        bursar: crate::bursar::test_support::FakeBursarClient,
+        musterroll: crate::musterroll::test_support::FakeMusterrollClient,
     }
 
     impl AdversarialCliFixture {
@@ -2920,11 +3000,11 @@ provider = "fixture-provider"
             std::fs::create_dir_all(&target_repo).unwrap();
             let artifact = target_repo.join("design.md");
             std::fs::write(&artifact, b"immutable design").unwrap();
-            let config_path = temp.path().join("conductor.toml");
+            let config_path = temp.path().join("undertake.toml");
             let config = crate::config::parse_str(
                 r#"
 [budgets]
-use_bursar = true
+use_musterroll = true
 item_wall_clock_mins = 1
 
 [adversarial_review]
@@ -2965,7 +3045,7 @@ provider = "codex"
                 &config_path,
                 r#"
 [budgets]
-use_bursar = true
+use_musterroll = true
 item_wall_clock_mins = 1
 
 [adversarial_review]
@@ -3007,8 +3087,8 @@ provider = "codex"
                 reports_home: temp.path().join("reports-home"),
                 ledger_path: temp.path().join("ledger").join("model-bench.jsonl"),
             };
-            let bursar =
-                crate::bursar::test_support::FakeBursarClient::with_provider_availabilities(&[
+            let musterroll =
+                crate::musterroll::test_support::FakeMusterrollClient::with_provider_availabilities(&[
                     ("opencode-go", Availability::Healthy),
                     ("agy", Availability::Healthy),
                     ("codex", Availability::Healthy),
@@ -3020,7 +3100,7 @@ provider = "codex"
                 config_path,
                 config,
                 paths,
-                bursar,
+                musterroll,
             }
         }
 
@@ -3039,7 +3119,7 @@ provider = "codex"
                 &self.config,
                 &self.plan_options(),
                 &self.paths,
-                &self.bursar,
+                &self.musterroll,
                 &NoopDeckValidator,
                 review_id,
                 "2026-07-15T12:00:00Z",
@@ -3096,7 +3176,7 @@ provider = "codex"
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "conductor-cli-{label}-{}-{nanos}",
+                "undertake-cli-{label}-{}-{nanos}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&path).unwrap();
@@ -3224,4 +3304,30 @@ provider = "codex"
     fn active_cli_has_no_arena_surface() {
         assert!(!USAGE.contains("arena"));
     }
+    #[test]
+    fn active_cli_uses_only_undertake_identity() {
+        assert!(USAGE.starts_with("usage: undertake "));
+        assert!(!USAGE.contains("conductor"));
+        assert_eq!(
+            parse_cycle_options(&["--dry-run".to_string()]).unwrap().config,
+            PathBuf::from("undertake.toml")
+        );
+    }
+
+    #[test]
+    fn migrate_state_requires_explicit_source_and_destination() {
+        let options = parse_migrate_state_options(&[
+            "state".to_string(),
+            "--from".to_string(),
+            "/snapshot/conductor".to_string(),
+            "--to".to_string(),
+            "/state/undertake".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(options.source, PathBuf::from("/snapshot/conductor"));
+        assert_eq!(options.destination, PathBuf::from("/state/undertake"));
+        assert_eq!(options.config, PathBuf::from("undertake.toml"));
+        assert!(parse_migrate_state_options(&["state".to_string()]).is_err());
+    }
+
 }

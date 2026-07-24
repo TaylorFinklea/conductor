@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 const SCHEMA: &str = "harness-deck/report@1";
-const PROJECT: &str = "conductor";
-const HARNESS: &str = "conductor";
+const PROJECT: &str = "undertake";
+const HARNESS: &str = "undertake";
 const MAX_RUN_ID_LEN: usize = 200;
 
 pub(crate) type Result<T> = std::result::Result<T, DeckError>;
@@ -77,7 +77,7 @@ pub(crate) enum ReportStatus {
     Done,
 }
 
-/// A conductor-owned harness-deck report manifest.
+/// A undertake-owned harness-deck report manifest.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Report {
     schema: &'static str,
@@ -91,7 +91,7 @@ pub(crate) struct Report {
 }
 
 impl Report {
-    /// Creates a conductor report manifest with the fixed harness-deck schema.
+    /// Creates a undertake report manifest with the fixed harness-deck schema.
     pub(crate) fn new(
         id: impl Into<String>,
         title: impl Into<String>,
@@ -130,7 +130,7 @@ impl Report {
     }
 }
 
-/// Supported conductor report block shapes for v1 cycle reports.
+/// Supported undertake report block shapes for v1 cycle reports.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub(crate) enum Block {
@@ -479,7 +479,7 @@ pub(crate) fn read_responses(run_dir: &Path) -> Result<Responses> {
     })
 }
 
-/// Returns `~/.harness/reports/conductor/<run-id>` under `home`.
+/// Returns `~/.harness/reports/undertake/<run-id>` under `home`.
 pub(crate) fn report_run_dir(home: &Path, run_id: &str) -> Result<PathBuf> {
     validate_run_id(run_id)?;
     Ok(home
@@ -489,12 +489,12 @@ pub(crate) fn report_run_dir(home: &Path, run_id: &str) -> Result<PathBuf> {
         .join(run_id))
 }
 
-/// Returns `~/.harness/reports/conductor/<run-id>/report.json` under `home`.
+/// Returns `~/.harness/reports/undertake/<run-id>/report.json` under `home`.
 pub(crate) fn report_path(home: &Path, run_id: &str) -> Result<PathBuf> {
     Ok(report_run_dir(home, run_id)?.join("report.json"))
 }
 
-/// Writes a conductor report to `~/.harness/reports/conductor/<run-id>/report.json` under `home`.
+/// Writes a undertake report to `~/.harness/reports/undertake/<run-id>/report.json` under `home`.
 pub(crate) fn write_report(home: &Path, report: &Report) -> Result<PathBuf> {
     let run_dir = report_run_dir(home, report.id())?;
     fs::create_dir_all(&run_dir).map_err(|e| DeckError::io("failed to create", &run_dir, &e))?;
@@ -783,7 +783,7 @@ mod tests {
             temp.path().join("responses.json"),
             serde_json::to_vec_pretty(&json!({
                 "run": "cycle-20260702-000000",
-                "project": "conductor",
+                "project": "undertake",
                 "updated": "2026-07-02T00:02:00Z",
                 "responses": {
                     "dispatch-plan": {
@@ -821,8 +821,8 @@ mod tests {
         let original = json!({
             "schema": "harness-deck/report@1",
             "id": "cycle-20260702-000000",
-            "project": "conductor",
-            "harness": "conductor",
+            "project": "undertake",
+            "harness": "undertake",
             "title": "Cycle",
             "status": "awaiting-review",
             "created": "2026-07-02T00:00:00Z",
@@ -870,8 +870,8 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&report_path).expect("read generated report"))
                 .expect("parse generated report");
         assert_eq!(manifest["schema"], json!("harness-deck/report@1"));
-        assert_eq!(manifest["project"], json!("conductor"));
-        assert_eq!(manifest["harness"], json!("conductor"));
+        assert_eq!(manifest["project"], json!("undertake"));
+        assert_eq!(manifest["harness"], json!("undertake"));
         assert_eq!(manifest["status"], json!("awaiting-review"));
     }
 
@@ -899,7 +899,7 @@ mod tests {
     fn sample_report() -> Result<Report> {
         Report::new(
             "cycle-20260702-000000",
-            "Conductor dry-run",
+            "Undertake dry-run",
             "2026-07-02T00:00:00Z",
             ReportStatus::AwaitingReview,
             vec![
@@ -919,7 +919,7 @@ mod tests {
                     "queue",
                     vec!["repo", "ready", "state"],
                     vec![
-                        vec!["conductor", "6", "ready"],
+                        vec!["undertake", "6", "ready"],
                         vec!["tesela", "0", "blocked"],
                     ],
                 ),
@@ -944,7 +944,7 @@ mod tests {
             let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("target")
                 .join("test-tmp")
-                .join(format!("conductor-{label}-{nanos}"));
+                .join(format!("undertake-{label}-{nanos}"));
             std::fs::create_dir_all(&path).expect("mkdir temp dir");
             Self(path)
         }

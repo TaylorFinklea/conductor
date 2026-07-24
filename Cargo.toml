@@ -1,5 +1,5 @@
 [package]
-name = "conductor"
+name = "undertake"
 version = "0.1.0"
 edition = "2024"
 description = "Fleet cycle runner: scan → triage → plan → dispatch → verify → report"
@@ -7,7 +7,7 @@ license = "MIT"
 rust-version = "1.85"
 
 [[bin]]
-name = "conductor"
+name = "undertake"
 path = "src/main.rs"
 
 [dependencies]

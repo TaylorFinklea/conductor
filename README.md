@@ -1,6 +1,6 @@
-# Conductor
+# Undertake
 
-Conductor is a Rust orchestration binary for bounded fleet cycles and isolated,
+Undertake is a Rust orchestration binary for bounded fleet cycles and isolated,
 approval-gated adversarial design review.
 
 ## Adversarial design review
@@ -9,8 +9,8 @@ Plan a review over one immutable artifact, approve the published harness-deck
 report, then dispatch the exact approved review ID:
 
 ```text
-conductor adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]
-conductor adversarial-review dispatch <review-id> [--config <path>]
+undertake adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]
+undertake adversarial-review dispatch <review-id> [--config <path>]
 ```
 
 `N` must be between 1 and `adversarial_review.max_reviewers` (7 by
@@ -46,25 +46,44 @@ usage and configuration failures exit `2`.
 
 The default roots are:
 
-- state: `~/.local/state/conductor/adversarial-reviews/<review-id>/`
-- report: `~/.harness/reports/conductor/<review-id>/report.json`
+- state: `~/.local/state/undertake/adversarial-reviews/<review-id>/`
+- report: `~/.harness/reports/undertake/<review-id>/report.json`
 - ledger: `~/.claude/model-bench.jsonl`
 
-`CONDUCTOR_STATE_DIR`, `CONDUCTOR_REPORTS_HOME`, and
-`CONDUCTOR_LEDGER_PATH` inject alternate roots. The state directory contains
+`UNDERTAKE_STATE_DIR`, `UNDERTAKE_REPORTS_HOME`, and
+`UNDERTAKE_LEDGER_PATH` inject alternate roots. The state directory contains
 the exact artifact bytes and hash, `plan.json`, `provider-snapshot.json`,
 `lifecycle.json`, reviewer attempt logs and validated `review.json` files, and
 judge logs.
 
-Persisted contracts are `conductor-adversarial-plan-v1`,
-`conductor-adversarial-provider-snapshot-v1`, and
-`conductor-adversarial-lifecycle-v1`; reports use `harness-deck/report@1`.
+Persisted contracts are `undertake-adversarial-plan-v1`,
+`undertake-adversarial-provider-snapshot-v1`, and
+`undertake-adversarial-lifecycle-v1`; reports use `harness-deck/report@1`.
 Reviewer JSON contains verdict, findings, assumptions, scope to cut, and
 recommended sequencing. Judge JSON contains verdict, consensus,
 disagreements, unique anonymous risks, required changes, deferred questions,
 confidence, and coverage. Unknown fields fail validation, and coverage must
 contain each anonymous reviewer ID exactly once. Ledger attempts use roles
 `adversarial-reviewer` and `adversarial-judge`.
+
+## One-shot state migration
+
+After dispatch is stopped and every `runs-v2` manifest is terminal, copy the
+legacy live state into a new root:
+
+```text
+undertake migrate state --from <legacy-root> --to <undertake-root> --config undertake.toml
+```
+
+The destination must not exist and cannot be the source or a child of it.
+Migration copies the journal, ratchet, current plans, terminal `runs-v2`, and
+the current role-routing lanes/reservations. It rewrites only Undertake and
+Musterroll ownership envelopes, preserves scheduler scores and reservation
+history, and verifies that the source tree hash did not change. Archived
+legacy `runs/` remain only in the source snapshot; Undertake never dual-reads
+the old root. Unknown state, unknown schemas, existing destinations, active
+runs, and active scheduler capacity all fail closed without publishing a
+partial destination.
 
 ### Mutation boundary
 

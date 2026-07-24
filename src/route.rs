@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use super::super::bursar::{
-        Availability, BudgetAction, BudgetDecision, BursarClient, ObservationExpiryBasis,
-        ObservationRequest, RuntimeLimitReason, test_support::FakeBursarClient,
+    use super::super::musterroll::{
+        Availability, BudgetAction, BudgetDecision, MusterrollClient, ObservationExpiryBasis,
+        ObservationRequest, RuntimeLimitReason, test_support::FakeMusterrollClient,
     };
     use super::super::config::{Backend, Ceiling, Cost, CostPolicy, Efficiency, RosterEntry, Tier};
     use super::super::fields::RoutingFields;
@@ -231,7 +231,7 @@ mod tests {
         primary.fallback = vec!["fallback".to_string()];
         let fallback = paid_entry("fallback", Tier::Senior, Efficiency::Lean, "codex");
         let roster = vec![primary.clone(), fallback.clone()];
-        let client = FakeBursarClient::with_provider_availabilities(&[
+        let client = FakeMusterrollClient::with_provider_availabilities(&[
             ("opencode-go", Availability::Healthy),
             ("codex", Availability::Healthy),
         ])
@@ -276,10 +276,10 @@ mod tests {
     }
 
     #[test]
-    fn disabled_bursar_keeps_providerless_legacy_rows_on_static_caps() {
+    fn disabled_musterroll_keeps_providerless_legacy_rows_on_static_caps() {
         let roster = vec![paid_entry("legacy", Tier::Senior, Efficiency::Lean, "")];
         let decisions = snapshot_provider_decisions(
-            &crate::bursar::test_support::FakeBursarClient::unavailable(),
+            &crate::musterroll::test_support::FakeMusterrollClient::unavailable(),
             &roster,
             false,
         );
@@ -409,8 +409,8 @@ use std::str::FromStr;
 
 use serde_json::{Value, json};
 
-use crate::bursar::{
-    Availability, BudgetAction, BudgetDecision, BursarClient, StatusReport, evaluate_budget,
+use crate::musterroll::{
+    Availability, BudgetAction, BudgetDecision, MusterrollClient, StatusReport, evaluate_budget,
 };
 use crate::config::{Backend, Config, Cost, CostPolicy, Efficiency, RosterEntry, Tier};
 use crate::fields::RoutingFields;
@@ -518,36 +518,36 @@ pub(crate) struct RouteAdvice {
     pub(crate) audit: Vec<CandidateAudit>,
 }
 
-struct FrozenBursar {
-    result: crate::bursar::Result<StatusReport>,
+struct FrozenMusterroll {
+    result: crate::musterroll::Result<StatusReport>,
 }
 
-impl BursarClient for FrozenBursar {
-    fn status(&self) -> crate::bursar::Result<StatusReport> {
+impl MusterrollClient for FrozenMusterroll {
+    fn status(&self) -> crate::musterroll::Result<StatusReport> {
         self.result.clone()
     }
 }
 
 pub(crate) fn snapshot_provider_decisions(
-    client: &dyn BursarClient,
+    client: &dyn MusterrollClient,
     roster: &[RosterEntry],
-    use_bursar: bool,
+    use_musterroll: bool,
 ) -> BTreeMap<String, BudgetDecision> {
-    let snapshot = use_bursar.then(|| client.status());
-    let frozen = FrozenBursar {
+    let snapshot = use_musterroll.then(|| client.status());
+    let frozen = FrozenMusterroll {
         result: snapshot
-            .unwrap_or_else(|| Err(crate::bursar::BursarError::unavailable("not queried"))),
+            .unwrap_or_else(|| Err(crate::musterroll::MusterrollError::unavailable("not queried"))),
     };
     roster
         .iter()
         .map(|entry| entry.provider.as_str())
-        .map(crate::bursar::canonical_provider_key)
+        .map(crate::musterroll::canonical_provider_key)
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .map(|provider| {
             (
                 provider.to_string(),
-                evaluate_budget(&frozen, provider, use_bursar),
+                evaluate_budget(&frozen, provider, use_musterroll),
             )
         })
         .collect()
@@ -558,13 +558,13 @@ pub(crate) fn explain(
     repo_path: &Path,
     routing: &RoutingFields,
     intent: Option<RouteIntent>,
-    client: &dyn BursarClient,
+    client: &dyn MusterrollClient,
 ) -> RouteAdvice {
     let repo = repo_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_else(|| repo_path.to_str().unwrap_or_default());
-    let decisions = snapshot_provider_decisions(client, &config.roster, config.budgets.use_bursar);
+    let decisions = snapshot_provider_decisions(client, &config.roster, config.budgets.use_musterroll);
     select(
         repo,
         routing,
@@ -728,7 +728,7 @@ fn evaluate_candidates<'r, 'd>(
         .min_by_key(|(index, entry)| base_key(entry, *index, dispatch_count_by_model));
     let fallback_names = provider_decisions.and_then(|decisions| {
         legacy_first.and_then(|(_, entry)| {
-            let decision = decisions.get(crate::bursar::canonical_provider_key(&entry.provider));
+            let decision = decisions.get(crate::musterroll::canonical_provider_key(&entry.provider));
             decision
                 .is_none_or(|decision| !provider_is_eligible(decision))
                 .then_some(entry.fallback.as_slice())
@@ -739,7 +739,7 @@ fn evaluate_candidates<'r, 'd>(
 
     for (index, entry) in roster.iter().enumerate() {
         let decision = provider_decisions.and_then(|decisions| {
-            decisions.get(crate::bursar::canonical_provider_key(&entry.provider))
+            decisions.get(crate::musterroll::canonical_provider_key(&entry.provider))
         });
         let mut reasons = Vec::new();
         if let Some(rejection) = candidate_rejection(entry, routing, repo_cost_policy) {
@@ -762,7 +762,7 @@ fn evaluate_candidates<'r, 'd>(
         } else if provider_decisions.is_some() {
             reasons.push(RouteReason {
                 code: "provider-unknown".to_string(),
-                text: format!("{}: no trusted Bursar decision", entry.provider),
+                text: format!("{}: no trusted Musterroll decision", entry.provider),
                 rejection: None,
             });
         } else {

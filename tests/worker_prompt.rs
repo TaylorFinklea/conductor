@@ -35,7 +35,7 @@ const RULE_PHRASES: [&str; 5] = [
 // `RULE_PHRASES` above only spot-checks the *existence* of the rule;
 // these phrases pin the rule's *shape* so it cannot regress to a flat
 // ban that fails closed on every item with a required ADR or named
-// handoff artifact (cycle-20260716-171315 / bursar-roster-contract).
+// handoff artifact (cycle-20260716-171315 / musterroll-roster-contract).
 const DOCS_AI_RULE_PHRASES: [&str; 6] = [
     "categorically",        // `.beads/` is forbidden unconditionally
     "forbidden by default", // `.docs/ai/` defaults to forbidden
@@ -85,7 +85,7 @@ fn worker_prompt_does_not_delegate_commit_attestation_to_worker_stdout() {
         .unwrap_or_else(|e| panic!("failed to read {TEMPLATE_PATH}: {e}"));
 
     assert!(
-        !contents.contains("CONDUCTOR_WORKER_COMMIT"),
+        !contents.contains("UNDERTAKE_WORKER_COMMIT"),
         "the parent must attest an isolated attempt checkout instead of trusting a worker marker"
     );
 }

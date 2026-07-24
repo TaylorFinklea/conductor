@@ -1,6 +1,6 @@
 //! cycle orchestration: scan → triage → plan → publish
 //!
-//! `conductor cycle --dry-run` wires the existing scan/triage/deck modules into
+//! `undertake cycle --dry-run` wires the existing scan/triage/deck modules into
 //! a single end-to-end pass that produces a harness-deck report and a journal
 //! entry without any bd writes (no claims, no dispatches, no mutations).
 
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 
 use crate::bd::BdClient;
-use crate::bursar::BursarClient;
+use crate::musterroll::MusterrollClient;
 use crate::config::{Config, CostPolicy};
 use crate::deck::{self, Bar, Block, CalloutLevel, Metric, Report, ReportStatus};
 use crate::fields::{Triage, extract};
@@ -82,14 +82,14 @@ pub(crate) struct CycleScopeRequest {
 pub(crate) fn run_dry_run(
     cfg: &Config,
     client: &dyn BdClient,
-    bursar: &dyn BursarClient,
+    musterroll: &dyn MusterrollClient,
     reports_home: &Path,
     state_dir: &Path,
 ) -> Result<CycleResult, CycleError> {
     run_dry_run_scoped(
         cfg,
         client,
-        bursar,
+        musterroll,
         reports_home,
         state_dir,
         &CycleScopeRequest::default(),
@@ -99,7 +99,7 @@ pub(crate) fn run_dry_run(
 pub(crate) fn run_dry_run_scoped(
     cfg: &Config,
     client: &dyn BdClient,
-    bursar: &dyn BursarClient,
+    musterroll: &dyn MusterrollClient,
     reports_home: &Path,
     state_dir: &Path,
     scope: &CycleScopeRequest,
@@ -112,7 +112,7 @@ pub(crate) fn run_dry_run_scoped(
     run_dry_run_with_timestamps_scoped(
         cfg,
         client,
-        bursar,
+        musterroll,
         reports_home,
         state_dir,
         &cycle_id,
@@ -146,7 +146,7 @@ fn unique_cycle_id(state_dir: &Path, base: &str) -> String {
 pub(crate) fn run_dry_run_with_timestamps(
     cfg: &Config,
     client: &dyn BdClient,
-    bursar: &dyn BursarClient,
+    musterroll: &dyn MusterrollClient,
     reports_home: &Path,
     state_dir: &Path,
     cycle_id: &str,
@@ -155,7 +155,7 @@ pub(crate) fn run_dry_run_with_timestamps(
     run_dry_run_with_timestamps_scoped(
         cfg,
         client,
-        bursar,
+        musterroll,
         reports_home,
         state_dir,
         cycle_id,
@@ -171,15 +171,15 @@ pub(crate) fn run_dry_run_with_timestamps(
 pub(crate) fn run_dry_run_with_timestamps_scoped(
     cfg: &Config,
     client: &dyn BdClient,
-    bursar: &dyn BursarClient,
+    musterroll: &dyn MusterrollClient,
     reports_home: &Path,
     state_dir: &Path,
     cycle_id: &str,
     created_at: &str,
     scope_request: &CycleScopeRequest,
 ) -> Result<CycleResult, CycleError> {
-    let resolved_roster = crate::bursar::resolve_roster(cfg, bursar)
-        .map_err(|error| CycleError::new(format!("bursar roster snapshot: {error}")))?;
+    let resolved_roster = crate::musterroll::resolve_roster(cfg, musterroll)
+        .map_err(|error| CycleError::new(format!("musterroll roster snapshot: {error}")))?;
     let mut runtime_cfg = cfg.clone();
     runtime_cfg.roster.clone_from(&resolved_roster.roster);
     let cfg = &runtime_cfg;
@@ -206,10 +206,10 @@ pub(crate) fn run_dry_run_with_timestamps_scoped(
     );
 
     // 3. Build and save cycle plan
-    let provider_advice = provider_route_advice(cfg, &snapshots, &plan, bursar)?;
+    let provider_advice = provider_route_advice(cfg, &snapshots, &plan, musterroll)?;
     let mut cycle_plan = CyclePlan::from_triage(cycle_id, created_at, &plan);
     cycle_plan.apply_provider_routes(provider_advice);
-    cycle_plan.bursar_roster_source_artifact = Some(resolved_roster.source_artifact.clone());
+    cycle_plan.musterroll_roster_source_artifact = Some(resolved_roster.source_artifact.clone());
     let max_dispatch_count = match resolved_scope.kind {
         ApprovalScopeKind::FleetAudit => cycle_plan.dispatches.len(),
         ApprovalScopeKind::RepositoryScope | ApprovalScopeKind::ExactItemScope => {
@@ -256,7 +256,7 @@ fn record_planned_consult_run(
     state_dir: &Path,
     cycle_plan: &CyclePlan,
     report_path: &Path,
-    resolved_roster: &crate::bursar::ResolvedRoster,
+    resolved_roster: &crate::musterroll::ResolvedRoster,
 ) -> Result<(), CycleError> {
     let target_repo = if cycle_plan.approval_scope.repo_paths.len() == 1 {
         cycle_plan.approval_scope.repo_paths[0].clone()
@@ -272,7 +272,7 @@ fn record_planned_consult_run(
                 bead: None,
             },
             approved_profiles: Vec::new(),
-            bursar_roster_artifact: Some(crate::run::ArtifactRef {
+            musterroll_roster_artifact: Some(crate::run::ArtifactRef {
                 path: resolved_roster.source_artifact.path.clone(),
                 sha256: resolved_roster.source_artifact.sha256.clone(),
             }),
@@ -555,10 +555,10 @@ fn provider_route_advice(
     cfg: &Config,
     snapshots: &[RepoSnapshot],
     plan: &Plan,
-    bursar: &dyn BursarClient,
+    musterroll: &dyn MusterrollClient,
 ) -> Result<Vec<(String, crate::route::RouteAdvice)>, CycleError> {
     let decisions =
-        crate::route::snapshot_provider_decisions(bursar, &cfg.roster, cfg.budgets.use_bursar);
+        crate::route::snapshot_provider_decisions(musterroll, &cfg.roster, cfg.budgets.use_musterroll);
     let mut dispatch_count_by_model = HashMap::new();
     let mut advice = Vec::with_capacity(plan.dispatches.len() + plan.proposals.len());
 
@@ -668,7 +668,7 @@ fn build_report(
 
     Report::new(
         cycle_id,
-        format!("Conductor dry-run: {cycle_id}"),
+        format!("Undertake dry-run: {cycle_id}"),
         created_at,
         ReportStatus::AwaitingReview,
         blocks,
@@ -927,8 +927,8 @@ fn compute_summary(snapshots: &[RepoSnapshot], plan: &CyclePlan) -> JournalSumma
 mod tests {
     use super::*;
     use crate::bd::{BdError, Comment, Issue};
-    use crate::bursar::test_support::FakeBursarClient;
-    use crate::bursar::{Availability, BursarClient, ProviderStatus, RosterSnapshot, StatusReport};
+    use crate::musterroll::test_support::FakeMusterrollClient;
+    use crate::musterroll::{Availability, MusterrollClient, ProviderStatus, RosterSnapshot, StatusReport};
     use crate::config;
     use serde_json::{Map, Value, json};
     use std::cell::{Cell, RefCell};
@@ -1043,7 +1043,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("conductor-cycle-{label}-{nanos}"));
+            let path = std::env::temp_dir().join(format!("undertake-cycle-{label}-{nanos}"));
             std::fs::create_dir_all(&path).expect("mkdir temp dir");
             Self(path)
         }
@@ -1165,19 +1165,19 @@ mod tests {
         BdError::json("bd ready", &err)
     }
 
-    struct CountingBursar {
+    struct CountingMusterroll {
         report: StatusReport,
         snapshot: RosterSnapshot,
         calls: Cell<usize>,
     }
 
-    impl BursarClient for CountingBursar {
-        fn status(&self) -> crate::bursar::Result<StatusReport> {
+    impl MusterrollClient for CountingMusterroll {
+        fn status(&self) -> crate::musterroll::Result<StatusReport> {
             self.calls.set(self.calls.get() + 1);
             Ok(self.report.clone())
         }
 
-        fn roster_snapshot(&self) -> crate::bursar::Result<RosterSnapshot> {
+        fn roster_snapshot(&self) -> crate::musterroll::Result<RosterSnapshot> {
             Ok(self.snapshot.clone())
         }
     }
@@ -1213,7 +1213,7 @@ mod tests {
                     data_as_of: Some(data_as_of.clone()),
                     expires_at: Some(expires_at.clone()),
                     windows: if availability == Availability::Healthy {
-                        vec![crate::bursar::Window {
+                        vec![crate::musterroll::Window {
                             label: "primary".to_string(),
                             percent: Some(42.0),
                             reset_at: Some("2100-01-01T00:00:00Z".to_string()),
@@ -1229,18 +1229,18 @@ mod tests {
         })
         .collect();
         StatusReport {
-            schema: "bursar/status@2".to_string(),
+            schema: "musterroll/status@2".to_string(),
             checked_at,
             providers,
         }
     }
 
     fn cycle_roster_snapshot() -> RosterSnapshot {
-        crate::bursar::parse_roster_snapshot(
+        crate::musterroll::parse_roster_snapshot(
             br#"{
-              "schema":"bursar/roster@2",
+              "schema":"musterroll/roster@2",
               "generated_at":"2026-07-17T12:00:00Z",
-              "source_artifact":{"path":"/fixture/bursar-roster.toml","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+              "source_artifact":{"path":"/fixture/musterroll-roster.toml","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
               "policy_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "providers":[
                 {"provider_id":"codex","availability_key":"codex","enabled":true,"state":"healthy","availability":"healthy","checked_at":"2026-07-17T12:00:00Z","data_as_of":null,"expires_at":"2100-01-01T00:00:00Z","reason":null,"eligible":true,"ineligibility_reason":null},
@@ -1252,7 +1252,7 @@ mod tests {
               ]
             }"#,
         )
-        .expect("valid cycle Bursar snapshot")
+        .expect("valid cycle Musterroll snapshot")
     }
 
     // --- The test ---
@@ -1405,7 +1405,7 @@ mod tests {
 root = "{}"
 
 [budgets]
-use_bursar = false
+use_musterroll = false
 
 [[roster]]
 name = "scope-worker"
@@ -1453,7 +1453,7 @@ fallback = []
         let result = run_dry_run_with_timestamps_scoped(
             &scoped_config(fleet.path()),
             &bd,
-            &FakeBursarClient::unavailable(),
+            &FakeMusterrollClient::unavailable(),
             reports.path(),
             state.path(),
             "cycle-20260713-scoped",
@@ -1508,7 +1508,7 @@ fallback = []
         run_dry_run_with_timestamps(
             &scoped_config(fleet.path()),
             &bd,
-            &FakeBursarClient::unavailable(),
+            &FakeMusterrollClient::unavailable(),
             reports.path(),
             state.path(),
             "cycle-20260713-fleet-103",
@@ -1541,7 +1541,7 @@ fallback = []
 root = "{}"
 
 [budgets]
-use_bursar = true
+use_musterroll = true
 
 [[roster]]
 name = "healthy-junior"
@@ -1577,7 +1577,7 @@ fallback = []
         );
         bd.set_count(&repo, 2);
         bd.set_blocked(&repo, vec![]);
-        let bursar = CountingBursar {
+        let musterroll = CountingMusterroll {
             report: provider_status_report(),
             snapshot: cycle_roster_snapshot(),
             calls: Cell::new(0),
@@ -1586,7 +1586,7 @@ fallback = []
         let result = run_dry_run_with_timestamps(
             &cfg,
             &bd,
-            &bursar,
+            &musterroll,
             reports.path(),
             state.path(),
             "cycle-20260713-120000",
@@ -1594,7 +1594,7 @@ fallback = []
         )
         .unwrap();
 
-        assert_eq!(bursar.calls.get(), 1, "one Bursar status call per cycle");
+        assert_eq!(musterroll.calls.get(), 1, "one Musterroll status call per cycle");
         let saved: Value = serde_json::from_slice(
             &std::fs::read(state.path().join("plans/cycle-20260713-120000.json")).unwrap(),
         )
@@ -1621,7 +1621,7 @@ fallback = []
             healthy_candidate["reason"]
                 .as_str()
                 .unwrap()
-                .contains("bursar availability healthy")
+                .contains("musterroll availability healthy")
         );
         assert_eq!(healthy_candidate["outcome"], "selected");
 
@@ -1682,7 +1682,7 @@ fallback = []
             .expect("consult manifest");
         assert!(
             consult_manifest.roster_snapshot.is_some(),
-            "every prepared v2 run pins a copied Bursar roster snapshot"
+            "every prepared v2 run pins a copied Musterroll roster snapshot"
         );
     }
 
@@ -1698,8 +1698,8 @@ fallback = []
         let report: serde_json::Value = serde_json::from_slice(&report_bytes).unwrap();
 
         assert_eq!(report["schema"], "harness-deck/report@1");
-        assert_eq!(report["project"], "conductor");
-        assert_eq!(report["harness"], "conductor");
+        assert_eq!(report["project"], "undertake");
+        assert_eq!(report["harness"], "undertake");
         assert_eq!(report["id"], cycle_id);
         assert_eq!(report["status"], "awaiting-review");
 
@@ -1775,7 +1775,7 @@ fallback = []
 root = "{}"
 
 [budgets]
-use_bursar = false
+use_musterroll = false
 
 [[roster]]
 name = "test-senior"
@@ -1800,7 +1800,7 @@ dispatch_id = "test/senior"
         let result = run_dry_run_with_timestamps(
             &cfg,
             &client,
-            &FakeBursarClient::unavailable(),
+            &FakeMusterrollClient::unavailable(),
             reports.path(),
             state.path(),
             cycle_id,
@@ -1876,7 +1876,7 @@ root = "{}"
 max_dispatches_per_cycle = 8
 max_active_per_repo = 1
 max_external_dispatches = 4
-use_bursar = false
+use_musterroll = false
 
 [[roster]]
 name = "test-senior"
@@ -1933,7 +1933,7 @@ dispatch_id = "test/junior"
         let result = run_dry_run_with_timestamps(
             &cfg,
             &client,
-            &FakeBursarClient::unavailable(),
+            &FakeMusterrollClient::unavailable(),
             reports.path(),
             state.path(),
             cycle_id,

@@ -114,7 +114,7 @@ pub(crate) struct Issue {
     // (issue_id/depends_on_id/type/created_at/created_by/metadata), not plain
     // issue-id strings; a `Vec<String>` typing made the whole array — and thus
     // the whole `bd ready` parse — fail for any issue with populated deps,
-    // silently emptying that repo's ready list (conductor-guildhall-dogfood
+    // silently emptying that repo's ready list (undertake-guildhall-dogfood
     // fix, 2026-07-02). This field is otherwise unused by triage/scan logic,
     // so `Value` avoids over-modeling a shape nothing consumes.
     #[serde(default)]
@@ -586,8 +586,8 @@ mod tests {
     }
 
     #[test]
-    fn bd_client_real_subprocess_conductor_revise_findings_round_trip_keeps_string_scalar_shape() {
-        // Live-contract regression for conductor-0ya. A throwaway
+    fn bd_client_real_subprocess_undertake_revise_findings_round_trip_keeps_string_scalar_shape() {
+        // Live-contract regression for undertake-0ya. A throwaway
         // `bd` repo proved `bd update --set-metadata` returns the
         // stored value as a JSON string scalar, not a native array,
         // even when the caller wrote a JSON-encoded array. This test
@@ -633,15 +633,15 @@ mod tests {
             .set_metadata(
                 temp.path(),
                 "fixture-revise-findings",
-                "conductor_revise_findings",
+                "undertake_revise_findings",
                 &findings,
             )
             .expect("set_metadata works against the live bd");
         let stored = set
             .metadata
             .as_ref()
-            .and_then(|m| m.get("conductor_revise_findings"))
-            .expect("conductor_revise_findings lives in returned metadata");
+            .and_then(|m| m.get("undertake_revise_findings"))
+            .expect("undertake_revise_findings lives in returned metadata");
         assert_eq!(
             stored,
             &serde_json::Value::String(findings.clone()),
@@ -657,7 +657,7 @@ mod tests {
         let ready_value = ready_issue
             .metadata
             .as_ref()
-            .and_then(|m| m.get("conductor_revise_findings"))
+            .and_then(|m| m.get("undertake_revise_findings"))
             .expect("ready carries the metadata");
         assert_eq!(
             ready_value,
@@ -671,7 +671,7 @@ mod tests {
         let shown_value = shown
             .metadata
             .as_ref()
-            .and_then(|m| m.get("conductor_revise_findings"))
+            .and_then(|m| m.get("undertake_revise_findings"))
             .expect("show carries the metadata");
         assert_eq!(
             shown_value,
@@ -706,7 +706,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("conductor-{label}-{nanos}"));
+            let path = std::env::temp_dir().join(format!("undertake-{label}-{nanos}"));
             std::fs::create_dir_all(&path).expect("mkdir temp repo");
             Self(path)
         }

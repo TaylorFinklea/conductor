@@ -4,7 +4,7 @@
 //! exiting nonzero, timing out, or losing provider capacity — all without
 //! producing an accepted commit. Left alone, that leaves the real
 //! repository dirty and strands both the partial work and every later
-//! Conductor cycle targeting the same repo. This module captures that
+//! Undertake cycle targeting the same repo. This module captures that
 //! uncommitted state as a hashed, immutable run artifact and restores the
 //! repository to its exact pre-attempt state, but only when ownership can
 //! be authenticated: HEAD must still match the value recorded before the
@@ -208,7 +208,7 @@ fn parse_porcelain_z(raw: &[u8]) -> std::result::Result<Vec<String>, String> {
             format!(
                 "git status reported a non-UTF-8 path ({error}); refusing to guess at its \
                  identity and leaving the repository completely untouched — this path requires \
-                 manual `git status`/`git diff` inspection and recovery outside Conductor"
+                 manual `git status`/`git diff` inspection and recovery outside Undertake"
             )
         })?;
         if text.len() < 3 {
@@ -241,7 +241,7 @@ fn split_nul_paths(raw: &[u8]) -> std::result::Result<Vec<String>, String> {
                 format!(
                     "git reported a non-UTF-8 path ({error}); refusing to guess at its identity \
                      and leaving the repository completely untouched — this path requires \
-                     manual `git status`/`git diff` inspection and recovery outside Conductor"
+                     manual `git status`/`git diff` inspection and recovery outside Undertake"
                 )
             })
         })
@@ -625,7 +625,7 @@ impl RepoLease {
             Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
                 return Err(QuarantineError::CaptureFailed(format!(
                     "repository lease for {canonical_repo} is already held; refusing to touch a \
-                     repo another Conductor operation may currently be using"
+                     repo another Undertake operation may currently be using"
                 )));
             }
             Err(error) => {
@@ -809,7 +809,7 @@ fn lease_location(state_dir: &Path, canonical_repo: &str) -> Result<LeaseLocatio
         ))
     })?;
     Ok(LeaseLocation {
-        leases_dir: git_common_dir.join("conductor").join("leases"),
+        leases_dir: git_common_dir.join("undertake").join("leases"),
         identity: identity.to_string(),
     })
 }
@@ -861,7 +861,7 @@ fn parse_lease_generation(contents: &str) -> Option<String> {
 fn lease_held_error(canonical_repo: &str, holder: &str) -> QuarantineError {
     QuarantineError::CaptureFailed(format!(
         "repository lease for {canonical_repo} is already held ({}); refusing to touch a repo \
-         another Conductor operation may currently be using",
+         another Undertake operation may currently be using",
         holder.trim().replace('\n', ", ")
     ))
 }
@@ -917,7 +917,7 @@ pub(crate) struct DispatchLease {
 
 impl DispatchLease {
     pub(crate) fn acquire(state_dir: &Path, cycle_id: &str) -> Result<Self> {
-        RepoLease::acquire(state_dir, "conductor://dispatch", cycle_id)
+        RepoLease::acquire(state_dir, "undertake://dispatch", cycle_id)
             .map(|lease| Self { _lease: lease })
     }
 }
@@ -939,10 +939,10 @@ fn parse_lease_pid(contents: &str) -> Option<u32> {
 
 #[cfg(test)]
 fn wait_at_test_reclaim_gate() {
-    let Ok(gate_dir) = std::env::var("CONDUCTOR_TEST_LEASE_RECLAIM_GATE_DIR") else {
+    let Ok(gate_dir) = std::env::var("UNDERTAKE_TEST_LEASE_RECLAIM_GATE_DIR") else {
         return;
     };
-    let contender = std::env::var("CONDUCTOR_TEST_LEASE_CONTENDER")
+    let contender = std::env::var("UNDERTAKE_TEST_LEASE_CONTENDER")
         .expect("lease contender id must accompany the reclaim gate");
     let gate_dir = PathBuf::from(gate_dir);
     std::fs::write(gate_dir.join(format!("{contender}.ready")), b"ready\n")
@@ -952,7 +952,7 @@ fn wait_at_test_reclaim_gate() {
 
 #[cfg(test)]
 fn abort_at_test_lease_phase(phase: &str) {
-    if std::env::var("CONDUCTOR_TEST_LEASE_ABORT_AT").as_deref() == Ok(phase) {
+    if std::env::var("UNDERTAKE_TEST_LEASE_ABORT_AT").as_deref() == Ok(phase) {
         std::process::exit(86);
     }
 }
@@ -997,7 +997,7 @@ pub(crate) fn process_alive(_pid: u32) -> bool {
 /// `kill -0 -<pgid>` succeeds while the group has members, reports `EPERM`
 /// when it has members we cannot signal, and only reports `ESRCH` once the
 /// group is empty. This proves an orphaned worker *and every descendant still
-/// in its group* is gone — a dead `conductor` owner is not proof its
+/// in its group* is gone — a dead `undertake` owner is not proof its
 /// separately grouped worker died with it. Fails closed exactly like
 /// [`process_alive`]: anything short of a confirmed-empty group reads as
 /// still-alive.
@@ -1348,7 +1348,7 @@ fn stage_private_patch_file(artifact_label: &str, patch: &[u8]) -> std::io::Resu
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
         let candidate = std::env::temp_dir().join(format!(
-            "conductor-quarantine-{}-{label}-{nanos}.patch",
+            "undertake-quarantine-{}-{label}-{nanos}.patch",
             std::process::id(),
         ));
         match open_private_new(&candidate) {
@@ -1674,7 +1674,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("conductor-quarantine-{label}-{nanos}"));
+            let path = std::env::temp_dir().join(format!("undertake-quarantine-{label}-{nanos}"));
             std::fs::create_dir_all(&path).expect("mkdir temp");
             Self(path)
         }
@@ -1792,17 +1792,17 @@ mod tests {
             .arg("--exact")
             .arg("--ignored")
             .arg("quarantine::tests::repo_lease_process_helper")
-            .env("CONDUCTOR_TEST_LEASE_STATE_DIR", state_dir)
-            .env("CONDUCTOR_TEST_LEASE_RECLAIM_GATE_DIR", gate_dir)
-            .env("CONDUCTOR_TEST_LEASE_CONTENDER", contender)
-            .env("CONDUCTOR_TEST_LEASE_KIND", kind.label())
-            .env("CONDUCTOR_TEST_LEASE_IDENTITY", identity)
-            .env("CONDUCTOR_TEST_LEASE_RUN_ID", run_id)
+            .env("UNDERTAKE_TEST_LEASE_STATE_DIR", state_dir)
+            .env("UNDERTAKE_TEST_LEASE_RECLAIM_GATE_DIR", gate_dir)
+            .env("UNDERTAKE_TEST_LEASE_CONTENDER", contender)
+            .env("UNDERTAKE_TEST_LEASE_KIND", kind.label())
+            .env("UNDERTAKE_TEST_LEASE_IDENTITY", identity)
+            .env("UNDERTAKE_TEST_LEASE_RUN_ID", run_id)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if let Some(phase) = abort_at {
-            command.env("CONDUCTOR_TEST_LEASE_ABORT_AT", phase);
+            command.env("UNDERTAKE_TEST_LEASE_ABORT_AT", phase);
         }
         command.spawn().expect("spawn independent lease contender")
     }
@@ -1811,14 +1811,14 @@ mod tests {
     #[ignore = "independent-process helper invoked by lease contention tests"]
     fn repo_lease_process_helper() {
         let state_dir = PathBuf::from(
-            std::env::var("CONDUCTOR_TEST_LEASE_STATE_DIR").expect("lease state dir"),
+            std::env::var("UNDERTAKE_TEST_LEASE_STATE_DIR").expect("lease state dir"),
         );
         let gate_dir = PathBuf::from(
-            std::env::var("CONDUCTOR_TEST_LEASE_RECLAIM_GATE_DIR").expect("lease gate dir"),
+            std::env::var("UNDERTAKE_TEST_LEASE_RECLAIM_GATE_DIR").expect("lease gate dir"),
         );
         let contender =
-            std::env::var("CONDUCTOR_TEST_LEASE_CONTENDER").expect("lease contender id");
-        let kind = match std::env::var("CONDUCTOR_TEST_LEASE_KIND")
+            std::env::var("UNDERTAKE_TEST_LEASE_CONTENDER").expect("lease contender id");
+        let kind = match std::env::var("UNDERTAKE_TEST_LEASE_KIND")
             .expect("lease kind")
             .as_str()
         {
@@ -1826,8 +1826,8 @@ mod tests {
             "dispatch" => TestLeaseKind::Dispatch,
             other => panic!("unknown lease kind {other:?}"),
         };
-        let identity = std::env::var("CONDUCTOR_TEST_LEASE_IDENTITY").expect("lease identity");
-        let run_id = std::env::var("CONDUCTOR_TEST_LEASE_RUN_ID").expect("lease run id");
+        let identity = std::env::var("UNDERTAKE_TEST_LEASE_IDENTITY").expect("lease identity");
+        let run_id = std::env::var("UNDERTAKE_TEST_LEASE_RUN_ID").expect("lease run id");
         let result_path = gate_dir.join(format!("{contender}.result"));
         let release_path = gate_dir.join(format!("{contender}.release"));
 
@@ -1976,11 +1976,11 @@ mod tests {
             RunJob::Work,
             crate::run::NewRun {
                 target: crate::run::RunTarget {
-                    repo: "/repo/conductor".to_string(),
+                    repo: "/repo/undertake".to_string(),
                     bead: Some(format!("bead-{label}")),
                 },
                 approved_profiles: vec!["claude-sonnet-5".to_string()],
-                bursar_roster_artifact: None,
+                musterroll_roster_artifact: None,
                 roster_snapshot: None,
                 limits: crate::run::RunLimits::default(),
                 verifier: crate::run::RunVerifier::default(),
@@ -2014,7 +2014,7 @@ mod tests {
         };
 
         let capture = quarantine_dirty_attempt(
-            Path::new("/repo/conductor"),
+            Path::new("/repo/undertake"),
             &commits,
             &recovery,
             &handle,
@@ -2048,7 +2048,7 @@ mod tests {
         };
 
         let capture = quarantine_dirty_attempt(
-            Path::new("/repo/conductor"),
+            Path::new("/repo/undertake"),
             &commits,
             &recovery,
             &handle,
@@ -2072,7 +2072,7 @@ mod tests {
         let recovery = FakeRecovery::default();
 
         let first = quarantine_dirty_attempt(
-            Path::new("/repo/conductor"),
+            Path::new("/repo/undertake"),
             &commits,
             &recovery,
             &handle,
@@ -2081,7 +2081,7 @@ mod tests {
         )
         .expect("first call succeeds");
         let second = quarantine_dirty_attempt(
-            Path::new("/repo/conductor"),
+            Path::new("/repo/undertake"),
             &commits,
             &recovery,
             &handle,
@@ -2107,7 +2107,7 @@ mod tests {
         };
 
         let error = quarantine_dirty_attempt(
-            Path::new("/repo/conductor"),
+            Path::new("/repo/undertake"),
             &commits,
             &recovery,
             &handle,
@@ -2130,7 +2130,7 @@ mod tests {
         let recovery = FakeRecovery::default();
 
         let error = quarantine_dirty_attempt(
-            Path::new("/repo/conductor"),
+            Path::new("/repo/undertake"),
             &commits,
             &recovery,
             &handle,
@@ -2156,7 +2156,7 @@ mod tests {
         };
 
         let error = quarantine_dirty_attempt(
-            Path::new("/repo/conductor"),
+            Path::new("/repo/undertake"),
             &commits,
             &recovery,
             &handle,
@@ -2183,7 +2183,7 @@ mod tests {
         };
 
         let error = quarantine_dirty_attempt(
-            Path::new("/repo/conductor"),
+            Path::new("/repo/undertake"),
             &commits,
             &recovery,
             &handle,
@@ -2215,7 +2215,7 @@ mod tests {
         };
 
         let error = quarantine_dirty_attempt(
-            Path::new("/repo/conductor"),
+            Path::new("/repo/undertake"),
             &commits,
             &recovery,
             &handle,
@@ -2264,7 +2264,7 @@ mod tests {
         };
 
         let error = quarantine_dirty_attempt(
-            Path::new("/repo/conductor"),
+            Path::new("/repo/undertake"),
             &commits,
             &recovery,
             &handle,
@@ -2299,7 +2299,7 @@ mod tests {
         };
         let run_id = handle.run_id().to_string();
         let capture = quarantine_dirty_attempt(
-            Path::new("/repo/conductor"),
+            Path::new("/repo/undertake"),
             &commits,
             &recovery,
             &handle,
@@ -2346,7 +2346,7 @@ mod tests {
         let run_id = handle.run_id().to_string();
 
         quarantine_dirty_attempt(
-            Path::new("/repo/conductor"),
+            Path::new("/repo/undertake"),
             &commits,
             &recovery,
             &handle,
@@ -2391,7 +2391,7 @@ mod tests {
                     bead: Some(bead.to_string()),
                 },
                 approved_profiles: vec!["claude-sonnet-5".to_string()],
-                bursar_roster_artifact: None,
+                musterroll_roster_artifact: None,
                 roster_snapshot: None,
                 limits: crate::run::RunLimits::default(),
                 verifier: crate::run::RunVerifier::default(),
@@ -2435,7 +2435,7 @@ mod tests {
                     bead: Some(bead.to_string()),
                 },
                 approved_profiles: vec!["claude-sonnet-5".to_string()],
-                bursar_roster_artifact: None,
+                musterroll_roster_artifact: None,
                 roster_snapshot: None,
                 limits: crate::run::RunLimits::default(),
                 verifier: crate::run::RunVerifier::default(),
@@ -2488,7 +2488,7 @@ mod tests {
                     bead: Some(bead.to_string()),
                 },
                 approved_profiles: vec!["claude-sonnet-5".to_string()],
-                bursar_roster_artifact: None,
+                musterroll_roster_artifact: None,
                 roster_snapshot: None,
                 limits: crate::run::RunLimits::default(),
                 verifier: crate::run::RunVerifier::default(),
@@ -2526,9 +2526,9 @@ mod tests {
     fn repo_lease_acquire_twice_for_the_same_repo_refuses_the_second() {
         let temp = TempDir::new("lease-conflict");
         let _first =
-            RepoLease::acquire(temp.path(), "/repo/bursar", "run-a").expect("first lease acquires");
+            RepoLease::acquire(temp.path(), "/repo/musterroll", "run-a").expect("first lease acquires");
 
-        let error = RepoLease::acquire(temp.path(), "/repo/bursar", "run-b")
+        let error = RepoLease::acquire(temp.path(), "/repo/musterroll", "run-b")
             .expect_err("second concurrent lease must refuse");
 
         assert!(matches!(error, QuarantineError::CaptureFailed(_)));
@@ -2538,18 +2538,18 @@ mod tests {
     fn repo_lease_release_on_drop_lets_a_later_attempt_acquire_it() {
         let temp = TempDir::new("lease-release");
         {
-            let _lease = RepoLease::acquire(temp.path(), "/repo/bursar", "run-a")
+            let _lease = RepoLease::acquire(temp.path(), "/repo/musterroll", "run-a")
                 .expect("first lease acquires");
         }
 
-        let _second = RepoLease::acquire(temp.path(), "/repo/bursar", "run-b")
+        let _second = RepoLease::acquire(temp.path(), "/repo/musterroll", "run-b")
             .expect("lease is available again once the holder drops it");
     }
 
     #[test]
     fn repo_leases_for_different_repos_do_not_conflict() {
         let temp = TempDir::new("lease-different-repos");
-        let _a = RepoLease::acquire(temp.path(), "/repo/bursar", "run-a").expect("lease a");
+        let _a = RepoLease::acquire(temp.path(), "/repo/musterroll", "run-a").expect("lease a");
         let _b = RepoLease::acquire(temp.path(), "/repo/other", "run-b").expect("lease b");
     }
 
@@ -2559,10 +2559,10 @@ mod tests {
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
         git_ok(&repo, &["init", "-b", "main"]);
-        git_ok(&repo, &["config", "user.name", "Conductor Test"]);
+        git_ok(&repo, &["config", "user.name", "Undertake Test"]);
         git_ok(
             &repo,
-            &["config", "user.email", "conductor@example.invalid"],
+            &["config", "user.email", "undertake@example.invalid"],
         );
         std::fs::write(repo.join("README.md"), b"base\n").expect("write base");
         git_ok(&repo, &["add", "README.md"]);
@@ -2653,14 +2653,14 @@ mod tests {
 
         let leases_dir = temp.path().join("leases");
         std::fs::create_dir_all(&leases_dir).expect("mkdir leases dir");
-        let stale_path = leases_dir.join(format!("{}.lock", lease_key("/repo/bursar")));
+        let stale_path = leases_dir.join(format!("{}.lock", lease_key("/repo/musterroll")));
         std::fs::write(
             &stale_path,
-            format!("run_id=stale-run\npid={dead_pid}\nrepo=/repo/bursar\n"),
+            format!("run_id=stale-run\npid={dead_pid}\nrepo=/repo/musterroll\n"),
         )
         .expect("write stale lease file");
 
-        let lease = RepoLease::acquire(temp.path(), "/repo/bursar", "run-new")
+        let lease = RepoLease::acquire(temp.path(), "/repo/musterroll", "run-new")
             .expect("a lease held by a provably dead process must be reclaimed");
 
         drop(lease);
@@ -2840,7 +2840,7 @@ mod tests {
             assert_single_winner_contention_round(
                 temp.path(),
                 TestLeaseKind::Repo,
-                "/repo/bursar",
+                "/repo/musterroll",
                 TestLeaseOwnerFormat::Legacy,
                 TestLeaseRace::Ordered,
                 round,
@@ -2848,7 +2848,7 @@ mod tests {
             assert_single_winner_contention_round(
                 temp.path(),
                 TestLeaseKind::Dispatch,
-                "conductor://dispatch",
+                "undertake://dispatch",
                 TestLeaseOwnerFormat::Legacy,
                 TestLeaseRace::Ordered,
                 round,
@@ -2857,7 +2857,7 @@ mod tests {
                 assert_single_winner_contention_round(
                     temp.path(),
                     TestLeaseKind::Repo,
-                    "/repo/bursar",
+                    "/repo/musterroll",
                     owner_format,
                     TestLeaseRace::Simultaneous,
                     round,
@@ -2865,7 +2865,7 @@ mod tests {
                 assert_single_winner_contention_round(
                     temp.path(),
                     TestLeaseKind::Dispatch,
-                    "conductor://dispatch",
+                    "undertake://dispatch",
                     owner_format,
                     TestLeaseRace::Simultaneous,
                     round,
@@ -2879,8 +2879,8 @@ mod tests {
         let temp = TempDir::new("lease-interrupted-reclaim");
         for kind in [TestLeaseKind::Repo, TestLeaseKind::Dispatch] {
             let identity = match kind {
-                TestLeaseKind::Repo => "/repo/bursar",
-                TestLeaseKind::Dispatch => "conductor://dispatch",
+                TestLeaseKind::Repo => "/repo/musterroll",
+                TestLeaseKind::Dispatch => "undertake://dispatch",
             };
             for phase in [
                 "after_guard_lock",
@@ -2937,7 +2937,7 @@ mod tests {
     #[test]
     fn repo_lease_leaves_live_or_unauthenticated_unlocked_owner_records_untouched() {
         let temp = TempDir::new("lease-owner-fail-closed");
-        let identity = "/repo/bursar";
+        let identity = "/repo/musterroll";
         for (label, contents) in [
             ("empty", String::new()),
             (
@@ -2985,7 +2985,7 @@ mod tests {
     #[test]
     fn repo_lease_drop_removes_only_its_authenticated_generation() {
         let temp = TempDir::new("lease-drop-generation");
-        let identity = "/repo/bursar";
+        let identity = "/repo/musterroll";
         let lease = RepoLease::acquire(temp.path(), identity, "owned-run")
             .expect("acquire original generation");
         let (_, owner_path, _) = lease_artifact_paths(temp.path(), identity);
@@ -3059,7 +3059,7 @@ mod tests {
 
         // Mirror how `CommandExec` launches a worker: as the leader of its own
         // process group, so the group id equals the child pid and a dead
-        // `conductor` parent would leave this group orphaned but alive.
+        // `undertake` parent would leave this group orphaned but alive.
         let mut worker = Command::new("sleep")
             .arg("30")
             .stdin(Stdio::null())
@@ -3075,7 +3075,7 @@ mod tests {
             "a live orphaned worker group must never read as gone"
         );
 
-        // The parent (this process, standing in for conductor) tears the whole
+        // The parent (this process, standing in for undertake) tears the whole
         // group down and reaps it — only now is the worker provably gone.
         let _ = Command::new("kill")
             .arg("-KILL")
@@ -3099,10 +3099,10 @@ mod tests {
         let temp = TempDir::new("lease-unparseable-holder");
         let leases_dir = temp.path().join("leases");
         std::fs::create_dir_all(&leases_dir).expect("mkdir leases dir");
-        let path = leases_dir.join(format!("{}.lock", lease_key("/repo/bursar")));
+        let path = leases_dir.join(format!("{}.lock", lease_key("/repo/musterroll")));
         std::fs::write(&path, "not a lease file at all\n").expect("write corrupt lease file");
 
-        let error = RepoLease::acquire(temp.path(), "/repo/bursar", "run-new")
+        let error = RepoLease::acquire(temp.path(), "/repo/musterroll", "run-new")
             .expect_err("a lease whose holder cannot be proven dead must not be reclaimed");
 
         assert!(matches!(error, QuarantineError::CaptureFailed(_)));
@@ -3115,9 +3115,9 @@ mod tests {
     #[test]
     fn running_run_conflict_finds_another_running_run_for_the_same_repo() {
         let temp = TempDir::new("running-conflict");
-        let running_run_id = running_manifest_for(&temp, "/repo/bursar", "bursar-467", fixed_now());
+        let running_run_id = running_manifest_for(&temp, "/repo/musterroll", "musterroll-467", fixed_now());
 
-        let found = running_run_conflict(temp.path(), "/repo/bursar", "some-other-run-id")
+        let found = running_run_conflict(temp.path(), "/repo/musterroll", "some-other-run-id")
             .expect("scan succeeds")
             .expect("conflict found");
 
@@ -3127,9 +3127,9 @@ mod tests {
     #[test]
     fn running_run_conflict_excludes_the_calling_runs_own_id() {
         let temp = TempDir::new("running-self-exclude");
-        let running_run_id = running_manifest_for(&temp, "/repo/bursar", "bursar-467", fixed_now());
+        let running_run_id = running_manifest_for(&temp, "/repo/musterroll", "musterroll-467", fixed_now());
 
-        let found = running_run_conflict(temp.path(), "/repo/bursar", &running_run_id)
+        let found = running_run_conflict(temp.path(), "/repo/musterroll", &running_run_id)
             .expect("scan succeeds");
 
         assert_eq!(found, None, "a run must never conflict with itself");
@@ -3140,8 +3140,8 @@ mod tests {
         let temp = TempDir::new("running-ignore");
         manifest_for(
             &temp,
-            "/repo/bursar",
-            "bursar-467",
+            "/repo/musterroll",
+            "musterroll-467",
             "failed",
             None,
             fixed_now(),
@@ -3149,7 +3149,7 @@ mod tests {
         running_manifest_for(&temp, "/repo/other", "other-1", fixed_now());
 
         let found =
-            running_run_conflict(temp.path(), "/repo/bursar", "excluded").expect("scan succeeds");
+            running_run_conflict(temp.path(), "/repo/musterroll", "excluded").expect("scan succeeds");
 
         assert_eq!(found, None);
     }
@@ -3158,7 +3158,7 @@ mod tests {
     fn quarantine_dirty_attempt_with_lease_refuses_while_another_run_is_running_against_the_repo() {
         let temp = TempDir::new("leased-running-conflict");
         let handle = run_handle(&temp, "leased-running-conflict");
-        running_manifest_for(&temp, "/repo/conductor", "bead-other", fixed_now());
+        running_manifest_for(&temp, "/repo/undertake", "bead-other", fixed_now());
         let commits = FakeCommits::new([Some("head1"), Some("head1")], [false, true]);
         let recovery = FakeRecovery {
             changed_paths: vec!["src/lib.rs".to_string()],
@@ -3167,8 +3167,8 @@ mod tests {
         };
 
         let error = quarantine_dirty_attempt_with_lease(
-            Path::new("/repo/conductor"),
-            "/repo/conductor",
+            Path::new("/repo/undertake"),
+            "/repo/undertake",
             temp.path(),
             &commits,
             &recovery,
@@ -3192,14 +3192,14 @@ mod tests {
         let created_at = fixed_now();
         let run_id = manifest_for(
             &temp,
-            "/repo/bursar",
-            "bursar-467",
+            "/repo/musterroll",
+            "musterroll-467",
             "failed",
             None,
             created_at,
         );
 
-        let found = most_recent_failed_run(temp.path(), "/repo/bursar", "bursar-467")
+        let found = most_recent_failed_run(temp.path(), "/repo/musterroll", "musterroll-467")
             .expect("lookup succeeds")
             .expect("run found");
 
@@ -3218,13 +3218,13 @@ mod tests {
         let created_at = fixed_now();
         let run_id = finished_run_with_attempt_started_for(
             &temp,
-            "/repo/bursar",
-            "bursar-467",
+            "/repo/musterroll",
+            "musterroll-467",
             "failed",
             created_at,
         );
 
-        let found = most_recent_failed_run(temp.path(), "/repo/bursar", "bursar-467")
+        let found = most_recent_failed_run(temp.path(), "/repo/musterroll", "musterroll-467")
             .expect("lookup succeeds")
             .expect("run found");
 
@@ -3237,7 +3237,7 @@ mod tests {
         let temp = TempDir::new("legacy-other-target");
         manifest_for(&temp, "/repo/other", "other-1", "failed", None, fixed_now());
 
-        let found = most_recent_failed_run(temp.path(), "/repo/bursar", "bursar-467")
+        let found = most_recent_failed_run(temp.path(), "/repo/musterroll", "musterroll-467")
             .expect("lookup succeeds");
 
         assert_eq!(found, None);
@@ -3248,22 +3248,22 @@ mod tests {
         let temp = TempDir::new("legacy-superseded");
         manifest_for(
             &temp,
-            "/repo/bursar",
-            "bursar-467",
+            "/repo/musterroll",
+            "musterroll-467",
             "failed",
             None,
             fixed_now(),
         );
         manifest_for(
             &temp,
-            "/repo/bursar",
-            "bursar-467",
+            "/repo/musterroll",
+            "musterroll-467",
             "verified",
             None,
             fixed_now() + chrono::Duration::minutes(5),
         );
 
-        let found = most_recent_failed_run(temp.path(), "/repo/bursar", "bursar-467")
+        let found = most_recent_failed_run(temp.path(), "/repo/musterroll", "musterroll-467")
             .expect("lookup succeeds");
 
         assert_eq!(found, None, "a later verified run means nothing to adopt");
@@ -3274,8 +3274,8 @@ mod tests {
         let temp = TempDir::new("legacy-tampered");
         let run_id = manifest_for(
             &temp,
-            "/repo/bursar",
-            "bursar-467",
+            "/repo/musterroll",
+            "musterroll-467",
             "failed",
             None,
             fixed_now(),
@@ -3294,7 +3294,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = most_recent_failed_run(temp.path(), "/repo/bursar", "bursar-467")
+        let error = most_recent_failed_run(temp.path(), "/repo/musterroll", "musterroll-467")
             .expect_err("tampered evidence for our own target must fail closed");
 
         assert!(matches!(error, QuarantineError::CaptureFailed(_)));
@@ -3309,8 +3309,8 @@ mod tests {
         let temp = TempDir::new("legacy-unparseable");
         let run_id = manifest_for(
             &temp,
-            "/repo/bursar",
-            "bursar-467",
+            "/repo/musterroll",
+            "musterroll-467",
             "failed",
             None,
             fixed_now(),
@@ -3322,11 +3322,11 @@ mod tests {
             .join("manifest.json");
         std::fs::write(
             &manifest_path,
-            b"{ not valid json but still mentions /repo/bursar and bursar-467 \xff\xfe",
+            b"{ not valid json but still mentions /repo/musterroll and musterroll-467 \xff\xfe",
         )
         .unwrap();
 
-        let error = most_recent_failed_run(temp.path(), "/repo/bursar", "bursar-467")
+        let error = most_recent_failed_run(temp.path(), "/repo/musterroll", "musterroll-467")
             .expect_err("unparseable evidence that might be ours must fail closed");
 
         assert!(matches!(error, QuarantineError::CaptureFailed(_)));
@@ -3351,7 +3351,7 @@ mod tests {
         )
         .unwrap();
 
-        let found = most_recent_failed_run(temp.path(), "/repo/bursar", "bursar-467")
+        let found = most_recent_failed_run(temp.path(), "/repo/musterroll", "musterroll-467")
             .expect("unrelated corrupt manifest must not block the scan");
 
         assert_eq!(found, None);
@@ -3367,7 +3367,7 @@ mod tests {
             attempt_started: true,
         };
 
-        let head = authenticate_legacy_adoption(&commits, Path::new("/repo/bursar"), &run, None)
+        let head = authenticate_legacy_adoption(&commits, Path::new("/repo/musterroll"), &run, None)
             .expect("authentication succeeds");
 
         assert_eq!(head, "sha-a");
@@ -3383,7 +3383,7 @@ mod tests {
             attempt_started: true,
         };
 
-        let error = authenticate_legacy_adoption(&commits, Path::new("/repo/bursar"), &run, None)
+        let error = authenticate_legacy_adoption(&commits, Path::new("/repo/musterroll"), &run, None)
             .expect_err("head mismatch must refuse");
 
         assert!(matches!(error, QuarantineError::HeadMoved { .. }));
@@ -3406,7 +3406,7 @@ mod tests {
             attempt_started: true,
         };
 
-        let error = authenticate_legacy_adoption(&commits, Path::new("/repo/bursar"), &run, None)
+        let error = authenticate_legacy_adoption(&commits, Path::new("/repo/musterroll"), &run, None)
             .expect_err("before_head-less legacy adoption must fail closed");
 
         assert!(matches!(error, QuarantineError::CaptureFailed(_)));
@@ -3424,7 +3424,7 @@ mod tests {
 
         let error = authenticate_legacy_adoption(
             &commits,
-            Path::new("/repo/bursar"),
+            Path::new("/repo/musterroll"),
             &run,
             Some("run-work-some-other-run"),
         )
@@ -3435,7 +3435,7 @@ mod tests {
 
     #[test]
     fn authenticate_legacy_adoption_accepts_explicit_operator_authorization_by_exact_run_id() {
-        // The bursar-467-shaped incident: no before_head was ever recorded,
+        // The musterroll-467-shaped incident: no before_head was ever recorded,
         // but an operator has explicitly named this exact run_id (not a
         // blanket policy) as reviewed and safe to adopt. Authentication
         // trusts the current HEAD as-is since there is still no before_head
@@ -3450,7 +3450,7 @@ mod tests {
 
         let head = authenticate_legacy_adoption(
             &commits,
-            Path::new("/repo/bursar"),
+            Path::new("/repo/musterroll"),
             &run,
             Some("run-work-legacy"),
         )
@@ -3475,7 +3475,7 @@ mod tests {
             attempt_started: false,
         };
 
-        let error = authenticate_legacy_adoption(&commits, Path::new("/repo/bursar"), &run, None)
+        let error = authenticate_legacy_adoption(&commits, Path::new("/repo/musterroll"), &run, None)
             .expect_err("missing AttemptStarted proof must fail closed even with a before_head");
 
         assert!(matches!(error, QuarantineError::CaptureFailed(_)));
@@ -3499,7 +3499,7 @@ mod tests {
 
         let head = authenticate_legacy_adoption(
             &commits,
-            Path::new("/repo/bursar"),
+            Path::new("/repo/musterroll"),
             &run,
             Some("run-work-no-attempt"),
         )
@@ -3566,7 +3566,7 @@ mod tests {
         };
 
         let error = quarantine_dirty_attempt(
-            Path::new("/repo/conductor"),
+            Path::new("/repo/undertake"),
             &commits,
             &recovery,
             &handle,

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const PLAN_DOCUMENT_SCHEMA: &str = "conductor/plan-document@1";
+const PLAN_DOCUMENT_SCHEMA: &str = "undertake/plan-document@1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -275,8 +275,8 @@ struct PeerReviewWire {
 fn parse_peer_review(bytes: &[u8]) -> Result<(crate::run::PeerVerdict, Vec<PlanFinding>), String> {
     let review: PeerReviewWire = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid plan peer-review JSON: {error}"))?;
-    if review.schema != "conductor/plan-peer-review@1" {
-        return Err("plan peer-review schema must be conductor/plan-peer-review@1".to_string());
+    if review.schema != "undertake/plan-peer-review@1" {
+        return Err("plan peer-review schema must be undertake/plan-peer-review@1".to_string());
     }
     for finding in &review.findings {
         if !valid_identifier(&finding.id)
@@ -317,9 +317,9 @@ struct SecondOpinionWire {
 fn parse_second_opinion(bytes: &[u8]) -> Result<crate::run::SecondOpinionVerdict, String> {
     let opinion: SecondOpinionWire = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid plan second-opinion JSON: {error}"))?;
-    if opinion.schema != "conductor/plan-second-opinion@1" {
+    if opinion.schema != "undertake/plan-second-opinion@1" {
         return Err(
-            "plan second-opinion schema must be conductor/plan-second-opinion@1".to_string(),
+            "plan second-opinion schema must be undertake/plan-second-opinion@1".to_string(),
         );
     }
     Ok(opinion.verdict)
@@ -453,7 +453,7 @@ pub(crate) struct PlanAuthorRequest {
     pub(crate) input: Vec<u8>,
     pub(crate) output_kind: PlanOutputKind,
     pub(crate) execution: crate::run::ApprovedExecution,
-    pub(crate) profile: crate::bursar::RosterProfile,
+    pub(crate) profile: crate::musterroll::RosterProfile,
 }
 
 /// Blind peer-review context. It deliberately has no author identity and no
@@ -465,7 +465,7 @@ pub(crate) struct PlanPeerReviewRequest {
     pub(crate) rubric: String,
     pub(crate) canonical_plan: Vec<u8>,
     pub(crate) execution: crate::run::ApprovedExecution,
-    pub(crate) profile: crate::bursar::RosterProfile,
+    pub(crate) profile: crate::musterroll::RosterProfile,
 }
 
 /// A revision returns the peer's strict findings and the previous canonical
@@ -477,7 +477,7 @@ pub(crate) struct PlanRevisionRequest {
     pub(crate) findings: Vec<PlanFinding>,
     pub(crate) output_kind: PlanOutputKind,
     pub(crate) execution: crate::run::ApprovedExecution,
-    pub(crate) profile: crate::bursar::RosterProfile,
+    pub(crate) profile: crate::musterroll::RosterProfile,
 }
 
 /// Final spec opinion context. It excludes both author identity and peer
@@ -488,7 +488,7 @@ pub(crate) struct PlanSecondOpinionRequest {
     pub(crate) target: crate::run::PlanTarget,
     pub(crate) canonical_plan: Vec<u8>,
     pub(crate) execution: crate::run::ApprovedExecution,
-    pub(crate) profile: crate::bursar::RosterProfile,
+    pub(crate) profile: crate::musterroll::RosterProfile,
 }
 
 /// Typed peer finding returned from the strict review wire format.
@@ -550,12 +550,12 @@ pub(crate) fn plan_document_prompt_contract(kind: PlanOutputKind) -> Result<Stri
 pub(crate) fn peer_review_prompt_contract() -> Result<String, String> {
     serde_json::to_string(&[
         PeerReviewWire {
-            schema: "conductor/plan-peer-review@1".to_string(),
+            schema: "undertake/plan-peer-review@1".to_string(),
             verdict: crate::run::PeerVerdict::Approve,
             findings: vec![],
         },
         PeerReviewWire {
-            schema: "conductor/plan-peer-review@1".to_string(),
+            schema: "undertake/plan-peer-review@1".to_string(),
             verdict: crate::run::PeerVerdict::Revise,
             findings: vec![PlanFinding {
                 id: "finding-low".to_string(),
@@ -566,7 +566,7 @@ pub(crate) fn peer_review_prompt_contract() -> Result<String, String> {
             }],
         },
         PeerReviewWire {
-            schema: "conductor/plan-peer-review@1".to_string(),
+            schema: "undertake/plan-peer-review@1".to_string(),
             verdict: crate::run::PeerVerdict::Revise,
             findings: vec![PlanFinding {
                 id: "finding-medium".to_string(),
@@ -577,7 +577,7 @@ pub(crate) fn peer_review_prompt_contract() -> Result<String, String> {
             }],
         },
         PeerReviewWire {
-            schema: "conductor/plan-peer-review@1".to_string(),
+            schema: "undertake/plan-peer-review@1".to_string(),
             verdict: crate::run::PeerVerdict::Revise,
             findings: vec![PlanFinding {
                 id: "finding-high".to_string(),
@@ -588,7 +588,7 @@ pub(crate) fn peer_review_prompt_contract() -> Result<String, String> {
             }],
         },
         PeerReviewWire {
-            schema: "conductor/plan-peer-review@1".to_string(),
+            schema: "undertake/plan-peer-review@1".to_string(),
             verdict: crate::run::PeerVerdict::Revise,
             findings: vec![PlanFinding {
                 id: "finding-critical".to_string(),
@@ -606,11 +606,11 @@ pub(crate) fn peer_review_prompt_contract() -> Result<String, String> {
 pub(crate) fn second_opinion_prompt_contract() -> Result<String, String> {
     serde_json::to_string(&[
         SecondOpinionWire {
-            schema: "conductor/plan-second-opinion@1".to_string(),
+            schema: "undertake/plan-second-opinion@1".to_string(),
             verdict: crate::run::SecondOpinionVerdict::Accept,
         },
         SecondOpinionWire {
-            schema: "conductor/plan-second-opinion@1".to_string(),
+            schema: "undertake/plan-second-opinion@1".to_string(),
             verdict: crate::run::SecondOpinionVerdict::Reject,
         },
     ])
@@ -659,10 +659,10 @@ fn plan_run_id() -> String {
     clippy::too_many_lines,
     reason = "preparation intentionally captures every immutable authorization input before approval"
 )]
-pub(crate) fn prepare<C: crate::bursar::BursarClient + ?Sized>(
+pub(crate) fn prepare<C: crate::musterroll::MusterrollClient + ?Sized>(
     paths: &PlanJobPaths,
     config: &crate::config::Config,
-    bursar: &C,
+    musterroll: &C,
     request: PlanPrepareRequest,
 ) -> Result<PreparedPlan, String> {
     let require_second_opinion =
@@ -678,12 +678,12 @@ pub(crate) fn prepare<C: crate::bursar::BursarClient + ?Sized>(
     if !target_status.is_empty() {
         return Err("plan target repository must be clean at preparation".to_string());
     }
-    let snapshot = bursar
+    let snapshot = musterroll
         .roster_snapshot()
-        .map_err(|error| format!("bursar roster snapshot: {error}"))?;
-    bursar
+        .map_err(|error| format!("musterroll roster snapshot: {error}"))?;
+    musterroll
         .status()
-        .map_err(|error| format!("bursar provider state: {error}"))?;
+        .map_err(|error| format!("musterroll provider state: {error}"))?;
     let roster_bytes = snapshot.snapshot_bytes().to_vec();
     let policy_sha256 = snapshot.policy_sha256().to_string();
     let source_artifact = snapshot.source_artifact().clone();
@@ -719,7 +719,7 @@ pub(crate) fn prepare<C: crate::bursar::BursarClient + ?Sized>(
         crate::run::StageAttemptLimit::new(2).map_err(|error| error.to_string())?;
     let approval_watermark = chrono::Utc::now().to_rfc3339();
     let approval = PlanApproval {
-        schema: "conductor/plan-approval@1".to_string(),
+        schema: "undertake/plan-approval@1".to_string(),
         decision: "awaiting_approval".to_string(),
         run_id: run_id.clone(),
         output_kind: request.output_kind,
@@ -764,7 +764,7 @@ pub(crate) fn prepare<C: crate::bursar::BursarClient + ?Sized>(
                     .filter(|candidate| candidate.eligible)
                     .map(|candidate| candidate.execution.profile_id.clone())
                     .collect(),
-                bursar_roster_artifact: Some(crate::run::ArtifactRef {
+                musterroll_roster_artifact: Some(crate::run::ArtifactRef {
                     path: source_artifact.path,
                     sha256: source_artifact.sha256,
                 }),
@@ -777,7 +777,7 @@ pub(crate) fn prepare<C: crate::bursar::BursarClient + ?Sized>(
                     max_attempts: Some(2),
                 },
                 verifier: crate::run::RunVerifier {
-                    mechanical: Some("conductor/plan-document@1 validation".to_string()),
+                    mechanical: Some("undertake/plan-document@1 validation".to_string()),
                     qualitative: None,
                 },
                 approval: serde_json::to_value(&approval)
@@ -1278,13 +1278,13 @@ fn valid_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-/// Validates the shipped plan policy against one exact Bursar v2 snapshot
+/// Validates the shipped plan policy against one exact Musterroll v2 snapshot
 /// without preparing a run, allocating a scheduler turn, or making a model
 /// call. The initial pool must support every possible author as a spec author:
 /// a provider-distinct peer and a third, pairwise-distinct final opinion.
 pub(crate) fn validate_initial_policy(
     config: &crate::config::Config,
-    snapshot: &crate::bursar::RosterSnapshot,
+    snapshot: &crate::musterroll::RosterSnapshot,
 ) -> Result<(), String> {
     let policy = crate::role_routing::RoutingPolicy::from_config(config, snapshot)
         .map_err(|error| format!("role policy: {error}"))?;
@@ -1307,7 +1307,7 @@ pub(crate) fn validate_initial_policy(
 }
 
 fn planner_constraints(
-    snapshot: &crate::bursar::RosterSnapshot,
+    snapshot: &crate::musterroll::RosterSnapshot,
     minimum_tier: crate::config::Tier,
 ) -> Result<crate::role_routing::HardEligibility, String> {
     let mut profiles = BTreeSet::new();
@@ -1318,7 +1318,7 @@ fn planner_constraints(
             .providers
             .iter()
             .find(|provider| provider.provider_id == profile.provider_id)
-            .ok_or_else(|| "Bursar profile has no provider".to_string())?;
+            .ok_or_else(|| "Musterroll profile has no provider".to_string())?;
         profiles.insert(
             crate::role_routing::ProfileId::new(profile.profile_id.clone())
                 .map_err(|error| error.to_string())?,
@@ -1483,18 +1483,18 @@ fn activate_plan_stage_capacity(
     clippy::too_many_arguments,
     reason = "the durable invocation boundary needs exact review evidence"
 )]
-fn start_plan_stage_invocation<C: crate::bursar::BursarClient + ?Sized>(
+fn start_plan_stage_invocation<C: crate::musterroll::MusterrollClient + ?Sized>(
     run: &mut crate::run::RunHandle,
     router: &crate::role_routing::RoleRouter,
-    bursar: &C,
-    snapshot: &crate::bursar::RosterSnapshot,
+    musterroll: &C,
+    snapshot: &crate::musterroll::RosterSnapshot,
     ledger_path: &Path,
     stage: crate::run::PlanStage,
     execution: &crate::run::ApprovedExecution,
-    profile: &crate::bursar::RosterProfile,
+    profile: &crate::musterroll::RosterProfile,
     input: &[u8],
 ) -> Result<u8, String> {
-    if let Err(error) = recheck_author(bursar, snapshot, execution) {
+    if let Err(error) = recheck_author(musterroll, snapshot, execution) {
         run.finish_plan_blocked().map_err(|checkpoint| {
             format!("plan blocked after no-call eligibility loss: {checkpoint}")
         })?;
@@ -1549,12 +1549,12 @@ fn start_plan_stage_invocation<C: crate::bursar::BursarClient + ?Sized>(
 pub(crate) fn dispatch<C, A>(
     paths: &PlanJobPaths,
     config: &crate::config::Config,
-    bursar: &C,
+    musterroll: &C,
     run_id: &str,
     author: &A,
 ) -> Result<(), String>
 where
-    C: crate::bursar::BursarClient + ?Sized,
+    C: crate::musterroll::MusterrollClient + ?Sized,
     A: PlanAuthor + ?Sized,
 {
     let mut run = crate::run::RunHandle::open(&paths.state_dir, run_id)
@@ -1586,11 +1586,11 @@ where
         return Err("captured plan input digest changed".to_string());
     }
     let roster_bytes = std::fs::read(run.dir().join("roster.json"))
-        .map_err(|error| format!("captured Bursar roster: {error}"))?;
-    let captured_snapshot = crate::bursar::parse_roster_snapshot(&roster_bytes)
-        .map_err(|error| format!("captured Bursar roster: {error}"))?;
+        .map_err(|error| format!("captured Musterroll roster: {error}"))?;
+    let captured_snapshot = crate::musterroll::parse_roster_snapshot(&roster_bytes)
+        .map_err(|error| format!("captured Musterroll roster: {error}"))?;
     if captured_snapshot.policy_sha256() != approval.roster_policy_sha256 {
-        return Err("captured Bursar policy digest does not match approval".to_string());
+        return Err("captured Musterroll policy digest does not match approval".to_string());
     }
     let policy = crate::role_routing::RoutingPolicy::from_config(config, &captured_snapshot)
         .map_err(|error| format!("role policy changed: {error}"))?;
@@ -1619,7 +1619,7 @@ where
         return dispatch_review_stages(
             &mut run,
             &router,
-            bursar,
+            musterroll,
             &paths.ledger_path,
             author,
             &captured_snapshot,
@@ -1639,7 +1639,7 @@ where
     {
         crate::run::PlanProgress::Prepared => {
             let selected =
-                match available_planner(bursar, &captured_snapshot, &planner_candidates, None) {
+                match available_planner(musterroll, &captured_snapshot, &planner_candidates, None) {
                     Ok(selected) => selected,
                     Err(error) => {
                         run.block_plan_before_authoring()
@@ -1660,11 +1660,11 @@ where
                     "persisted plan author is outside immutable approved planner route".to_string(),
                 );
             }
-            match recheck_author(bursar, &captured_snapshot, &author) {
+            match recheck_author(musterroll, &captured_snapshot, &author) {
                 Ok(()) => author,
                 Err(current_error) => {
                     match available_planner(
-                        bursar,
+                        musterroll,
                         &captured_snapshot,
                         &planner_candidates,
                         Some(&author),
@@ -1863,7 +1863,7 @@ where
         dispatch_review_stages(
             &mut run,
             &router,
-            bursar,
+            musterroll,
             &paths.ledger_path,
             author,
             &captured_snapshot,
@@ -1884,15 +1884,15 @@ where
 fn dispatch_review_stages<C, A>(
     run: &mut crate::run::RunHandle,
     router: &crate::role_routing::RoleRouter,
-    bursar: &C,
+    musterroll: &C,
     ledger_path: &Path,
     executor: &A,
-    snapshot: &crate::bursar::RosterSnapshot,
+    snapshot: &crate::musterroll::RosterSnapshot,
     repo: &Path,
     approval: &PlanApproval,
 ) -> Result<(), String>
 where
-    C: crate::bursar::BursarClient + ?Sized,
+    C: crate::musterroll::MusterrollClient + ?Sized,
     A: PlanAuthor + ?Sized,
 {
     loop {
@@ -1914,7 +1914,7 @@ where
                 }
                 let (reviewer, degraded) = match peer {
                     Some(bound) => {
-                        if let Err(error) = recheck_author(bursar, snapshot, &bound) {
+                        if let Err(error) = recheck_author(musterroll, snapshot, &bound) {
                             run.finish_plan_blocked().map_err(|checkpoint| {
                                 format!("plan blocked after bound peer loss: {checkpoint}")
                             })?;
@@ -1925,7 +1925,7 @@ where
                     None => match select_reviewer(
                         run,
                         router,
-                        bursar,
+                        musterroll,
                         snapshot,
                         crate::run::PlanStage::PeerReview,
                         &author,
@@ -1947,7 +1947,7 @@ where
                 let attempt = start_plan_stage_invocation(
                     run,
                     router,
-                    bursar,
+                    musterroll,
                     snapshot,
                     ledger_path,
                     crate::run::PlanStage::PeerReview,
@@ -2007,7 +2007,7 @@ where
                         let repair_attempt = start_plan_stage_invocation(
                             run,
                             router,
-                            bursar,
+                            musterroll,
                             snapshot,
                             ledger_path,
                             crate::run::PlanStage::PeerReview,
@@ -2113,7 +2113,7 @@ where
                 if finish_exhausted_stage(run, crate::run::PlanStage::Planner)? {
                     return Err("plan revision attempt limit exhausted".to_string());
                 }
-                recheck_author(bursar, snapshot, &author).map_err(|error| {
+                recheck_author(musterroll, snapshot, &author).map_err(|error| {
                     let _ = run.finish_plan_blocked();
                     format!("immutable plan author is no longer eligible for revision: {error}")
                 })?;
@@ -2136,7 +2136,7 @@ where
                 let attempt = start_plan_stage_invocation(
                     run,
                     router,
-                    bursar,
+                    musterroll,
                     snapshot,
                     ledger_path,
                     crate::run::PlanStage::Planner,
@@ -2190,7 +2190,7 @@ where
                         let repair_attempt = start_plan_stage_invocation(
                             run,
                             router,
-                            bursar,
+                            musterroll,
                             snapshot,
                             ledger_path,
                             crate::run::PlanStage::Planner,
@@ -2296,7 +2296,7 @@ where
                     return Err("plan second-opinion attempt limit exhausted".to_string());
                 }
                 let reviewer = if let Some(bound) = second {
-                    if let Err(error) = recheck_author(bursar, snapshot, &bound) {
+                    if let Err(error) = recheck_author(musterroll, snapshot, &bound) {
                         run.finish_plan_blocked().map_err(|checkpoint| {
                             format!("plan blocked after bound second-opinion loss: {checkpoint}")
                         })?;
@@ -2309,7 +2309,7 @@ where
                     let (bound, _) = select_reviewer(
                         run,
                         router,
-                        bursar,
+                        musterroll,
                         snapshot,
                         crate::run::PlanStage::SecondOpinion,
                         &author,
@@ -2326,7 +2326,7 @@ where
                 let attempt = start_plan_stage_invocation(
                     run,
                     router,
-                    bursar,
+                    musterroll,
                     snapshot,
                     ledger_path,
                     crate::run::PlanStage::SecondOpinion,
@@ -2383,7 +2383,7 @@ where
                         let repair_attempt = start_plan_stage_invocation(
                             run,
                             router,
-                            bursar,
+                            musterroll,
                             snapshot,
                             ledger_path,
                             crate::run::PlanStage::SecondOpinion,
@@ -2490,7 +2490,7 @@ fn append_plan_invocation(
     kind: crate::run::EventKind,
     stage: crate::run::PlanStage,
     execution: &crate::run::ApprovedExecution,
-    profile: &crate::bursar::RosterProfile,
+    profile: &crate::musterroll::RosterProfile,
     input: &[u8],
     output: Option<&[u8]>,
     attempt: u8,
@@ -2552,7 +2552,7 @@ fn append_plan_invocation(
             verify_passed: outcome == "returned",
             complexity: complexity.to_string(),
             project: plan.target.repo.clone(),
-            notes: "conductor plan invocation".to_string(),
+            notes: "undertake plan invocation".to_string(),
             failure_reason: None,
             duration_ms: None,
         },
@@ -2582,7 +2582,7 @@ fn plan_artifact_bytes(
 
 fn peer_rubric(kind: PlanOutputKind) -> String {
     format!(
-        "Review this {} for correctness, completeness, executable acceptance criteria, and target safety. Return only strict conductor/plan-peer-review@1 JSON.",
+        "Review this {} for correctness, completeness, executable acceptance criteria, and target safety. Return only strict undertake/plan-peer-review@1 JSON.",
         kind.label()
     )
 }
@@ -2591,11 +2591,11 @@ fn peer_rubric(kind: PlanOutputKind) -> String {
     clippy::too_many_lines,
     reason = "all fail-closed review eligibility gates are deliberately visible at the bind boundary"
 )]
-fn select_reviewer<C: crate::bursar::BursarClient + ?Sized>(
+fn select_reviewer<C: crate::musterroll::MusterrollClient + ?Sized>(
     run: &mut crate::run::RunHandle,
     router: &crate::role_routing::RoleRouter,
-    bursar: &C,
-    snapshot: &crate::bursar::RosterSnapshot,
+    musterroll: &C,
+    snapshot: &crate::musterroll::RosterSnapshot,
     stage: crate::run::PlanStage,
     author: &crate::run::ApprovedExecution,
     peer: Option<&crate::run::ApprovedExecution>,
@@ -2644,7 +2644,7 @@ fn select_reviewer<C: crate::bursar::BursarClient + ?Sized>(
                     crate::run::PlanStage::SecondOpinion => false,
                 })
         })
-        .filter(|candidate| recheck_author(bursar, snapshot, candidate).is_ok())
+        .filter(|candidate| recheck_author(musterroll, snapshot, candidate).is_ok())
         .cloned()
         .collect::<Vec<_>>();
     if live.is_empty() {
@@ -2743,7 +2743,7 @@ fn select_reviewer<C: crate::bursar::BursarClient + ?Sized>(
 }
 
 fn execution_tier(
-    snapshot: &crate::bursar::RosterSnapshot,
+    snapshot: &crate::musterroll::RosterSnapshot,
     execution: &crate::run::ApprovedExecution,
 ) -> Result<u8, String> {
     let profile = snapshot
@@ -2777,9 +2777,9 @@ pub(crate) fn cancel(
         return Err("plan cancel is legal only before authoring starts".to_string());
     }
     let roster_bytes = std::fs::read(run.dir().join("roster.json"))
-        .map_err(|error| format!("captured Bursar roster: {error}"))?;
-    let snapshot = crate::bursar::parse_roster_snapshot(&roster_bytes)
-        .map_err(|error| format!("captured Bursar roster: {error}"))?;
+        .map_err(|error| format!("captured Musterroll roster: {error}"))?;
+    let snapshot = crate::musterroll::parse_roster_snapshot(&roster_bytes)
+        .map_err(|error| format!("captured Musterroll roster: {error}"))?;
     let policy = crate::role_routing::RoutingPolicy::from_config(config, &snapshot)
         .map_err(|error| format!("role policy changed: {error}"))?;
     let router =
@@ -2823,7 +2823,7 @@ fn load_approval(run: &crate::run::RunHandle) -> Result<PlanApproval, String> {
     let approval: PlanApproval =
         serde_json::from_value(run.approval().map_err(|error| error.to_string())?)
             .map_err(|error| format!("plan approval: {error}"))?;
-    if approval.schema != "conductor/plan-approval@1"
+    if approval.schema != "undertake/plan-approval@1"
         || approval.decision != "awaiting_approval"
         || approval.run_id != run.run_id()
         || !valid_identifier(&approval.approval_block_id)
@@ -2850,25 +2850,25 @@ fn approval_response(paths: &PlanJobPaths, approval: &PlanApproval) -> Result<()
     Ok(())
 }
 
-fn recheck_author<C: crate::bursar::BursarClient + ?Sized>(
-    bursar: &C,
-    captured_snapshot: &crate::bursar::RosterSnapshot,
+fn recheck_author<C: crate::musterroll::MusterrollClient + ?Sized>(
+    musterroll: &C,
+    captured_snapshot: &crate::musterroll::RosterSnapshot,
     approved: &crate::run::ApprovedExecution,
 ) -> Result<(), String> {
-    let live = bursar
+    let live = musterroll
         .roster_snapshot()
-        .map_err(|error| format!("live Bursar roster snapshot: {error}"))?;
+        .map_err(|error| format!("live Musterroll roster snapshot: {error}"))?;
     let profile = live
         .profiles
         .iter()
         .find(|profile| profile.profile_id == approved.profile_id)
-        .ok_or_else(|| "approved plan author is absent from live Bursar roster".to_string())?;
+        .ok_or_else(|| "approved plan author is absent from live Musterroll roster".to_string())?;
     let provider = live
         .providers
         .iter()
         .find(|provider| provider.provider_id == profile.provider_id)
         .ok_or_else(|| {
-            "approved plan author provider is absent from live Bursar roster".to_string()
+            "approved plan author provider is absent from live Musterroll roster".to_string()
         })?;
     if !profile.eligible
         || !provider.eligible
@@ -2876,9 +2876,9 @@ fn recheck_author<C: crate::bursar::BursarClient + ?Sized>(
     {
         return Err("approved plan author is no longer exactly eligible".to_string());
     }
-    let report = bursar
+    let report = musterroll
         .status()
-        .map_err(|error| format!("live Bursar provider status: {error}"))?;
+        .map_err(|error| format!("live Musterroll provider status: {error}"))?;
     let availability_key = captured_snapshot
         .providers
         .iter()
@@ -2894,13 +2894,13 @@ fn recheck_author<C: crate::bursar::BursarClient + ?Sized>(
                 })
         })
         .map(|provider| provider.availability_key.as_str())
-        .ok_or_else(|| "approved plan author is absent from captured Bursar roster".to_string())?;
+        .ok_or_else(|| "approved plan author is absent from captured Musterroll roster".to_string())?;
     let status = report.providers.get(availability_key).ok_or_else(|| {
-        "approved plan author provider is absent from live Bursar status".to_string()
+        "approved plan author provider is absent from live Musterroll status".to_string()
     })?;
     if !matches!(
         status.availability,
-        crate::bursar::Availability::Healthy | crate::bursar::Availability::Caution
+        crate::musterroll::Availability::Healthy | crate::musterroll::Availability::Caution
     ) {
         return Err("approved plan author provider is no longer available".to_string());
     }
@@ -2922,9 +2922,9 @@ fn planner_candidates(
     Ok(route.candidates.clone())
 }
 
-fn available_planner<C: crate::bursar::BursarClient + ?Sized>(
-    bursar: &C,
-    captured_snapshot: &crate::bursar::RosterSnapshot,
+fn available_planner<C: crate::musterroll::MusterrollClient + ?Sized>(
+    musterroll: &C,
+    captured_snapshot: &crate::musterroll::RosterSnapshot,
     candidates: &[crate::run::ApprovedExecution],
     exclude: Option<&crate::run::ApprovedExecution>,
 ) -> Result<crate::run::ApprovedExecution, String> {
@@ -2933,7 +2933,7 @@ fn available_planner<C: crate::bursar::BursarClient + ?Sized>(
         if exclude.is_some_and(|excluded| candidate == excluded) {
             continue;
         }
-        match recheck_author(bursar, captured_snapshot, candidate) {
+        match recheck_author(musterroll, captured_snapshot, candidate) {
             Ok(()) => return Ok(candidate.clone()),
             Err(error) => failures.push(format!("{}: {error}", candidate.profile_id)),
         }
@@ -2945,23 +2945,23 @@ fn available_planner<C: crate::bursar::BursarClient + ?Sized>(
 }
 
 fn profile_for_execution(
-    snapshot: &crate::bursar::RosterSnapshot,
+    snapshot: &crate::musterroll::RosterSnapshot,
     execution: &crate::run::ApprovedExecution,
-) -> Result<crate::bursar::RosterProfile, String> {
+) -> Result<crate::musterroll::RosterProfile, String> {
     let profile = snapshot
         .profiles
         .iter()
         .find(|profile| profile.profile_id == execution.profile_id)
-        .ok_or_else(|| "approved plan author is absent from captured Bursar roster".to_string())?;
+        .ok_or_else(|| "approved plan author is absent from captured Musterroll roster".to_string())?;
     let provider = snapshot
         .providers
         .iter()
         .find(|provider| provider.provider_id == profile.provider_id)
         .ok_or_else(|| {
-            "approved plan author provider is absent from captured Bursar roster".to_string()
+            "approved plan author provider is absent from captured Musterroll roster".to_string()
         })?;
     if crate::role_routing::approved_execution(profile, provider) != *execution {
-        return Err("approved plan author differs from captured Bursar execution".to_string());
+        return Err("approved plan author differs from captured Musterroll execution".to_string());
     }
     Ok(profile.clone())
 }
@@ -2973,7 +2973,7 @@ fn with_isolated_worktree<T>(
 ) -> Result<T, String> {
     let sequence = PLAN_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "conductor-plan-worktree-{}-{sequence}",
+        "undertake-plan-worktree-{}-{sequence}",
         std::process::id()
     ));
     let add = Command::new("git")
@@ -3014,7 +3014,7 @@ mod tests {
         let error = parse_document(
             PlanOutputKind::Spec,
             br#"{
-                "schema": "conductor/plan-document@1",
+                "schema": "undertake/plan-document@1",
                 "kind": "spec",
                 "title": " " ,
                 "context": "context",
@@ -3037,7 +3037,7 @@ mod tests {
     #[test]
     fn plan_document_requires_explicit_kind_and_raw_json() {
         let missing_kind = br#"{
-            "schema":"conductor/plan-document@1",
+            "schema":"undertake/plan-document@1",
             "title":"Plan",
             "context":"Context",
             "tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],
@@ -3050,7 +3050,7 @@ mod tests {
         );
 
         let fenced = br#"```json
-{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}
+{"schema":"undertake/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}
 ```"#;
         assert!(
             parse_document(PlanOutputKind::ImplementationPlan, fenced).is_err(),
@@ -3063,10 +3063,10 @@ mod tests {
         let error = parse_document(
             PlanOutputKind::ImplementationPlan,
             br#"{
-                "schema": "conductor/plan-document@1",
+                "schema": "undertake/plan-document@1",
                 "kind": "implementation-plan",
                 "title": "Route plans",
-                "context": "Conductor",
+                "context": "Undertake",
                 "tasks": [{
                     "id": "author",
                     "depends_on": ["missing"],
@@ -3085,17 +3085,17 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct FakeBursar {
-        snapshot: crate::bursar::RosterSnapshot,
-        status: crate::bursar::StatusReport,
+    struct FakeMusterroll {
+        snapshot: crate::musterroll::RosterSnapshot,
+        status: crate::musterroll::StatusReport,
     }
 
-    impl crate::bursar::BursarClient for FakeBursar {
-        fn status(&self) -> crate::bursar::Result<crate::bursar::StatusReport> {
+    impl crate::musterroll::MusterrollClient for FakeMusterroll {
+        fn status(&self) -> crate::musterroll::Result<crate::musterroll::StatusReport> {
             Ok(self.status.clone())
         }
 
-        fn roster_snapshot(&self) -> crate::bursar::Result<crate::bursar::RosterSnapshot> {
+        fn roster_snapshot(&self) -> crate::musterroll::Result<crate::musterroll::RosterSnapshot> {
             Ok(self.snapshot.clone())
         }
     }
@@ -3126,23 +3126,23 @@ mod tests {
 
         fn peer_review(&self, _request: &PlanPeerReviewRequest) -> Result<Vec<u8>, String> {
             Ok(
-                br#"{"schema":"conductor/plan-peer-review@1","verdict":"approve","findings":[]}"#
+                br#"{"schema":"undertake/plan-peer-review@1","verdict":"approve","findings":[]}"#
                     .to_vec(),
             )
         }
 
         fn second_opinion(&self, _request: &PlanSecondOpinionRequest) -> Result<Vec<u8>, String> {
-            Ok(br#"{"schema":"conductor/plan-second-opinion@1","verdict":"accept"}"#.to_vec())
+            Ok(br#"{"schema":"undertake/plan-second-opinion@1","verdict":"accept"}"#.to_vec())
         }
     }
 
-    struct StatusSwitchBursar {
-        snapshot: crate::bursar::RosterSnapshot,
-        status: std::sync::Mutex<crate::bursar::StatusReport>,
+    struct StatusSwitchMusterroll {
+        snapshot: crate::musterroll::RosterSnapshot,
+        status: std::sync::Mutex<crate::musterroll::StatusReport>,
     }
 
-    impl StatusSwitchBursar {
-        fn from_fake(fake: &FakeBursar) -> Self {
+    impl StatusSwitchMusterroll {
+        fn from_fake(fake: &FakeMusterroll) -> Self {
             Self {
                 snapshot: fake.snapshot.clone(),
                 status: std::sync::Mutex::new(fake.status.clone()),
@@ -3156,16 +3156,16 @@ mod tests {
                 .providers
                 .get_mut(provider_id)
                 .expect("provider")
-                .availability = crate::bursar::Availability::Exhausted;
+                .availability = crate::musterroll::Availability::Exhausted;
         }
     }
 
-    impl crate::bursar::BursarClient for StatusSwitchBursar {
-        fn status(&self) -> crate::bursar::Result<crate::bursar::StatusReport> {
+    impl crate::musterroll::MusterrollClient for StatusSwitchMusterroll {
+        fn status(&self) -> crate::musterroll::Result<crate::musterroll::StatusReport> {
             Ok(self.status.lock().expect("status lock").clone())
         }
 
-        fn roster_snapshot(&self) -> crate::bursar::Result<crate::bursar::RosterSnapshot> {
+        fn roster_snapshot(&self) -> crate::musterroll::Result<crate::musterroll::RosterSnapshot> {
             Ok(self.snapshot.clone())
         }
     }
@@ -3185,7 +3185,7 @@ mod tests {
         }
         fn peer_review(&self, _request: &PlanPeerReviewRequest) -> Result<Vec<u8>, String> {
             Ok(
-                br#"{"schema":"conductor/plan-peer-review@1","verdict":"approve","findings":[]}"#
+                br#"{"schema":"undertake/plan-peer-review@1","verdict":"approve","findings":[]}"#
                     .to_vec(),
             )
         }
@@ -3278,7 +3278,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "fixture constructs the exact multi-provider authoring environment"
     )]
-    fn plan_fixture(label: &str) -> (TestDir, PlanJobPaths, crate::config::Config, FakeBursar) {
+    fn plan_fixture(label: &str) -> (TestDir, PlanJobPaths, crate::config::Config, FakeMusterroll) {
         let temp = TestDir::new(label);
         let checked_at = chrono::Utc::now().to_rfc3339();
         let providers = ["anthropic", "codex", "opencode-go"]
@@ -3286,13 +3286,13 @@ mod tests {
             .map(|provider| {
                 (
                     provider.to_string(),
-                    crate::bursar::ProviderStatus {
-                        availability: crate::bursar::Availability::Healthy,
+                    crate::musterroll::ProviderStatus {
+                        availability: crate::musterroll::Availability::Healthy,
                         source: "test".to_string(),
                         checked_at: checked_at.clone(),
                         data_as_of: None,
                         expires_at: Some("2100-01-01T00:00:00Z".to_string()),
-                        windows: vec![crate::bursar::Window {
+                        windows: vec![crate::musterroll::Window {
                             label: "test".to_string(),
                             percent: Some(1.0),
                             reset_at: None,
@@ -3332,14 +3332,14 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let roster = serde_json::json!({
-            "schema": "bursar/roster@2",
+            "schema": "musterroll/roster@2",
             "generated_at": checked_at,
             "source_artifact": {"path": "/fixture/roster.toml", "sha256": "a".repeat(64)},
             "policy_sha256": "b".repeat(64),
             "providers": provider_rows,
             "profiles": profile_rows
         });
-        let snapshot = crate::bursar::parse_roster_snapshot(roster.to_string().as_bytes())
+        let snapshot = crate::musterroll::parse_roster_snapshot(roster.to_string().as_bytes())
             .expect("strict fixture roster");
         let config = crate::config::parse_str(
             r#"
@@ -3373,23 +3373,23 @@ enabled = true
             temp,
             PlanJobPaths {
                 state_dir: std::env::temp_dir().join(format!(
-                    "conductor-plan-state-{label}-{}",
+                    "undertake-plan-state-{label}-{}",
                     std::process::id()
                 )),
                 reports_home: std::env::temp_dir().join(format!(
-                    "conductor-plan-reports-{label}-{}",
+                    "undertake-plan-reports-{label}-{}",
                     std::process::id()
                 )),
                 ledger_path: std::env::temp_dir().join(format!(
-                    "conductor-plan-ledger-{label}-{}.jsonl",
+                    "undertake-plan-ledger-{label}-{}.jsonl",
                     std::process::id()
                 )),
             },
             config,
-            FakeBursar {
+            FakeMusterroll {
                 snapshot,
-                status: crate::bursar::StatusReport {
-                    schema: "bursar/status@2".to_string(),
+                status: crate::musterroll::StatusReport {
+                    schema: "musterroll/status@2".to_string(),
                     checked_at,
                     providers,
                 },
@@ -3398,14 +3398,14 @@ enabled = true
     }
     #[test]
     fn initial_policy_preflight_accepts_every_author_peer_and_spec_team_contingency() {
-        let (_temp, _paths, config, bursar) = plan_fixture("initial-policy-preflight");
+        let (_temp, _paths, config, musterroll) = plan_fixture("initial-policy-preflight");
 
-        validate_initial_policy(&config, &bursar.snapshot)
+        validate_initial_policy(&config, &musterroll.snapshot)
             .expect("three provider plan pool is valid for every author, peer, and spec team");
     }
     #[test]
     fn initial_policy_preflight_rejects_a_spec_pool_without_three_provider_contingencies() {
-        let (_temp, _paths, _config, bursar) = plan_fixture("initial-policy-two-provider");
+        let (_temp, _paths, _config, musterroll) = plan_fixture("initial-policy-two-provider");
         let two_provider_config = crate::config::parse_str(
             r#"
 [[role_binding]]
@@ -3423,7 +3423,7 @@ enabled = true
         )
         .expect("two-provider policy parses before cross-provider preflight");
 
-        let error = validate_initial_policy(&two_provider_config, &bursar.snapshot)
+        let error = validate_initial_policy(&two_provider_config, &musterroll.snapshot)
             .expect_err("spec policy needs a third provider contingency");
 
         assert!(error.contains("three-way team"), "{error}");
@@ -3434,7 +3434,7 @@ enabled = true
     impl TestDir {
         fn new(label: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "conductor-plan-test-{label}-{}-{}",
+                "undertake-plan-test-{label}-{}-{}",
                 std::process::id(),
                 chrono::Utc::now().timestamp_nanos_opt().expect("nanos")
             ));
@@ -3468,7 +3468,7 @@ enabled = true
         std::fs::create_dir_all(&repo).expect("repo");
         git(&repo, &["init"]);
         git(&repo, &["config", "user.email", "test@example.invalid"]);
-        git(&repo, &["config", "user.name", "Conductor Test"]);
+        git(&repo, &["config", "user.name", "Undertake Test"]);
         std::fs::write(repo.join("README"), "immutable").expect("input");
         git(&repo, &["add", "README"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -3491,7 +3491,7 @@ enabled = true
 
     #[test]
     fn repeated_prepare_create_plan_failures_cancel_capacity_without_rewinding_scores() {
-        let (temp, paths, config, bursar) = plan_fixture("prepare-create-failure");
+        let (temp, paths, config, musterroll) = plan_fixture("prepare-create-failure");
         let repo = initialized_repo(&temp);
         std::fs::create_dir_all(&paths.state_dir).expect("state dir");
         std::fs::write(paths.state_dir.join("runs-v2"), b"not a directory")
@@ -3502,7 +3502,7 @@ enabled = true
                 prepare(
                     &paths,
                     &config,
-                    &bursar,
+                    &musterroll,
                     implementation_request(repo.clone())
                 )
                 .is_err(),
@@ -3511,7 +3511,7 @@ enabled = true
         }
 
         std::fs::remove_file(paths.state_dir.join("runs-v2")).expect("unblock run creation");
-        let prepared = prepare(&paths, &config, &bursar, implementation_request(repo))
+        let prepared = prepare(&paths, &config, &musterroll, implementation_request(repo))
             .expect("failed preparation must not consume every profile's in-flight capacity");
         let approval = load_approval(
             &crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run"),
@@ -3525,7 +3525,7 @@ enabled = true
 
     #[test]
     fn repeated_prepare_report_write_failures_cancel_capacity_and_remove_unpublished_runs() {
-        let (temp, paths, config, bursar) = plan_fixture("prepare-report-failure");
+        let (temp, paths, config, musterroll) = plan_fixture("prepare-report-failure");
         let repo = initialized_repo(&temp);
         std::fs::create_dir_all(&paths.reports_home).expect("reports home");
         std::fs::write(paths.reports_home.join(".harness"), b"not a directory")
@@ -3536,7 +3536,7 @@ enabled = true
                 prepare(
                     &paths,
                     &config,
-                    &bursar,
+                    &musterroll,
                     implementation_request(repo.clone())
                 )
                 .is_err(),
@@ -3552,7 +3552,7 @@ enabled = true
             "a plan without its approval report is not a durable dispatchable run"
         );
         std::fs::remove_file(paths.reports_home.join(".harness")).expect("unblock report write");
-        let prepared = prepare(&paths, &config, &bursar, implementation_request(repo))
+        let prepared = prepare(&paths, &config, &musterroll, implementation_request(repo))
             .expect("failed report writes must not consume every profile's in-flight capacity");
         let approval = load_approval(
             &crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run"),
@@ -3563,11 +3563,11 @@ enabled = true
 
     #[test]
     fn restart_reconciliation_cancels_an_unlinked_reviewer_binding_without_rewinding() {
-        let (temp, paths, config, bursar) = plan_fixture("unlinked-reviewer-binding");
+        let (temp, paths, config, musterroll) = plan_fixture("unlinked-reviewer-binding");
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             implementation_request(initialized_repo(&temp)),
         )
         .expect("prepare");
@@ -3575,9 +3575,9 @@ enabled = true
         let approval = load_approval(&run).expect("approval");
         let router = crate::role_routing::RoleRouter::with_pinned_snapshot(
             &paths.state_dir,
-            crate::role_routing::RoutingPolicy::from_config(&config, &bursar.snapshot)
+            crate::role_routing::RoutingPolicy::from_config(&config, &musterroll.snapshot)
                 .expect("routing policy"),
-            bursar.snapshot.clone(),
+            musterroll.snapshot.clone(),
         )
         .expect("router");
         let reservation = router
@@ -3588,7 +3588,7 @@ enabled = true
                 approval.author,
                 None,
                 true,
-                planner_constraints(&bursar.snapshot, crate::config::Tier::Lead)
+                planner_constraints(&musterroll.snapshot, crate::config::Tier::Lead)
                     .expect("constraints"),
             )
             .expect("reservation before simulated bind crash")
@@ -3616,11 +3616,11 @@ enabled = true
 
     #[test]
     fn peer_bind_crash_retries_with_a_fresh_durable_generation() {
-        let (temp, paths, config, bursar) = plan_fixture("peer-bind-crash-retry");
+        let (temp, paths, config, musterroll) = plan_fixture("peer-bind-crash-retry");
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             implementation_request(initialized_repo(&temp)),
         )
         .expect("prepare");
@@ -3639,9 +3639,9 @@ enabled = true
         drop(run);
         let router = crate::role_routing::RoleRouter::with_pinned_snapshot(
             &paths.state_dir,
-            crate::role_routing::RoutingPolicy::from_config(&config, &bursar.snapshot)
+            crate::role_routing::RoutingPolicy::from_config(&config, &musterroll.snapshot)
                 .expect("routing policy"),
-            bursar.snapshot.clone(),
+            musterroll.snapshot.clone(),
         )
         .expect("router");
         let role = crate::role_routing::RoleId::new("plan").expect("role");
@@ -3656,14 +3656,14 @@ enabled = true
                 approval.author,
                 None,
                 true,
-                planner_constraints(&bursar.snapshot, crate::config::Tier::Lead)
+                planner_constraints(&musterroll.snapshot, crate::config::Tier::Lead)
                     .expect("constraints"),
             )
             .expect("fault-window reservation");
 
         let executor =
             ScriptedExecutor::new(Vec::new(), Vec::new(), vec![Ok(peer_approve())], Vec::new());
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor)
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor)
             .expect("restart retries after canceling the unlinked peer reservation");
 
         assert!(matches!(
@@ -3697,11 +3697,11 @@ enabled = true
         reason = "the regression constructs the exact second-opinion bind crash window"
     )]
     fn second_opinion_bind_crash_retries_with_a_fresh_durable_generation() {
-        let (temp, paths, config, bursar) = plan_fixture("second-bind-crash-retry");
+        let (temp, paths, config, musterroll) = plan_fixture("second-bind-crash-retry");
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo: initialized_repo(&temp),
                 input: PlanPrepareInput::Artifact {
@@ -3744,9 +3744,9 @@ enabled = true
         drop(run);
         let router = crate::role_routing::RoleRouter::with_pinned_snapshot(
             &paths.state_dir,
-            crate::role_routing::RoutingPolicy::from_config(&config, &bursar.snapshot)
+            crate::role_routing::RoutingPolicy::from_config(&config, &musterroll.snapshot)
                 .expect("routing policy"),
-            bursar.snapshot.clone(),
+            musterroll.snapshot.clone(),
         )
         .expect("router");
         let role = crate::role_routing::RoleId::new("plan").expect("role");
@@ -3763,7 +3763,7 @@ enabled = true
                 approval.author,
                 Some(peer),
                 true,
-                planner_constraints(&bursar.snapshot, crate::config::Tier::Lead)
+                planner_constraints(&musterroll.snapshot, crate::config::Tier::Lead)
                     .expect("constraints"),
             )
             .expect("fault-window reservation");
@@ -3773,10 +3773,10 @@ enabled = true
             Vec::new(),
             Vec::new(),
             vec![Ok(
-                br#"{"schema":"conductor/plan-second-opinion@1","verdict":"accept"}"#.to_vec(),
+                br#"{"schema":"undertake/plan-second-opinion@1","verdict":"accept"}"#.to_vec(),
             )],
         );
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor)
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor)
             .expect("restart retries after canceling the unlinked opinion reservation");
 
         assert!(matches!(
@@ -3929,17 +3929,17 @@ enabled = true
     }
 
     fn implementation_document() -> Vec<u8> {
-        br#"{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()
+        br#"{"schema":"undertake/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()
     }
 
     fn spec_document() -> Vec<u8> {
-        br#"{"schema":"conductor/plan-document@1","kind":"spec","title":"Spec","context":"Context","goals":["Goal"],"constraints":["Constraint"],"requirements":["Requirement"],"acceptance":["Acceptance"],"verification":["cargo test"],"non_goals":[],"risks":[],"assumptions":[],"open_questions":[]}"#.to_vec()
+        br#"{"schema":"undertake/plan-document@1","kind":"spec","title":"Spec","context":"Context","goals":["Goal"],"constraints":["Constraint"],"requirements":["Requirement"],"acceptance":["Acceptance"],"verification":["cargo test"],"non_goals":[],"risks":[],"assumptions":[],"open_questions":[]}"#.to_vec()
     }
     #[expect(
         clippy::too_many_lines,
         reason = "the fixture preserves the real ProviderId versus AvailabilityKey boundary"
     )]
-    fn omp_plan_fixture(label: &str) -> (TestDir, PlanJobPaths, crate::config::Config, FakeBursar) {
+    fn omp_plan_fixture(label: &str) -> (TestDir, PlanJobPaths, crate::config::Config, FakeMusterroll) {
         let temp = TestDir::new(label);
         let checked_at = chrono::Utc::now().to_rfc3339();
         let provider_rows = [
@@ -3983,25 +3983,25 @@ enabled = true
             })
             .collect::<Vec<_>>();
         let roster = serde_json::json!({
-            "schema": "bursar/roster@2",
+            "schema": "musterroll/roster@2",
             "generated_at": checked_at,
             "source_artifact": {"path": "/fixture/roster.toml", "sha256": "a".repeat(64)},
             "policy_sha256": "b".repeat(64),
             "providers": provider_rows,
             "profiles": profile_rows
         });
-        let snapshot = crate::bursar::parse_roster_snapshot(roster.to_string().as_bytes())
+        let snapshot = crate::musterroll::parse_roster_snapshot(roster.to_string().as_bytes())
             .expect("strict OMP fixture roster");
         let providers = [
-            ("codex", crate::bursar::Availability::Healthy),
-            ("anthropic", crate::bursar::Availability::Healthy),
-            ("opencode-go", crate::bursar::Availability::Healthy),
+            ("codex", crate::musterroll::Availability::Healthy),
+            ("anthropic", crate::musterroll::Availability::Healthy),
+            ("opencode-go", crate::musterroll::Availability::Healthy),
         ]
         .into_iter()
         .map(|(availability_key, availability)| {
             (
                 availability_key.to_string(),
-                crate::bursar::ProviderStatus {
+                crate::musterroll::ProviderStatus {
                     availability,
                     source: "test".to_string(),
                     checked_at: checked_at.clone(),
@@ -4040,23 +4040,23 @@ enabled = true
             temp,
             PlanJobPaths {
                 state_dir: std::env::temp_dir().join(format!(
-                    "conductor-plan-state-{label}-{}",
+                    "undertake-plan-state-{label}-{}",
                     std::process::id()
                 )),
                 reports_home: std::env::temp_dir().join(format!(
-                    "conductor-plan-reports-{label}-{}",
+                    "undertake-plan-reports-{label}-{}",
                     std::process::id()
                 )),
                 ledger_path: std::env::temp_dir().join(format!(
-                    "conductor-plan-ledger-{label}-{}.jsonl",
+                    "undertake-plan-ledger-{label}-{}.jsonl",
                     std::process::id()
                 )),
             },
             config,
-            FakeBursar {
+            FakeMusterroll {
                 snapshot,
-                status: crate::bursar::StatusReport {
-                    schema: "bursar/status@2".to_string(),
+                status: crate::musterroll::StatusReport {
+                    schema: "musterroll/status@2".to_string(),
                     checked_at,
                     providers,
                 },
@@ -4092,7 +4092,7 @@ enabled = true
     fn prepare_implementation_run(
         paths: &PlanJobPaths,
         config: &crate::config::Config,
-        bursar: &FakeBursar,
+        musterroll: &FakeMusterroll,
         repo: &Path,
         label: &str,
         max_plan_revisions: u8,
@@ -4100,7 +4100,7 @@ enabled = true
         prepare(
             paths,
             config,
-            bursar,
+            musterroll,
             PlanPrepareRequest {
                 repo: repo.to_path_buf(),
                 input: PlanPrepareInput::Artifact {
@@ -4124,28 +4124,28 @@ enabled = true
     fn fixture_router(
         paths: &PlanJobPaths,
         config: &crate::config::Config,
-        bursar: &FakeBursar,
+        musterroll: &FakeMusterroll,
     ) -> crate::role_routing::RoleRouter {
-        let policy = crate::role_routing::RoutingPolicy::from_config(config, &bursar.snapshot)
+        let policy = crate::role_routing::RoutingPolicy::from_config(config, &musterroll.snapshot)
             .expect("policy");
         crate::role_routing::RoleRouter::with_pinned_snapshot(
             &paths.state_dir,
             policy,
-            bursar.snapshot.clone(),
+            musterroll.snapshot.clone(),
         )
         .expect("router")
     }
 
     #[test]
     fn committed_before_invocation_remains_active_across_idempotent_reconciliation() {
-        let (temp, paths, _config, bursar) = plan_fixture("committed-before-invocation");
+        let (temp, paths, _config, musterroll) = plan_fixture("committed-before-invocation");
         let repo = initialized_repo(&temp);
         let config = dominant_profile_config();
-        let prepared = prepare_implementation_run(&paths, &config, &bursar, &repo, "first", 0);
+        let prepared = prepare_implementation_run(&paths, &config, &musterroll, &repo, "first", 0);
         let run =
             crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("first run");
         let approval = load_approval(&run).expect("approval");
-        let router = fixture_router(&paths, &config, &bursar);
+        let router = fixture_router(&paths, &config, &musterroll);
         let committed = router
             .commit(&approval.reservation)
             .expect("commit before call");
@@ -4163,20 +4163,20 @@ enabled = true
                 .expect("committed history"),
             committed
         );
-        let next = prepare_implementation_run(&paths, &config, &bursar, &repo, "second", 0);
+        let next = prepare_implementation_run(&paths, &config, &musterroll, &repo, "second", 0);
         assert_eq!(prepared_author(&paths, &next.run_id), "planner-b");
     }
 
     #[test]
     fn unmatched_attempt_started_remains_active_until_finish_or_stage_transition() {
-        let (temp, paths, _config, bursar) = plan_fixture("attempt-started-capacity");
+        let (temp, paths, _config, musterroll) = plan_fixture("attempt-started-capacity");
         let repo = initialized_repo(&temp);
         let config = dominant_profile_config();
-        let prepared = prepare_implementation_run(&paths, &config, &bursar, &repo, "first", 0);
+        let prepared = prepare_implementation_run(&paths, &config, &musterroll, &repo, "first", 0);
         let mut run =
             crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("first run");
         let approval = load_approval(&run).expect("approval");
-        let router = fixture_router(&paths, &config, &bursar);
+        let router = fixture_router(&paths, &config, &musterroll);
         router
             .commit(&approval.reservation)
             .expect("commit before call");
@@ -4184,7 +4184,7 @@ enabled = true
             .expect("authoring checkpoint");
         run.record_plan_author_attempt()
             .expect("attempt checkpoint");
-        let profile = profile_for_execution(&bursar.snapshot, &approval.author).expect("profile");
+        let profile = profile_for_execution(&musterroll.snapshot, &approval.author).expect("profile");
         append_plan_invocation(
             &mut run,
             &paths.ledger_path,
@@ -4200,39 +4200,39 @@ enabled = true
         .expect("started evidence");
 
         reconcile_plan_reservations(&router, &paths.state_dir).expect("reconciliation");
-        let next = prepare_implementation_run(&paths, &config, &bursar, &repo, "second", 0);
+        let next = prepare_implementation_run(&paths, &config, &musterroll, &repo, "second", 0);
         assert_eq!(prepared_author(&paths, &next.run_id), "planner-b");
     }
 
     #[test]
     fn attempt_finished_releases_capacity_before_crash_resume_stage_transition() {
-        let (temp, paths, _config, bursar) = plan_fixture("attempt-finished-capacity");
+        let (temp, paths, _config, musterroll) = plan_fixture("attempt-finished-capacity");
         let repo = initialized_repo(&temp);
         let config = dominant_profile_config();
-        let prepared = prepare_implementation_run(&paths, &config, &bursar, &repo, "first", 0);
+        let prepared = prepare_implementation_run(&paths, &config, &musterroll, &repo, "first", 0);
         approve(&paths, &prepared.run_id);
         assert!(dispatch(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             &prepared.run_id,
             &FailingAuthor(std::sync::Mutex::new(0)),
         )
         .is_err());
 
-        let router = fixture_router(&paths, &config, &bursar);
+        let router = fixture_router(&paths, &config, &musterroll);
         reconcile_plan_reservations(&router, &paths.state_dir).expect("first reconciliation");
         reconcile_plan_reservations(&router, &paths.state_dir).expect("idempotent reconciliation");
-        let next = prepare_implementation_run(&paths, &config, &bursar, &repo, "second", 0);
+        let next = prepare_implementation_run(&paths, &config, &musterroll, &repo, "second", 0);
         assert_eq!(prepared_author(&paths, &next.run_id), "planner-a");
     }
 
     #[test]
     fn terminal_rejected_owner_releases_committed_stage_capacity() {
-        let (temp, paths, _config, bursar) = plan_fixture("rejected-capacity");
+        let (temp, paths, _config, musterroll) = plan_fixture("rejected-capacity");
         let repo = initialized_repo(&temp);
         let config = dominant_profile_config();
-        let prepared = prepare_implementation_run(&paths, &config, &bursar, &repo, "first", 0);
+        let prepared = prepare_implementation_run(&paths, &config, &musterroll, &repo, "first", 0);
         approve(&paths, &prepared.run_id);
         let executor = ScriptedExecutor::new(
             vec![Ok(implementation_document())],
@@ -4240,7 +4240,7 @@ enabled = true
             vec![Ok(peer_revise())],
             vec![],
         );
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor)
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor)
             .expect("terminal rejection");
 
         let rejected =
@@ -4252,20 +4252,20 @@ enabled = true
             }
         ));
 
-        let next = prepare_implementation_run(&paths, &config, &bursar, &repo, "second", 0);
+        let next = prepare_implementation_run(&paths, &config, &musterroll, &repo, "second", 0);
         assert_eq!(prepared_author(&paths, &next.run_id), "planner-a");
     }
 
     #[test]
     fn terminal_blocked_owner_releases_committed_stage_capacity() {
-        let (temp, paths, _config, bursar) = plan_fixture("blocked-capacity");
+        let (temp, paths, _config, musterroll) = plan_fixture("blocked-capacity");
         let repo = initialized_repo(&temp);
         let config = dominant_profile_config();
-        let prepared = prepare_implementation_run(&paths, &config, &bursar, &repo, "first", 0);
+        let prepared = prepare_implementation_run(&paths, &config, &musterroll, &repo, "first", 0);
         approve(&paths, &prepared.run_id);
         let failing = FailingAuthor(std::sync::Mutex::new(0));
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &failing).is_err());
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &failing).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &failing).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &failing).is_err());
 
         let run =
             crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("blocked run");
@@ -4275,13 +4275,13 @@ enabled = true
                 verdict: crate::run::PlanTerminalVerdict::Blocked
             }
         ));
-        let next = prepare_implementation_run(&paths, &config, &bursar, &repo, "second", 0);
+        let next = prepare_implementation_run(&paths, &config, &musterroll, &repo, "second", 0);
         assert_eq!(prepared_author(&paths, &next.run_id), "planner-a");
     }
 
     #[test]
     fn sequential_terminal_plan_runs_release_committed_peer_capacity_without_rewinding_turns() {
-        let (temp, paths, _config, bursar) = plan_fixture("terminal-peer-capacity-release");
+        let (temp, paths, _config, musterroll) = plan_fixture("terminal-peer-capacity-release");
         let repo = initialized_repo(&temp);
         let config = crate::config::parse_str(
             r#"
@@ -4315,7 +4315,7 @@ enabled = true
             let prepared = prepare(
                 &paths,
                 &config,
-                &bursar,
+                &musterroll,
                 PlanPrepareRequest {
                     repo: repo.clone(),
                     input: PlanPrepareInput::Artifact {
@@ -4333,7 +4333,7 @@ enabled = true
             dispatch(
                 &paths,
                 &config,
-                &bursar,
+                &musterroll,
                 &prepared.run_id,
                 &FakeAuthor::new(vec![implementation_document()]),
             )
@@ -4366,13 +4366,13 @@ enabled = true
 
     #[test]
     fn spec_revision_resume_uses_distinct_omp_availability_key_identities() {
-        let (temp, paths, config, bursar) = omp_plan_fixture("omp-second-opinion");
+        let (temp, paths, config, musterroll) = omp_plan_fixture("omp-second-opinion");
         let repo = initialized_repo(&temp);
         let before_head = git_output(&repo, ["rev-parse", "HEAD"]).expect("head");
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo: repo.clone(),
                 input: PlanPrepareInput::Artifact {
@@ -4393,16 +4393,16 @@ enabled = true
             vec![Ok(peer_revise()), Ok(peer_approve())],
             vec![
                 Err("simulated second-opinion crash".to_string()),
-                Ok(br#"{"schema":"conductor/plan-second-opinion@1","verdict":"accept"}"#.to_vec()),
+                Ok(br#"{"schema":"undertake/plan-second-opinion@1","verdict":"accept"}"#.to_vec()),
             ],
         );
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         assert_eq!(
             status(&paths, &prepared.run_id).expect("status"),
             "awaiting_second_opinion"
         );
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor)
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor)
             .expect("resume completes the bound second opinion");
 
         assert_eq!(
@@ -4453,21 +4453,21 @@ enabled = true
     }
 
     fn peer_approve() -> Vec<u8> {
-        br#"{"schema":"conductor/plan-peer-review@1","verdict":"approve","findings":[]}"#.to_vec()
+        br#"{"schema":"undertake/plan-peer-review@1","verdict":"approve","findings":[]}"#.to_vec()
     }
 
     fn peer_revise() -> Vec<u8> {
-        br#"{"schema":"conductor/plan-peer-review@1","verdict":"revise","findings":[{"id":"F-1","severity":"high","location":"tasks.one","problem":"Missing detail","required_change":"Add the missing detail"}]}"#.to_vec()
+        br#"{"schema":"undertake/plan-peer-review@1","verdict":"revise","findings":[{"id":"F-1","severity":"high","location":"tasks.one","problem":"Missing detail","required_change":"Add the missing detail"}]}"#.to_vec()
     }
 
     #[test]
     fn prepared_plan_run_id_passes_cli_dispatch_parsing_and_dispatches() {
-        let (temp, paths, config, bursar) = plan_fixture("cli-run-id");
+        let (temp, paths, config, musterroll) = plan_fixture("cli-run-id");
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -4496,19 +4496,19 @@ enabled = true
 
         approve(&paths, &run_id);
         let author = FakeAuthor::new(vec![implementation_document()]);
-        dispatch(&paths, &config, &bursar, &run_id, &author).expect("dispatch");
+        dispatch(&paths, &config, &musterroll, &run_id, &author).expect("dispatch");
         assert_eq!(status(&paths, &run_id).expect("status"), "accepted");
     }
 
     #[test]
     fn artifact_implementation_plan_authoring_ends_at_awaiting_peer_without_repo_mutation() {
-        let (temp, paths, config, bursar) = plan_fixture("artifact");
+        let (temp, paths, config, musterroll) = plan_fixture("artifact");
         let repo = initialized_repo(&temp);
         let before = git_output(&repo, ["rev-parse", "HEAD"]).expect("head");
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo: repo.clone(),
                 input: PlanPrepareInput::Artifact {
@@ -4523,8 +4523,8 @@ enabled = true
         )
         .expect("prepare");
         approve(&paths, &prepared.run_id);
-        let author = FakeAuthor::new(vec![br#"{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()]);
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("dispatch");
+        let author = FakeAuthor::new(vec![br#"{"schema":"undertake/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()]);
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).expect("dispatch");
         assert_eq!(
             status(&paths, &prepared.run_id).expect("status"),
             "accepted"
@@ -4536,12 +4536,12 @@ enabled = true
     }
     #[test]
     fn implementation_plan_executes_required_peer_review_to_acceptance() {
-        let (temp, paths, config, bursar) = plan_fixture("implementation-peer");
+        let (temp, paths, config, musterroll) = plan_fixture("implementation-peer");
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -4556,9 +4556,9 @@ enabled = true
         )
         .expect("prepare");
         approve(&paths, &prepared.run_id);
-        let author = FakeAuthor::new(vec![br#"{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()]);
+        let author = FakeAuthor::new(vec![br#"{"schema":"undertake/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()]);
 
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("dispatch");
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).expect("dispatch");
 
         assert_eq!(
             status(&paths, &prepared.run_id).expect("status"),
@@ -4569,17 +4569,17 @@ enabled = true
 
     #[test]
     fn bead_spec_with_open_questions_terminates_needs_input_without_target_mutation() {
-        let (temp, paths, config, bursar) = plan_fixture("bead");
+        let (temp, paths, config, musterroll) = plan_fixture("bead");
         let repo = initialized_repo(&temp);
         let before = git_output(&repo, ["rev-parse", "HEAD"]).expect("head");
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo: repo.clone(),
                 input: PlanPrepareInput::Bead {
-                    bead_id: "conductor-plan-job".to_string(),
+                    bead_id: "undertake-plan-job".to_string(),
                     bytes: b"{\"title\":\"plan\"}".to_vec(),
                     tier: crate::run::PlanTier::Lead,
                     complexity: crate::run::PlanComplexity::XL,
@@ -4591,8 +4591,8 @@ enabled = true
         )
         .expect("prepare");
         approve(&paths, &prepared.run_id);
-        let author = FakeAuthor::new(vec![br#"{"schema":"conductor/plan-document@1","kind":"spec","title":"Spec","context":"Context","goals":["Goal"],"constraints":["Invariant"],"requirements":["Requirement"],"acceptance":["Acceptance"],"verification":["cargo test"],"non_goals":[],"risks":[],"assumptions":[],"open_questions":["Needs operator answer"]}"#.to_vec()]);
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("dispatch");
+        let author = FakeAuthor::new(vec![br#"{"schema":"undertake/plan-document@1","kind":"spec","title":"Spec","context":"Context","goals":["Goal"],"constraints":["Invariant"],"requirements":["Requirement"],"acceptance":["Acceptance"],"verification":["cargo test"],"non_goals":[],"risks":[],"assumptions":[],"open_questions":["Needs operator answer"]}"#.to_vec()]);
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).expect("dispatch");
         assert_eq!(
             status(&paths, &prepared.run_id).expect("status"),
             "needs_input"
@@ -4605,12 +4605,12 @@ enabled = true
     #[test]
     fn provider_loss_before_first_artifact_uses_only_approved_planner_fallback() {
         let (temp, paths, config, fake) = plan_fixture("provider-fallback");
-        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let musterroll = StatusSwitchMusterroll::from_fake(&fake);
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -4628,14 +4628,14 @@ enabled = true
         let approval = load_approval(&run).expect("approval");
         let candidates = planner_candidates(run.plan().expect("plan")).expect("route");
         assert_eq!(candidates.first(), Some(&approval.author));
-        bursar.exhaust(&approval.author.provider_id);
+        musterroll.exhaust(&approval.author.provider_id);
         approve(&paths, &prepared.run_id);
         let author = CapturingAuthor {
-            output: br#"{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec(),
+            output: br#"{"schema":"undertake/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec(),
             calls: std::sync::Mutex::new(Vec::new()),
         };
 
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("fallback dispatch");
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).expect("fallback dispatch");
 
         let calls = author.calls.lock().expect("calls");
         assert_eq!(calls.len(), 1);
@@ -4649,12 +4649,12 @@ enabled = true
 
     #[test]
     fn malformed_initial_and_repair_exhaustion_finishes_terminal_blocked_with_evidence() {
-        let (temp, paths, config, bursar) = plan_fixture("repair-attempts");
+        let (temp, paths, config, musterroll) = plan_fixture("repair-attempts");
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -4671,7 +4671,7 @@ enabled = true
         approve(&paths, &prepared.run_id);
         let author = FakeAuthor::new(vec![b"not json".to_vec(), b"still not json".to_vec()]);
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).is_err());
         assert!(
             matches!(
                 crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id)
@@ -4686,7 +4686,7 @@ enabled = true
             "schema repair exhaustion must not leave a resumable authoring manifest"
         );
         assert!(
-            dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err(),
+            dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).is_err(),
             "a terminal run must reject resume"
         );
         assert!(
@@ -4711,19 +4711,19 @@ enabled = true
 
     #[test]
     fn backend_failure_exhaustion_finishes_terminal_blocked_with_evidence() {
-        let (temp, paths, config, bursar) = plan_fixture("backend-exhaustion");
+        let (temp, paths, config, musterroll) = plan_fixture("backend-exhaustion");
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             implementation_request(initialized_repo(&temp)),
         )
         .expect("prepare");
         approve(&paths, &prepared.run_id);
         let author = FailingAuthor(std::sync::Mutex::new(0));
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).is_err());
         assert_eq!(*author.0.lock().expect("calls"), 2);
         assert!(
             matches!(
@@ -4738,7 +4738,7 @@ enabled = true
             ),
             "backend retry exhaustion must not leave a resumable authoring manifest"
         );
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).is_err());
         assert_eq!(
             *author.0.lock().expect("calls"),
             2,
@@ -4761,12 +4761,12 @@ enabled = true
 
     #[test]
     fn dispatch_without_exact_later_approval_never_calls_author() {
-        let (temp, paths, config, bursar) = plan_fixture("approval-negative");
+        let (temp, paths, config, musterroll) = plan_fixture("approval-negative");
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -4785,7 +4785,7 @@ enabled = true
             calls: std::sync::Mutex::new(Vec::new()),
         };
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).is_err());
         assert!(author.calls.lock().expect("calls").is_empty());
         assert_eq!(
             status(&paths, &prepared.run_id).expect("status"),
@@ -4796,12 +4796,12 @@ enabled = true
     #[test]
     fn provider_block_before_authorship_is_cancellable() {
         let (temp, paths, config, fake) = plan_fixture("blocked-cancel");
-        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let musterroll = StatusSwitchMusterroll::from_fake(&fake);
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -4816,7 +4816,7 @@ enabled = true
         )
         .expect("prepare");
         for provider in ["anthropic", "codex", "opencode-go"] {
-            bursar.exhaust(provider);
+            musterroll.exhaust(provider);
         }
         approve(&paths, &prepared.run_id);
         let author = CapturingAuthor {
@@ -4824,7 +4824,7 @@ enabled = true
             calls: std::sync::Mutex::new(Vec::new()),
         };
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).is_err());
         assert!(author.calls.lock().expect("calls").is_empty());
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
         cancel(&paths, &config, &prepared.run_id).expect("cancel blocked plan");
@@ -4833,12 +4833,12 @@ enabled = true
 
     #[test]
     fn cancel_is_forbidden_once_authoring_has_started() {
-        let (temp, paths, config, bursar) = plan_fixture("cancel-after-authoring");
+        let (temp, paths, config, musterroll) = plan_fixture("cancel-after-authoring");
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -4853,9 +4853,9 @@ enabled = true
         )
         .expect("prepare");
         approve(&paths, &prepared.run_id);
-        let author = FakeAuthor::new(vec![br#"{"schema":"conductor/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()]);
+        let author = FakeAuthor::new(vec![br#"{"schema":"undertake/plan-document@1","kind":"implementation-plan","title":"Plan","context":"Context","tasks":[{"id":"one","depends_on":[],"targets":[{"file":"src/x.rs","symbol":"x"}],"change":"Change","acceptance":"Accept","verify":"cargo test"}],"risks":[],"assumptions":[]}"#.to_vec()]);
 
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &author).expect("dispatch");
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).expect("dispatch");
 
         assert!(cancel(&paths, &config, &prepared.run_id).is_err());
     }
@@ -4863,12 +4863,12 @@ enabled = true
     #[test]
     fn exhausted_author_and_approved_fallbacks_after_authorship_are_terminal_and_noncancellable() {
         let (temp, paths, config, fake) = plan_fixture("started-provider-block");
-        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let musterroll = StatusSwitchMusterroll::from_fake(&fake);
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -4885,13 +4885,13 @@ enabled = true
         approve(&paths, &prepared.run_id);
         let author = FailingAuthor(std::sync::Mutex::new(0));
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).is_err());
         assert_eq!(*author.0.lock().expect("calls"), 1);
         for provider in ["anthropic", "codex", "opencode-go"] {
-            bursar.exhaust(provider);
+            musterroll.exhaust(provider);
         }
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &author).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).is_err());
         assert_eq!(
             *author.0.lock().expect("calls"),
             1,
@@ -4908,12 +4908,12 @@ enabled = true
     }
     #[test]
     fn spec_second_opinion_rejection_is_terminal_and_evidenced() {
-        let (temp, paths, config, bursar) = plan_fixture("spec-second-reject");
+        let (temp, paths, config, musterroll) = plan_fixture("spec-second-reject");
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -4933,11 +4933,11 @@ enabled = true
             Vec::new(),
             vec![Ok(peer_approve())],
             vec![Ok(
-                br#"{"schema":"conductor/plan-second-opinion@1","verdict":"reject"}"#.to_vec(),
+                br#"{"schema":"undertake/plan-second-opinion@1","verdict":"reject"}"#.to_vec(),
             )],
         );
 
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor)
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor)
             .expect("strict second opinion executes");
 
         assert_eq!(
@@ -4962,12 +4962,12 @@ enabled = true
 
     #[test]
     fn revision_reuses_immutable_author_and_peer_then_exhausts_at_authorized_limit() {
-        let (temp, paths, config, bursar) = plan_fixture("same-author-peer");
+        let (temp, paths, config, musterroll) = plan_fixture("same-author-peer");
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -4989,7 +4989,7 @@ enabled = true
             Vec::new(),
         );
 
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).expect("revision flow");
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).expect("revision flow");
 
         assert_eq!(
             status(&paths, &prepared.run_id).expect("status"),
@@ -5011,12 +5011,12 @@ enabled = true
         assert_ne!(calls[0].1.execution_key, calls[1].1.execution_key);
         drop(calls);
 
-        let (temp, paths, config, bursar) = plan_fixture("revision-exhaustion");
+        let (temp, paths, config, musterroll) = plan_fixture("revision-exhaustion");
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -5037,7 +5037,7 @@ enabled = true
             vec![Ok(peer_revise())],
             Vec::new(),
         );
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &exhausted)
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &exhausted)
             .expect("exhaustion is a terminal completed review");
         assert_eq!(
             status(&paths, &prepared.run_id).expect("status"),
@@ -5062,12 +5062,12 @@ enabled = true
     )]
     fn malformed_peer_repair_and_crash_resume_use_only_pinned_candidates() {
         let (temp, paths, config, fake) = plan_fixture("peer-repair-resume");
-        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let musterroll = StatusSwitchMusterroll::from_fake(&fake);
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -5089,7 +5089,7 @@ enabled = true
             Vec::new(),
         );
 
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &repaired)
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &repaired)
             .expect("one persisted peer schema repair");
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         assert_eq!(run.plan().expect("plan").stage_attempts.peer_review, 2);
@@ -5100,12 +5100,12 @@ enabled = true
         assert_malformed_peer_repair_ledger(&paths);
 
         let (temp, paths, config, fake) = plan_fixture("peer-resume-degraded");
-        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let musterroll = StatusSwitchMusterroll::from_fake(&fake);
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -5126,7 +5126,7 @@ enabled = true
             vec![Err("simulated peer crash".to_string()), Ok(peer_approve())],
             Vec::new(),
         );
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &resumed).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &resumed).is_err());
         let failed_rows = std::fs::read_to_string(&paths.ledger_path)
             .expect("ledger after failed backend invocation")
             .lines()
@@ -5147,7 +5147,7 @@ enabled = true
             } => peer.clone(),
             other => panic!("peer crash must persist one bound reviewer, got {other:?}"),
         };
-        let snapshot = crate::bursar::parse_roster_snapshot(
+        let snapshot = crate::musterroll::parse_roster_snapshot(
             &std::fs::read(run.dir().join("roster.json")).expect("captured roster"),
         )
         .expect("captured roster");
@@ -5175,7 +5175,7 @@ enabled = true
             })
         ));
 
-        dispatch(&paths, &config, &bursar, &prepared.run_id, &resumed)
+        dispatch(&paths, &config, &musterroll, &prepared.run_id, &resumed)
             .expect("resume must use the durable peer binding");
         assert_eq!(
             status(&paths, &prepared.run_id).expect("status"),
@@ -5196,12 +5196,12 @@ enabled = true
     #[test]
     fn bound_peer_loss_after_crash_is_terminal_and_nonresumable() {
         let (temp, paths, config, fake) = plan_fixture("bound-peer-loss-after-crash");
-        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let musterroll = StatusSwitchMusterroll::from_fake(&fake);
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -5223,22 +5223,22 @@ enabled = true
             Vec::new(),
         );
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         assert!(matches!(
             run.plan().expect("plan").progress,
             crate::run::PlanProgress::AwaitingPeer { peer: Some(_), .. }
         ));
         for provider in ["anthropic", "codex", "opencode-go"] {
-            bursar.exhaust(provider);
+            musterroll.exhaust(provider);
         }
         let calls_before = executor.calls.lock().expect("calls").len();
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
         let events = crate::run::read_events(&run.events_path()).expect("events");
         assert!(matches!(
@@ -5268,12 +5268,12 @@ enabled = true
     #[test]
     fn second_opinion_loss_after_binding_is_terminal_and_nonresumable() {
         let (temp, paths, config, fake) = plan_fixture("unbound-second-exhaustion");
-        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let musterroll = StatusSwitchMusterroll::from_fake(&fake);
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo,
                 input: PlanPrepareInput::Artifact {
@@ -5295,21 +5295,21 @@ enabled = true
             vec![Err("simulated unbound second-opinion crash".to_string())],
         );
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         assert!(matches!(
             run.plan().expect("plan").progress,
             crate::run::PlanProgress::AwaitingSecondOpinion { .. }
         ));
         for provider in ["anthropic", "codex", "opencode-go"] {
-            bursar.exhaust(provider);
+            musterroll.exhaust(provider);
         }
         let calls_before = executor.calls.lock().expect("calls").len();
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         assert!(matches!(
@@ -5341,11 +5341,11 @@ enabled = true
     #[test]
     fn bound_revision_author_loss_is_terminal_and_nonresumable() {
         let (temp, paths, config, fake) = plan_fixture("bound-revision-loss");
-        let bursar = StatusSwitchBursar::from_fake(&fake);
+        let musterroll = StatusSwitchMusterroll::from_fake(&fake);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             implementation_request(initialized_repo(&temp)),
         )
         .expect("prepare");
@@ -5380,15 +5380,15 @@ enabled = true
             .expect("peer findings");
         run.record_plan_peer_verdict(peer, crate::run::PeerVerdict::Revise, false)
             .expect("revision state");
-        bursar.exhaust(&approval.author.provider_id);
+        musterroll.exhaust(&approval.author.provider_id);
         drop(run);
         let executor = ScriptedExecutor::new(Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let calls_before = executor.calls.lock().expect("calls").len();
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls_before);
         let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         assert!(matches!(
@@ -5405,11 +5405,11 @@ enabled = true
 
     #[test]
     fn bound_peer_backend_exhaustion_after_revision_is_terminal_and_nonresumable() {
-        let (temp, paths, config, bursar) = plan_fixture("bound-peer-exhaustion");
+        let (temp, paths, config, musterroll) = plan_fixture("bound-peer-exhaustion");
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             implementation_request(initialized_repo(&temp)),
         )
         .expect("prepare");
@@ -5424,10 +5424,10 @@ enabled = true
             Vec::new(),
         );
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         let calls = executor.calls.lock().expect("calls").len();
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls);
         assert_eq!(
             plan_ledger_rows(&paths.ledger_path)
@@ -5445,11 +5445,11 @@ enabled = true
 
     #[test]
     fn peer_backend_attempt_exhaustion_is_terminal_and_nonresumable() {
-        let (temp, paths, config, bursar) = plan_fixture("peer-backend-exhaustion");
+        let (temp, paths, config, musterroll) = plan_fixture("peer-backend-exhaustion");
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             implementation_request(initialized_repo(&temp)),
         )
         .expect("prepare");
@@ -5464,11 +5464,11 @@ enabled = true
             Vec::new(),
         );
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         let calls = executor.calls.lock().expect("calls").len();
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls);
         let rows = plan_ledger_rows(&paths.ledger_path);
         assert_eq!(
@@ -5492,11 +5492,11 @@ enabled = true
 
     #[test]
     fn peer_double_malformed_repair_is_terminal_and_nonresumable() {
-        let (temp, paths, config, bursar) = plan_fixture("peer-malformed-exhaustion");
+        let (temp, paths, config, musterroll) = plan_fixture("peer-malformed-exhaustion");
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             implementation_request(initialized_repo(&temp)),
         )
         .expect("prepare");
@@ -5511,10 +5511,10 @@ enabled = true
             Vec::new(),
         );
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         let calls = executor.calls.lock().expect("calls").len();
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls);
         assert_eq!(
             plan_ledger_rows(&paths.ledger_path)
@@ -5527,11 +5527,11 @@ enabled = true
 
     #[test]
     fn second_opinion_backend_attempt_exhaustion_is_terminal_and_nonresumable() {
-        let (temp, paths, config, bursar) = plan_fixture("second-backend-exhaustion");
+        let (temp, paths, config, musterroll) = plan_fixture("second-backend-exhaustion");
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo: initialized_repo(&temp),
                 input: PlanPrepareInput::Artifact {
@@ -5556,11 +5556,11 @@ enabled = true
             ],
         );
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         let calls = executor.calls.lock().expect("calls").len();
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls);
         let rows = plan_ledger_rows(&paths.ledger_path);
         assert_eq!(
@@ -5589,11 +5589,11 @@ enabled = true
 
     #[test]
     fn second_opinion_double_malformed_repair_is_terminal_and_nonresumable() {
-        let (temp, paths, config, bursar) = plan_fixture("second-malformed-exhaustion");
+        let (temp, paths, config, musterroll) = plan_fixture("second-malformed-exhaustion");
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             PlanPrepareRequest {
                 repo: initialized_repo(&temp),
                 input: PlanPrepareInput::Artifact {
@@ -5618,10 +5618,10 @@ enabled = true
             ],
         );
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         let calls = executor.calls.lock().expect("calls").len();
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls);
         assert_eq!(
             plan_ledger_rows(&paths.ledger_path)
@@ -5641,11 +5641,11 @@ enabled = true
         revision: Result<Vec<u8>, String>,
         expected_outcome: &str,
     ) {
-        let (temp, paths, config, bursar) = plan_fixture(label);
+        let (temp, paths, config, musterroll) = plan_fixture(label);
         let prepared = prepare(
             &paths,
             &config,
-            &bursar,
+            &musterroll,
             implementation_request(initialized_repo(&temp)),
         )
         .expect("prepare");
@@ -5657,10 +5657,10 @@ enabled = true
             Vec::new(),
         );
 
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         let calls = executor.calls.lock().expect("calls").len();
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
-        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &executor).is_err());
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &executor).is_err());
         assert_eq!(executor.calls.lock().expect("calls").len(), calls);
         assert_eq!(
             plan_ledger_rows(&paths.ledger_path)

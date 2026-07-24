@@ -14,7 +14,7 @@ use std::{collections::BTreeMap, collections::HashSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::bursar::{self, Availability, BudgetAction, BudgetDecision};
+use crate::musterroll::{self, Availability, BudgetAction, BudgetDecision};
 use crate::config::{
     AdversarialReviewConfig, Backend, Ceiling, Cost, Efficiency, ReasoningEffort, RosterEntry, Tier,
 };
@@ -25,9 +25,9 @@ use crate::ledger::{self, AdversarialLedgerRow, LedgerRow};
 const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
 const MAX_REVIEW_ID_BYTES: usize = 128;
 const ARTIFACT_FILE: &str = "artifact.bin";
-const REVIEW_PLAN_SCHEMA: &str = "conductor-adversarial-plan-v1";
-const PROVIDER_SNAPSHOT_SCHEMA: &str = "conductor-adversarial-provider-snapshot-v1";
-const LIFECYCLE_SCHEMA: &str = "conductor-adversarial-lifecycle-v1";
+const REVIEW_PLAN_SCHEMA: &str = "undertake-adversarial-plan-v1";
+const PROVIDER_SNAPSHOT_SCHEMA: &str = "undertake-adversarial-provider-snapshot-v1";
+const LIFECYCLE_SCHEMA: &str = "undertake-adversarial-lifecycle-v1";
 const APPROVAL_BLOCK_PREFIX: &str = "adversarial-review-approval";
 const REPAIR_RETRIES: u32 = 1;
 
@@ -406,7 +406,7 @@ pub(crate) fn plan_panel(
     let mut audit = Vec::with_capacity(roster.len() + config.judge_fallbacks.len() + 1);
     let mut eligible = Vec::new();
     for (roster_index, entry) in roster.iter().enumerate() {
-        let provider = bursar::normalize_provider_key(&entry.provider);
+        let provider = musterroll::normalize_provider_key(&entry.provider);
         let (decision, reasons) = reviewer_eligibility(entry, &provider, provider_snapshot);
         let availability = decision.map_or_else(|| "unknown".to_string(), decision_availability);
         if reasons.is_empty() {
@@ -543,7 +543,7 @@ fn select_explicit_reviewers<'a>(
                     "explicit reviewer does not satisfy tier, data, or provider gates: {model}"
                 ))
             })?;
-        let provider = bursar::normalize_provider_key(&candidate.entry.provider);
+        let provider = musterroll::normalize_provider_key(&candidate.entry.provider);
         if !providers.insert(provider.clone()) {
             return Err(AdversarialError::new(format!(
                 "explicit reviewers do not use distinct providers: {provider}"
@@ -569,7 +569,7 @@ fn select_automatic_reviewers<'a>(
     let mut groups: BTreeMap<String, Vec<EligibleCandidate<'a>>> = BTreeMap::new();
     for candidate in eligible {
         groups
-            .entry(bursar::normalize_provider_key(&candidate.entry.provider))
+            .entry(musterroll::normalize_provider_key(&candidate.entry.provider))
             .or_default()
             .push(*candidate);
     }
@@ -610,11 +610,11 @@ fn build_reviewer_slots<'a>(
         .iter()
         .enumerate()
         .map(|(index, primary)| {
-            let provider = bursar::normalize_provider_key(&primary.entry.provider);
+            let provider = musterroll::normalize_provider_key(&primary.entry.provider);
             let mut alternatives = eligible
                 .iter()
                 .filter(|candidate| {
-                    bursar::normalize_provider_key(&candidate.entry.provider) == provider
+                    musterroll::normalize_provider_key(&candidate.entry.provider) == provider
                         && candidate.entry.name != primary.entry.name
                         && !same_dispatch_identity(candidate.entry, primary.entry)
                 })
@@ -655,7 +655,7 @@ fn select_judge(
         let mut reasons = Vec::new();
         let entry = roster.iter().find(|entry| entry.name == *name);
         let provider = entry.map_or_else(String::new, |entry| {
-            bursar::normalize_provider_key(&entry.provider)
+            musterroll::normalize_provider_key(&entry.provider)
         });
         let decision = provider_snapshot.get(&provider);
         match entry {
@@ -731,7 +731,7 @@ fn select_judge(
     Ok((
         JudgeSlot {
             model: selected.name.clone(),
-            provider: bursar::normalize_provider_key(&selected.provider),
+            provider: musterroll::normalize_provider_key(&selected.provider),
             fallbacks,
         },
         audit,
@@ -1248,9 +1248,9 @@ fn select_rechecked_judge<'a>(
             .ok_or_else(|| {
                 AdversarialError::new(format!("approved judge is absent from roster: {name}"))
             })?;
-        let provider = bursar::normalize_provider_key(&entry.provider);
+        let provider = musterroll::normalize_provider_key(&entry.provider);
         if kind == JudgeAttemptKind::Primary
-            && provider != bursar::normalize_provider_key(&plan.panel.judge.provider)
+            && provider != musterroll::normalize_provider_key(&plan.panel.judge.provider)
         {
             return Err(AdversarialError::new(
                 "approved primary judge provider binding changed",
@@ -1267,7 +1267,7 @@ fn select_rechecked_judge<'a>(
         }
         let decision = provider_snapshot.get(&provider);
         let eligible = decision.is_some_and(|decision| {
-            bursar::normalize_provider_key(&decision.provider) == provider
+            musterroll::normalize_provider_key(&decision.provider) == provider
                 && decision_is_eligible(decision)
         });
         if eligible {
@@ -1488,7 +1488,7 @@ fn append_reviewer_ledger_rows(
                 attempt.duration_ms,
             ),
             review_id: plan.review_id.clone(),
-            provider: bursar::normalize_provider_key(&entry.provider),
+            provider: musterroll::normalize_provider_key(&entry.provider),
             attempt_kind: attempt_kind.to_string(),
             reviewer_id: Some(reviewer_id),
             schema_valid,
@@ -1524,7 +1524,7 @@ fn append_judge_ledger_row(
             attempt.duration_ms,
         ),
         review_id: plan.review_id.clone(),
-        provider: bursar::normalize_provider_key(&judge.provider),
+        provider: musterroll::normalize_provider_key(&judge.provider),
         attempt_kind: attempt_kind.to_string(),
         reviewer_id: None,
         schema_valid,
@@ -1569,7 +1569,7 @@ fn adversarial_base_ledger_row(
         task: plan.review_id.clone(),
         verify_passed: schema_valid,
         complexity: "L".to_string(),
-        project: "conductor".to_string(),
+        project: "undertake".to_string(),
         notes,
         failure_reason,
         duration_ms: Some(duration_ms),
@@ -2088,7 +2088,7 @@ fn reviewer_chain<'a>(
     let names = std::iter::once(&slot.model)
         .chain(slot.alternatives.iter())
         .collect::<Vec<_>>();
-    let expected_provider = bursar::normalize_provider_key(&slot.provider);
+    let expected_provider = musterroll::normalize_provider_key(&slot.provider);
     if expected_provider.is_empty() {
         return Err(AdversarialError::new(
             "approved reviewer has an empty provider",
@@ -2104,7 +2104,7 @@ fn reviewer_chain<'a>(
                     "approved reviewer model is absent from roster: {name}"
                 ))
             })?;
-        if bursar::normalize_provider_key(&entry.provider) != expected_provider {
+        if musterroll::normalize_provider_key(&entry.provider) != expected_provider {
             return Err(AdversarialError::new(format!(
                 "approved reviewer fallback leaves provider envelope: {name}"
             )));
@@ -2623,13 +2623,13 @@ fn provider_evidence(
 ) -> Result<BTreeMap<String, ProviderEvidence>> {
     let mut evidence = BTreeMap::new();
     for (snapshot_key, decision) in provider_snapshot {
-        let provider = bursar::normalize_provider_key(&decision.provider);
+        let provider = musterroll::normalize_provider_key(&decision.provider);
         if provider.is_empty() {
             return Err(AdversarialError::new(
                 "provider snapshot contains an empty normalized provider key",
             ));
         }
-        if bursar::normalize_provider_key(snapshot_key) != provider {
+        if musterroll::normalize_provider_key(snapshot_key) != provider {
             return Err(AdversarialError::new(format!(
                 "provider snapshot key {snapshot_key:?} does not match decision provider {:?}",
                 decision.provider
@@ -3157,7 +3157,7 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bursar::Availability;
+    use crate::musterroll::Availability;
     use crate::config::{Backend, Ceiling};
     use crate::deck::{CommandDeckValidator, DeckValidator};
     use sha2::{Digest, Sha256};
@@ -4573,9 +4573,9 @@ mod tests {
                     Availability::Exhausted | Availability::Unknown => BudgetAction::Defer,
                 };
                 (
-                    bursar::normalize_provider_key(provider),
+                    musterroll::normalize_provider_key(provider),
                     BudgetDecision {
-                        provider: bursar::normalize_provider_key(provider),
+                        provider: musterroll::normalize_provider_key(provider),
                         model: None,
                         availability: Some(*availability),
                         source: Some("test".to_string()),
@@ -5088,7 +5088,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir()
-                .join(format!("conductor-{label}-{}-{nanos}", std::process::id()));
+                .join(format!("undertake-{label}-{}-{nanos}", std::process::id()));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }

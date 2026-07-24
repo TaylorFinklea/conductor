@@ -1,6 +1,6 @@
 # Model Scorecard — Test Fixture (Ceiling Mismatch)
 
-This scorecard has a different ceiling for sonnet-5 than conductor.toml.
+This scorecard has a different ceiling for sonnet-5 than undertake.toml.
 
 ## Live Roster
 

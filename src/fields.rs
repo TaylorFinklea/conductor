@@ -1,6 +1,6 @@
 //! routing-field extraction: metadata first, notes-prose fallback (pure)
 //!
-//! Pinned rules (conductor-v1-spec, "Routing-field extraction"):
+//! Pinned rules (undertake-v1-spec, "Routing-field extraction"):
 //! 1. Prefer bd metadata keys: `tier_floor` ∈ {`lead`,`senior`,`junior`},
 //!    `complexity` ∈ {`S`,`M`,`L`,`XL`}, `verify_cmd` = exact shell command.
 //! 2. Fallback: scan notes for `tier_floor:\s*(lead|senior|junior)` and
@@ -25,7 +25,7 @@ use crate::config::{Ceiling, Tier};
 /// Routing fields extracted from a bead: `tier_floor` and `complexity` are
 /// always present when `Triage::Triaged`; `verify_cmd` is optional (a missing
 /// `verify_cmd` flags the item for triage downstream but does not make it
-/// Untriaged — see conductor-v1-spec invariant 3). `trains_ok` is an item-level
+/// Untriaged — see undertake-v1-spec invariant 3). `trains_ok` is an item-level
 /// opt-in that lifts the `FreeTrainsInput` repo-policy gate (bead metadata
 /// `data_policy: trains-ok` — e.g. a public-dataset task on a proprietary
 /// repo).

@@ -1,4 +1,4 @@
-//! conductor.toml load + validation (incl. roster) and `config check` preflight.
+//! undertake.toml load + validation (incl. roster) and `config check` preflight.
 
 // The config surface (structs, enums, HARDCODED_EXCLUDE) is built ahead of its
 // consumers in scan/triage/dispatch/verify (milestones M1+); silence dead-code
@@ -287,7 +287,7 @@ pub(crate) struct RosterEntry {
     /// and rejected for other backends so dispatch cannot silently ignore it.
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     /// Provider/account identity for legacy static rows. V2 routing consumes
-    /// Bursar's independently validated provider identity instead.
+    /// Musterroll's independently validated provider identity instead.
     pub(crate) provider: String,
     /// Cost axis — `paid` (default) | `free` | `free-trains-input`. Gates
     /// per-repo eligibility; orthogonal to `Tier`.
@@ -299,21 +299,21 @@ pub(crate) struct RosterEntry {
     pub(crate) fallback: Vec<String>,
 }
 
-/// Conductor-owned retry order for a Bursar execution profile. Bursar owns
+/// Undertake-owned retry order for a Musterroll execution profile. Musterroll owns
 /// profile capability and availability; this policy only decides which
-/// eligible profile Conductor tries next after a classified runtime failure.
+/// eligible profile Undertake tries next after a classified runtime failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JobFallbackPolicy {
     pub(crate) profile_id: String,
     pub(crate) fallback_profile_ids: Vec<String>,
 }
 
-/// Closed native job bindings. Each row names only Bursar v2 profile IDs and
+/// Closed native job bindings. Each row names only Musterroll v2 profile IDs and
 /// structural policy; it does not define a workflow, plugin, or fleet scan.
 pub(crate) type NativeJobConfig = JobBinding;
 
-/// One enabled Conductor-owned profile weight for an opaque capability role.
-/// Bursar supplies the profile's facts; this configuration owns selection.
+/// One enabled Undertake-owned profile weight for an opaque capability role.
+/// Musterroll supplies the profile's facts; this configuration owns selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoleBindingConfig {
     pub(crate) role: String,
@@ -341,7 +341,7 @@ pub(crate) struct Budgets {
     pub(crate) max_dispatches_per_cycle: u32,
     pub(crate) max_active_per_repo: u32,
     pub(crate) max_external_dispatches: u32,
-    pub(crate) use_bursar: bool,
+    pub(crate) use_musterroll: bool,
     pub(crate) unknown_429_cooldown_mins: u32,
     pub(crate) item_wall_clock_mins: u32,
     /// Upper bound for plan peer-requested revisions; the CLI may choose a
@@ -367,7 +367,7 @@ impl Default for Budgets {
             max_dispatches_per_cycle: 8,
             max_active_per_repo: 1,
             max_external_dispatches: 4,
-            use_bursar: true,
+            use_musterroll: true,
             unknown_429_cooldown_mins: 15,
             item_wall_clock_mins: 45,
             max_plan_revisions: 1,
@@ -408,8 +408,8 @@ impl Default for ReviewConfig {
     }
 }
 
-/// Auto-dispatch ceiling for the ratchet mechanism (conductor-v1-spec §
-/// Ratchet + ADR 2026-07-03 on `conductor-m6`).
+/// Auto-dispatch ceiling for the ratchet mechanism (undertake-v1-spec §
+/// Ratchet + ADR 2026-07-03 on `undertake-m6`).
 ///
 /// The MECHANISM auto-dispatches when `tier_floor ∈ {senior, junior}` AND
 /// `complexity ≤ M` AND a runnable `verify_cmd` exists AND the repo has
@@ -465,18 +465,18 @@ pub(crate) struct Config {
     pub(crate) budgets: Budgets,
     pub(crate) verify: VerifyConfig,
     pub(crate) review: ReviewConfig,
-    /// Auto-dispatch ceiling for the ratchet (conductor-m6). Defaults to
+    /// Auto-dispatch ceiling for the ratchet (undertake-m6). Defaults to
     /// the month-1 narrow posture (junior / S) — see `RatchetCeiling`.
     pub(crate) ratchet: RatchetCeiling,
     pub(crate) adversarial_review: AdversarialReviewConfig,
     pub(crate) roster: Vec<RosterEntry>,
-    /// Runtime retry policy keyed by Bursar profile IDs. This remains static
-    /// Conductor policy and is resolved against each Bursar snapshot.
+    /// Runtime retry policy keyed by Musterroll profile IDs. This remains static
+    /// Undertake policy and is resolved against each Musterroll snapshot.
     pub(crate) job_fallbacks: Vec<JobFallbackPolicy>,
     /// Native v2 job configuration. An omitted registry remains unactivated;
     /// a present registry must be a complete closed set.
     pub(crate) jobs: Vec<NativeJobConfig>,
-    /// Conductor-owned enabled role/profile weights. Empty means role routing
+    /// Undertake-owned enabled role/profile weights. Empty means role routing
     /// is not configured and any caller must fail closed.
     pub(crate) role_bindings: Vec<RoleBindingConfig>,
     /// Per-repo `[[repo_policy]]` entries; absent repos default to
@@ -1010,7 +1010,7 @@ fn parse_adversarial_review(
         ));
     }
 
-    // Production configuration deliberately carries no roster rows: Bursar
+    // Production configuration deliberately carries no roster rows: Musterroll
     // supplies the authoritative profile snapshot at launch. Keep validation
     // for explicitly supplied legacy rows, while deferring profile resolution
     // for the snapshot-backed path.
@@ -1085,8 +1085,8 @@ fn parse_budgets(node: Option<&Node>) -> Result<Budgets> {
             "max_external_dispatches" => {
                 b.max_external_dispatches = expect_u32("budgets.max_external_dispatches", val)?;
             }
-            "use_bursar" => {
-                b.use_bursar = expect_bool("budgets.use_bursar", val)?;
+            "use_musterroll" => {
+                b.use_musterroll = expect_bool("budgets.use_musterroll", val)?;
             }
             "unknown_429_cooldown" => {
                 b.unknown_429_cooldown_mins = expect_u32("budgets.unknown_429_cooldown", val)?;
@@ -1663,7 +1663,7 @@ fn expect_bool(loc: &str, node: &Node) -> Result<bool> {
 }
 
 // ---------------------------------------------------------------------------
-// Preflight (`conductor config check`)
+// Preflight (`undertake config check`)
 // ---------------------------------------------------------------------------
 
 const PATH_TOOLS: &[&str] = &[
@@ -1677,7 +1677,7 @@ const PATH_TOOLS: &[&str] = &[
     "orchestra",
     "bun",
     "harness-deck",
-    "bursar",
+    "musterroll",
 ];
 
 #[derive(Debug, Clone)]
@@ -1719,7 +1719,7 @@ pub(crate) fn preflight_checks(path_var: &str, state_dir: Option<&Path>) -> Vec<
         None => checks.push(PreflightCheck {
             name: "state dir".to_string(),
             ok: false,
-            message: "HOME not set; cannot locate ~/.local/state/conductor".to_string(),
+            message: "HOME not set; cannot locate ~/.local/state/undertake".to_string(),
         }),
     }
     match state_dir {
@@ -1782,7 +1782,7 @@ fn is_executable(path: &Path) -> bool {
 
 fn check_state_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let probe = dir.join("conductor-preflight-probe");
+    let probe = dir.join("undertake-preflight-probe");
     std::fs::write(&probe, b"")?;
     std::fs::remove_file(&probe)?;
     Ok(())
@@ -1874,7 +1874,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let d = std::env::temp_dir().join(format!("conductor-test-{label}-{nanos}"));
+            let d = std::env::temp_dir().join(format!("undertake-test-{label}-{nanos}"));
             std::fs::create_dir_all(&d).expect("mkdir");
             TempDir(d)
         }
@@ -1909,14 +1909,14 @@ mod tests {
     // --- the checked-in config ---
 
     #[test]
-    #[ignore = "Bursar owns the live roster after conductor-bursar-roster cutover"]
+    #[ignore = "Musterroll owns the live roster after undertake-musterroll-roster cutover"]
     #[expect(
         clippy::too_many_lines,
         reason = "checked-in roster fixture intentionally asserts many fields inline"
     )]
     fn checked_in_config_parses_and_has_phase2_roster_entries() {
-        let cfg = parse_str(include_str!("../conductor.toml"))
-            .expect("checked-in conductor.toml must parse");
+        let cfg = parse_str(include_str!("../undertake.toml"))
+            .expect("checked-in undertake.toml must parse");
         assert_eq!(cfg.roster.len(), 24);
         // spec's exact roster table, in order.
         assert_eq!(cfg.roster[0].name, "sonnet-5");
@@ -2102,7 +2102,7 @@ mod tests {
         assert_eq!(cfg.budgets.max_dispatches_per_cycle, 8);
         assert_eq!(cfg.budgets.max_active_per_repo, 1);
         assert_eq!(cfg.budgets.max_external_dispatches, 4);
-        assert!(cfg.budgets.use_bursar);
+        assert!(cfg.budgets.use_musterroll);
         assert_eq!(cfg.budgets.unknown_429_cooldown_mins, 15);
         assert_eq!(cfg.budgets.item_wall_clock_mins, 45);
         assert_eq!(cfg.budgets.cycle_wall_clock_mins, 90);
@@ -2118,16 +2118,16 @@ mod tests {
             ["gpt-5.6-terra", "opus-4.8"]
         );
         // ratchet: month-1 default-narrow posture (ADR 2026-07-03) since
-        // the checked-in conductor.toml does not set [ratchet].
+        // the checked-in undertake.toml does not set [ratchet].
         assert_eq!(cfg.ratchet.max_tier_floor, Tier::Junior);
         assert_eq!(cfg.ratchet.max_complexity, Ceiling::S);
         assert_eq!(cfg.ratchet.clean_cycles_to_unlock, 3);
     }
 
     #[test]
-    fn checked_in_config_defers_profile_ownership_to_bursar() {
-        let cfg = parse_str(include_str!("../conductor.toml"))
-            .expect("checked-in conductor.toml must parse");
+    fn checked_in_config_defers_profile_ownership_to_musterroll() {
+        let cfg = parse_str(include_str!("../undertake.toml"))
+            .expect("checked-in undertake.toml must parse");
         assert!(cfg.roster.is_empty());
         let plan_bindings: Vec<(&str, u32)> = cfg
             .role_bindings
@@ -2177,7 +2177,7 @@ exclude = [\"chezmoi-config\", \"scratch\"]
 max_dispatches_per_cycle = 3
 max_active_per_repo = 2
 max_external_dispatches = 1
-use_bursar = false
+use_musterroll = false
 unknown_429_cooldown = 30
 item_wall_clock_mins = 20
 cycle_wall_clock_mins = 60
@@ -2215,7 +2215,7 @@ dispatch_id = \"claude-sonnet-5\"
         assert_eq!(cfg.budgets.max_dispatches_per_cycle, 3);
         assert_eq!(cfg.budgets.max_active_per_repo, 2);
         assert_eq!(cfg.budgets.max_external_dispatches, 1);
-        assert!(!cfg.budgets.use_bursar);
+        assert!(!cfg.budgets.use_musterroll);
         assert_eq!(cfg.budgets.unknown_429_cooldown_mins, 30);
         assert_eq!(cfg.budgets.item_wall_clock_mins, 20);
         assert_eq!(cfg.budgets.cycle_wall_clock_mins, 60);
@@ -2239,7 +2239,7 @@ dispatch_id = \"claude-sonnet-5\"
         assert_eq!(cfg.budgets.max_dispatches_per_cycle, 8);
         assert_eq!(cfg.budgets.max_active_per_repo, 1);
         assert_eq!(cfg.budgets.max_external_dispatches, 4);
-        assert!(cfg.budgets.use_bursar);
+        assert!(cfg.budgets.use_musterroll);
         assert_eq!(cfg.budgets.unknown_429_cooldown_mins, 15);
         assert_eq!(cfg.budgets.item_wall_clock_mins, 45);
         assert_eq!(cfg.budgets.cycle_wall_clock_mins, 90);
@@ -2608,7 +2608,7 @@ dispatch_id = "provider/senior"
         assert!(HARDCODED_EXCLUDE.contains(&"chezmoi-personal"));
     }
 
-    // --- ratchet ceiling (conductor-m6) ---
+    // --- ratchet ceiling (undertake-m6) ---
 
     #[test]
     fn ratchet_default_is_narrow_month1_posture() {
@@ -2658,7 +2658,7 @@ clean_cycles_to_unlock = 3
         assert!(!check(&checks, "orchestra").ok);
         assert!(!check(&checks, "bun").ok);
         assert!(!check(&checks, "harness-deck").ok);
-        assert!(!check(&checks, "bursar").ok);
+        assert!(!check(&checks, "musterroll").ok);
         assert!(check(&checks, "state dir").ok);
     }
 
@@ -2675,7 +2675,7 @@ clean_cycles_to_unlock = 3
         let parent = TempDir::new("blocked");
         let blocker = parent.path().join("blocker");
         std::fs::write(&blocker, b"").expect("write");
-        let target = blocker.join("conductor");
+        let target = blocker.join("undertake");
         let checks = preflight_checks("", Some(&target));
         assert!(!check(&checks, "state dir").ok);
     }

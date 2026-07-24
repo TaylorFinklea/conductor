@@ -1,6 +1,6 @@
 # Model Scorecard — Test Fixture (Agreement)
 
-This scorecard matches conductor.toml exactly.
+This scorecard matches undertake.toml exactly.
 
 ## Live Roster
 

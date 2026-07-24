@@ -1,6 +1,6 @@
 //! Read-only legacy scorecard parser retained for a bounded compatibility
-//! window. It is intentionally disconnected from Conductor's CLI and launch
-//! path: Bursar's `bursar/roster@1` snapshot is the sole roster authority.
+//! window. It is intentionally disconnected from Undertake's CLI and launch
+//! path: Musterroll's `musterroll/roster@1` snapshot is the sole roster authority.
 //! Never auto-edits either input.
 
 #![allow(dead_code)]
@@ -80,9 +80,9 @@ pub(crate) struct DriftItem {
 /// The kind of roster drift detected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DriftKind {
-    /// Model is in the scorecard but not in `conductor.toml`.
+    /// Model is in the scorecard but not in `undertake.toml`.
     MissingFromConfig,
-    /// Model is in `conductor.toml` but not in the scorecard.
+    /// Model is in `undertake.toml` but not in the scorecard.
     ExtraInConfig,
     /// Tier differs between scorecard and config.
     TierMismatch,
@@ -402,7 +402,7 @@ pub(crate) fn diff(
                 kind: DriftKind::MissingFromConfig,
                 model: entry.model.clone(),
                 detail: format!(
-                    "in scorecard but not in conductor.toml (tier: {}, ceiling: {})",
+                    "in scorecard but not in undertake.toml (tier: {}, ceiling: {})",
                     entry.tier, entry.ceiling
                 ),
             });
@@ -416,7 +416,7 @@ pub(crate) fn diff(
             report.items.push(DriftItem {
                 kind: DriftKind::ExtraInConfig,
                 model: entry.name.clone(),
-                detail: "in conductor.toml but not in scorecard".to_string(),
+                detail: "in undertake.toml but not in scorecard".to_string(),
             });
         }
     }
@@ -499,7 +499,7 @@ pub(crate) fn diff(
 /// Prints the drift report to stdout.
 pub(crate) fn print_report(report: &DriftReport) {
     if report.items.is_empty() {
-        println!("roster drift: none — scorecard and conductor.toml agree");
+        println!("roster drift: none — scorecard and undertake.toml agree");
         return;
     }
     println!(
@@ -938,15 +938,15 @@ Just some prose, no table at all.
         );
     }
 
-    fn load_conductor_config() -> config::Config {
-        config::parse_str(include_str!("../conductor.toml")).expect("conductor.toml must parse")
+    fn load_undertake_config() -> config::Config {
+        config::parse_str(include_str!("../undertake.toml")).expect("undertake.toml must parse")
     }
 
     #[test]
-    #[ignore = "legacy scorecard parser is disconnected after Bursar roster cutover"]
+    #[ignore = "legacy scorecard parser is disconnected after Musterroll roster cutover"]
     fn roster_drift_diff_fixture_agreement_against_real_config() {
         let entries = parse_scorecard(&load_fixture("scorecard-agreement.md")).unwrap();
-        let cfg = load_conductor_config();
+        let cfg = load_undertake_config();
         let report = diff(&entries, &cfg.roster);
         assert!(
             !report.has_drift(),
@@ -956,10 +956,10 @@ Just some prose, no table at all.
     }
 
     #[test]
-    #[ignore = "legacy scorecard parser is disconnected after Bursar roster cutover"]
+    #[ignore = "legacy scorecard parser is disconnected after Musterroll roster cutover"]
     fn roster_drift_diff_fixture_missing_from_config_against_real_config() {
         let entries = parse_scorecard(&load_fixture("scorecard-missing-from-config.md")).unwrap();
-        let cfg = load_conductor_config();
+        let cfg = load_undertake_config();
         let report = diff(&entries, &cfg.roster);
         let missing: Vec<_> = report
             .items
@@ -971,10 +971,10 @@ Just some prose, no table at all.
     }
 
     #[test]
-    #[ignore = "legacy scorecard parser is disconnected after Bursar roster cutover"]
+    #[ignore = "legacy scorecard parser is disconnected after Musterroll roster cutover"]
     fn roster_drift_diff_fixture_extra_in_config_against_real_config() {
         let entries = parse_scorecard(&load_fixture("scorecard-extra-in-config.md")).unwrap();
-        let cfg = load_conductor_config();
+        let cfg = load_undertake_config();
         let report = diff(&entries, &cfg.roster);
         let extra: Vec<_> = report
             .items
@@ -986,10 +986,10 @@ Just some prose, no table at all.
     }
 
     #[test]
-    #[ignore = "legacy scorecard parser is disconnected after Bursar roster cutover"]
+    #[ignore = "legacy scorecard parser is disconnected after Musterroll roster cutover"]
     fn roster_drift_diff_fixture_tier_mismatch_against_real_config() {
         let entries = parse_scorecard(&load_fixture("scorecard-tier-mismatch.md")).unwrap();
-        let cfg = load_conductor_config();
+        let cfg = load_undertake_config();
         let report = diff(&entries, &cfg.roster);
         let mismatches: Vec<_> = report
             .items
@@ -1001,10 +1001,10 @@ Just some prose, no table at all.
     }
 
     #[test]
-    #[ignore = "legacy scorecard parser is disconnected after Bursar roster cutover"]
+    #[ignore = "legacy scorecard parser is disconnected after Musterroll roster cutover"]
     fn roster_drift_diff_fixture_ceiling_mismatch_against_real_config() {
         let entries = parse_scorecard(&load_fixture("scorecard-ceiling-mismatch.md")).unwrap();
-        let cfg = load_conductor_config();
+        let cfg = load_undertake_config();
         let report = diff(&entries, &cfg.roster);
         let mismatches: Vec<_> = report
             .items

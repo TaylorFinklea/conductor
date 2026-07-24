@@ -4,7 +4,7 @@
 
 ## Vision
 
-Conductor: a single Rust binary that runs autonomous work-routing cycles over the ~24 beads-tracked repos under `~/git` — scan → triage → plan → approval → dispatch → verify → report — composing bd, pi/agy/claude, orchestra, and harness-deck over subprocess/file contracts. Spec: `phases/conductor-v1-spec.md`.
+Undertake: a single Rust binary that runs autonomous work-routing cycles over the ~24 beads-tracked repos under `~/git` — scan → triage → plan → approval → dispatch → verify → report — composing bd, pi/agy/claude, orchestra, and harness-deck over subprocess/file contracts. Historical v1 spec: `phases/conductor-v1-spec.md`.
 
 ## Now / Next / Later
 
@@ -28,15 +28,14 @@ Conductor: a single Rust binary that runs autonomous work-routing cycles over th
   `runs-v2/` is isolated from inert legacy history. Arena is removed.
   Canonical contract: Guildhall `conductor-core-consolidation-spec.md`.
 - [x] **Rebrand cutover `harness-conductor` → `conductor` — COMPLETE** (2026-07-12). In-repo refs + chezmoi-personal source (`f95115b`); GitHub repo + backlog repo renamed (`backlog-conductor` resolves); dir moved; `chezmoi apply` published to live HOME (verified zero stale refs across `~/AGENTS.md`, `ralph`, scorecard digest, all skill copies); formerly-unmanaged `~/.agents/skills/conductor-arena` is now chezmoi-managed (chezmoi-personal `2c46d98`, mirrors the `dot_claude` copy). `conductor config check` passes against `~/git/conductor/conductor.toml`. Old path-keyed session dir (`-Users-tfinklea-git-harness-conductor`) held only 2 transcripts, no memory — not migrated.
-- [ ] `cargo test` has 1 pre-existing env failure: `deck::tests::generated_sample_report_passes_harness_deck_validate` shells `Command::new("harness-deck")`, which is not on PATH (237/238 pass). Fails on a clean tree at `0c801d3` too — unrelated to the rebrand. Either install `harness-deck` or gate the test on the binary being present.
-- [ ] Cycle 1 COMPLETE (9 beads closed: m0a, m0b, m1a, m1b, m2a, m2b, prompt, bdro, rev1); `cargo test` passes 84 tests. Live ready queue (`bd ready`, 6 items): `conductor-m4a`/`conductor-m3a` (P1), `conductor-agy`/`conductor-m1c`/`conductor-m0c` (P2), `conductor-cov1` (P3). Routing fields are in bd metadata; every bead's Verify is its `verify_cmd`.
+- [ ] Cycle 1 COMPLETE (9 beads closed: m0a, m0b, m1a, m1b, m2a, m2b, prompt, bdro, rev1); `cargo test` passes 84 tests. Live ready queue (`bd ready`, 6 items): `undertake-m4a`/`undertake-m3a` (P1), `undertake-agy`/`undertake-m1c`/`undertake-m0c` (P2), `undertake-cov1` (P3). Routing fields are in bd metadata; every bead's Verify is its `verify_cmd`.
 
 ### Next
-- [ ] M3 dry-run cycle has a human-verify tail (report renders on dashboard) — see `conductor-m3b` notes. `conductor-guildhall-dogfood` (lead, v1 integration proof) is now bd-blocked on `conductor-m3b` and carries its own human-verify tail (dry-run over 3+ real repos + dashboard spot-check; verify_cmd alone under-covers).
+- [ ] M3 dry-run cycle has a human-verify tail (report renders on dashboard) — see `undertake-m3b` notes. `undertake-guildhall-dogfood` (lead, v1 integration proof) is now bd-blocked on `undertake-m3b` and carries its own human-verify tail (dry-run over 3+ real repos + dashboard spot-check; verify_cmd alone under-covers).
 
 ### Later
-- [ ] M3 dry-run cycle → M4 dispatch+verify (m4a→m4b→m4c) → `conductor-review` → M5 triage backfill → M6 ratchet. `conductor-review` bumped P2→P1 and now GATES v1-done (user decision 2026-07-02, ADR in guildhall decisions.md); still bd-blocked on m4c + m4b.
-- [ ] `conductor-warden` set to deferred (self-labeled v1.5; not in the v1-done clause) — un-defer after conductor-m4c + warden m3/m4/m6.
+- [ ] M3 dry-run cycle → M4 dispatch+verify (m4a→m4b→m4c) → `undertake-review` → M5 triage backfill → M6 ratchet. `undertake-review` bumped P2→P1 and now GATES v1-done (user decision 2026-07-02, ADR in guildhall decisions.md); still bd-blocked on m4c + m4b.
+- [ ] `undertake-cautionlight` set to deferred (self-labeled v1.5; not in the v1-done clause) — un-defer after undertake-m4c + cautionlight m3/m4/m6.
 - [ ] Post-v1 spikes: bd swarm/gate/mol evaluation; hermes-voice notification channel; SSE response push
 
 ## Milestones
