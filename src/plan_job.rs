@@ -836,18 +836,16 @@ pub(crate) fn prepare<C: crate::bursar::BursarClient + ?Sized>(
     }
 }
 
-/// Reconciles reservation capacity against fully readable plan manifests before
-/// any new planner or reviewer selection. Planner reservations stay pending
-/// until approval; a reviewer binding already persisted in a manifest is
-/// promoted to committed so a crash cannot consume capacity indefinitely.
+/// Reconciles historical reservations against readable run and invocation
+/// evidence before any new capacity selection. Unknown committed rows remain
+/// fail-closed; known completed stages release capacity without changing their
+/// committed state, score evidence, or sequence.
 fn reconcile_plan_reservations(
     router: &crate::role_routing::RoleRouter,
     state_dir: &Path,
 ) -> Result<(), String> {
     let role = crate::role_routing::RoleId::new("plan").map_err(|error| error.to_string())?;
-    let mut planner_links = Vec::new();
-    let mut peer_links = Vec::new();
-    let mut second_links = Vec::new();
+    let mut owners = Vec::new();
     let entries = match std::fs::read_dir(crate::run::runs_dir(state_dir)) {
         Ok(entries) => entries,
         Err(error)
@@ -875,107 +873,232 @@ fn reconcile_plan_reservations(
         let Ok(run) = crate::run::RunHandle::open(state_dir, &run_id) else {
             continue;
         };
-        let Ok(plan) = run.plan() else {
+        let Ok(plan) = run.plan().cloned() else {
             continue;
         };
-        planner_links.push(
-            crate::role_routing::RunId::new(run.run_id().to_string())
+        let Ok(events) = crate::run::read_events(&run.events_path()) else {
+            continue;
+        };
+        owners.push(PlanReservationOwner {
+            run_id: crate::role_routing::RunId::new(run.run_id().to_string())
                 .map_err(|error| format!("plan reservation reconciliation: {error}"))?,
-        );
-        if let crate::run::PlanProgress::AwaitingPeer {
-            peer: Some(_),
-            peer_binding_run_id,
-            ..
-        } = &plan.progress
-        {
-            peer_links.push(
-                peer_binding_run_id
-                    .as_deref()
-                    .map(|binding| {
-                        crate::role_routing::RunId::new(binding.to_string())
-                            .map_err(|error| format!("plan reservation reconciliation: {error}"))
-                    })
-                    .transpose()?
-                    .unwrap_or(reviewer_binding_run_id(
-                        run.run_id(),
-                        crate::role_routing::PlanStage::PeerReview,
-                    )?),
-            );
-        }
-        if let crate::run::PlanProgress::AwaitingSecondOpinion {
-            second: Some(_),
-            second_binding_run_id,
-            ..
-        } = &plan.progress
-        {
-            second_links.push(
-                second_binding_run_id
-                    .as_deref()
-                    .map(|binding| {
-                        crate::role_routing::RunId::new(binding.to_string())
-                            .map_err(|error| format!("plan reservation reconciliation: {error}"))
-                    })
-                    .transpose()?
-                    .unwrap_or(reviewer_binding_run_id(
-                        run.run_id(),
-                        crate::role_routing::PlanStage::SecondOpinion,
-                    )?),
-            );
-        }
+            plan,
+            events,
+        });
     }
-    reconcile_reservation_stage(
-        router,
-        &role,
+    for stage in [
         crate::role_routing::PlanStage::Planner,
-        &planner_links,
-        false,
-    )?;
-    reconcile_reservation_stage(
-        router,
-        &role,
         crate::role_routing::PlanStage::PeerReview,
-        &peer_links,
-        true,
-    )?;
-    reconcile_reservation_stage(
-        router,
-        &role,
         crate::role_routing::PlanStage::SecondOpinion,
-        &second_links,
-        true,
-    )
+    ] {
+        reconcile_reservation_stage(router, &role, stage, &owners)?;
+    }
+    Ok(())
+}
+
+struct PlanReservationOwner {
+    run_id: crate::role_routing::RunId,
+    plan: crate::run::PlanRunDetails,
+    events: Vec<crate::run::RunEvent>,
 }
 
 fn reconcile_reservation_stage(
     router: &crate::role_routing::RoleRouter,
     role: &crate::role_routing::RoleId,
     stage: crate::role_routing::PlanStage,
-    linked: &[crate::role_routing::RunId],
-    commit_bound: bool,
+    owners: &[PlanReservationOwner],
 ) -> Result<(), String> {
-    router
-        .reconcile_orphans(role, stage, linked)
+    let reservations = router
+        .reservations(role, stage)
         .map_err(|error| format!("plan reservation reconciliation: {error}"))?;
-    if !commit_bound {
-        return Ok(());
-    }
-    for run_id in linked {
-        let Some(reservation) = router
-            .reservation(role, stage, run_id)
-            .map_err(|error| format!("plan reservation reconciliation: {error}"))?
-        else {
+    let mut release = Vec::new();
+    let mut activate = Vec::new();
+    for reservation in reservations {
+        let owner = owners
+            .iter()
+            .find(|owner| reservation_belongs_to_owner(&reservation, owner, stage));
+        let Some(owner) = owner else {
+            if matches!(
+                reservation.state,
+                crate::role_routing::ReservationState::PendingApproval
+            ) {
+                router
+                    .cancel(&reservation)
+                    .map_err(|error| format!("plan reservation reconciliation: {error}"))?;
+            }
             continue;
         };
-        if matches!(
-            reservation.state,
+        let active = reservation_capacity_is_active(&reservation, owner, stage);
+        match reservation.state {
             crate::role_routing::ReservationState::PendingApproval
-        ) {
-            router
-                .commit(&reservation)
-                .map_err(|error| format!("plan reviewer reservation reconciliation: {error}"))?;
+                if matches!(stage, crate::role_routing::PlanStage::Planner) =>
+            {
+                if !active {
+                    router
+                        .cancel(&reservation)
+                        .map_err(|error| format!("plan reservation reconciliation: {error}"))?;
+                }
+            }
+            crate::role_routing::ReservationState::PendingApproval => {
+                if reviewer_reservation_was_bound(&reservation, owner, stage) {
+                    let committed = router.commit(&reservation).map_err(|error| {
+                        format!("plan reviewer reservation reconciliation: {error}")
+                    })?;
+                    if active {
+                        activate.push(committed);
+                    } else {
+                        release.push(committed);
+                    }
+                } else {
+                    router
+                        .cancel(&reservation)
+                        .map_err(|error| format!("plan reservation reconciliation: {error}"))?;
+                }
+            }
+            crate::role_routing::ReservationState::Committed => {
+                if active {
+                    activate.push(reservation);
+                } else {
+                    release.push(reservation);
+                }
+            }
+            crate::role_routing::ReservationState::Canceled => {}
         }
     }
+    for reservation in release {
+        router
+            .release_capacity(&reservation)
+            .map_err(|error| format!("plan reservation reconciliation: {error}"))?;
+    }
+    for reservation in activate {
+        router
+            .activate_capacity(&reservation, 1)
+            .map_err(|error| format!("plan reservation reconciliation: {error}"))?;
+    }
     Ok(())
+}
+
+fn reservation_belongs_to_owner(
+    reservation: &crate::role_routing::Reservation,
+    owner: &PlanReservationOwner,
+    stage: crate::role_routing::PlanStage,
+) -> bool {
+    match stage {
+        crate::role_routing::PlanStage::Planner => reservation.run_id == owner.run_id,
+        crate::role_routing::PlanStage::PeerReview
+        | crate::role_routing::PlanStage::SecondOpinion => reviewer_binding_belongs_to_owner(
+            reservation.run_id.as_str(),
+            owner.run_id.as_str(),
+            stage,
+        ),
+    }
+}
+
+fn reviewer_binding_belongs_to_owner(
+    reservation_run_id: &str,
+    owner_run_id: &str,
+    stage: crate::role_routing::PlanStage,
+) -> bool {
+    let label = match stage {
+        crate::role_routing::PlanStage::Planner => return false,
+        crate::role_routing::PlanStage::PeerReview => "peer-review",
+        crate::role_routing::PlanStage::SecondOpinion => "second-opinion",
+    };
+    let base = format!("{owner_run_id}-{label}-bind");
+    reservation_run_id == base
+        || reservation_run_id
+            .strip_prefix(&format!("{base}-retry-"))
+            .and_then(|generation| generation.parse::<u64>().ok())
+            .is_some()
+}
+
+fn reservation_capacity_is_active(
+    reservation: &crate::role_routing::Reservation,
+    owner: &PlanReservationOwner,
+    stage: crate::role_routing::PlanStage,
+) -> bool {
+    if !reservation_is_current_stage(reservation, owner, stage) {
+        return false;
+    }
+    !matches!(
+        owner
+            .events
+            .iter()
+            .rev()
+            .find(|event| {
+                event
+                    .plan_invocation
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.stage == stage)
+            })
+            .map(|event| event.kind),
+        Some(crate::run::EventKind::AttemptFinished)
+    )
+}
+
+fn reservation_is_current_stage(
+    reservation: &crate::role_routing::Reservation,
+    owner: &PlanReservationOwner,
+    stage: crate::role_routing::PlanStage,
+) -> bool {
+    match (stage, &owner.plan.progress) {
+        (
+            crate::role_routing::PlanStage::Planner,
+            crate::run::PlanProgress::Prepared
+            | crate::run::PlanProgress::Authoring { .. }
+            | crate::run::PlanProgress::Revising { .. }
+            | crate::run::PlanProgress::Blocked { cancellable: true },
+        ) => true,
+        (
+            crate::role_routing::PlanStage::PeerReview,
+            crate::run::PlanProgress::AwaitingPeer {
+                peer: Some(_),
+                peer_binding_run_id,
+                ..
+            },
+        ) => peer_binding_run_id.as_deref().map_or_else(
+            || {
+                reviewer_binding_belongs_to_owner(
+                    reservation.run_id.as_str(),
+                    owner.run_id.as_str(),
+                    stage,
+                )
+            },
+            |bound| bound == reservation.run_id.as_str(),
+        ),
+        (
+            crate::role_routing::PlanStage::SecondOpinion,
+            crate::run::PlanProgress::AwaitingSecondOpinion {
+                second: Some(_),
+                second_binding_run_id,
+                ..
+            },
+        ) => second_binding_run_id.as_deref().map_or_else(
+            || {
+                reviewer_binding_belongs_to_owner(
+                    reservation.run_id.as_str(),
+                    owner.run_id.as_str(),
+                    stage,
+                )
+            },
+            |bound| bound == reservation.run_id.as_str(),
+        ),
+        _ => false,
+    }
+}
+
+fn reviewer_reservation_was_bound(
+    reservation: &crate::role_routing::Reservation,
+    owner: &PlanReservationOwner,
+    stage: crate::role_routing::PlanStage,
+) -> bool {
+    reservation_is_current_stage(reservation, owner, stage)
+        || owner.events.iter().any(|event| {
+            event
+                .plan_invocation
+                .as_ref()
+                .is_some_and(|evidence| evidence.stage == stage)
+        })
 }
 
 fn reviewer_binding_run_id(
@@ -1299,6 +1422,59 @@ fn finish_exhausted_stage(
         .map_err(|error| format!("plan blocked checkpoint: {error}"))?;
     Ok(true)
 }
+fn activate_plan_stage_capacity(
+    router: &crate::role_routing::RoleRouter,
+    run: &crate::run::RunHandle,
+    stage: crate::run::PlanStage,
+) -> Result<(), String> {
+    let role = crate::role_routing::RoleId::new("plan").map_err(|error| error.to_string())?;
+    let plan = run.plan().map_err(|error| error.to_string())?;
+    let reservation_run_id = match (stage, &plan.progress) {
+        (crate::run::PlanStage::Planner, _) => {
+            crate::role_routing::RunId::new(run.run_id().to_string())
+                .map_err(|error| error.to_string())?
+        }
+        (
+            crate::run::PlanStage::PeerReview,
+            crate::run::PlanProgress::AwaitingPeer {
+                peer_binding_run_id,
+                ..
+            },
+        ) => peer_binding_run_id
+            .as_deref()
+            .map(|run_id| crate::role_routing::RunId::new(run_id.to_string()))
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(reviewer_binding_run_id(
+                run.run_id(),
+                crate::run::PlanStage::PeerReview,
+            )?),
+        (
+            crate::run::PlanStage::SecondOpinion,
+            crate::run::PlanProgress::AwaitingSecondOpinion {
+                second_binding_run_id,
+                ..
+            },
+        ) => second_binding_run_id
+            .as_deref()
+            .map(|run_id| crate::role_routing::RunId::new(run_id.to_string()))
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(reviewer_binding_run_id(
+                run.run_id(),
+                crate::run::PlanStage::SecondOpinion,
+            )?),
+        _ => return Err("plan stage has no durable scheduler binding".to_string()),
+    };
+    let reservation = router
+        .reservation(&role, stage, &reservation_run_id)
+        .map_err(|error| format!("plan stage reservation: {error}"))?
+        .ok_or_else(|| "plan stage reservation is missing".to_string())?;
+    router
+        .activate_capacity(&reservation, 1)
+        .map_err(|error| format!("plan stage capacity: {error}"))?;
+    Ok(())
+}
 
 /// Checks every no-call precondition before persisting the crash/resume
 /// invocation boundary. If an already-persisted boundary is at capacity,
@@ -1309,6 +1485,7 @@ fn finish_exhausted_stage(
 )]
 fn start_plan_stage_invocation<C: crate::bursar::BursarClient + ?Sized>(
     run: &mut crate::run::RunHandle,
+    router: &crate::role_routing::RoleRouter,
     bursar: &C,
     snapshot: &crate::bursar::RosterSnapshot,
     ledger_path: &Path,
@@ -1318,8 +1495,9 @@ fn start_plan_stage_invocation<C: crate::bursar::BursarClient + ?Sized>(
     input: &[u8],
 ) -> Result<u8, String> {
     if let Err(error) = recheck_author(bursar, snapshot, execution) {
-        run.finish_plan_blocked()
-            .map_err(|checkpoint| format!("plan blocked after no-call eligibility loss: {checkpoint}"))?;
+        run.finish_plan_blocked().map_err(|checkpoint| {
+            format!("plan blocked after no-call eligibility loss: {checkpoint}")
+        })?;
         return Err(format!(
             "plan {} execution is no longer eligible: {error}",
             plan_stage_label(stage)
@@ -1331,6 +1509,7 @@ fn start_plan_stage_invocation<C: crate::bursar::BursarClient + ?Sized>(
             plan_stage_label(stage)
         ));
     }
+    activate_plan_stage_capacity(router, run, stage)?;
     let attempt = match run.record_plan_stage_attempt(stage) {
         Ok(attempt) => attempt,
         Err(error) => {
@@ -1340,10 +1519,7 @@ fn start_plan_stage_invocation<C: crate::bursar::BursarClient + ?Sized>(
                     plan_stage_label(stage)
                 ));
             }
-            return Err(format!(
-                "plan {} attempt: {error}",
-                plan_stage_label(stage)
-            ));
+            return Err(format!("plan {} attempt: {error}", plan_stage_label(stage)));
         }
     };
     if let Err(error) = append_plan_invocation(
@@ -1518,6 +1694,7 @@ where
         _ => return Err("plan dispatch state is not resumable authoring".to_string()),
     };
     let profile = profile_for_execution(&captured_snapshot, &selected)?;
+    activate_plan_stage_capacity(&router, &run, crate::run::PlanStage::Planner)?;
     run.record_plan_author_attempt()
         .map_err(|error| format!("plan author attempt: {error}"))?;
     let author_attempt = run
@@ -1579,6 +1756,7 @@ where
                 author_attempt,
                 "malformed",
             )?;
+            activate_plan_stage_capacity(&router, &run, crate::run::PlanStage::Planner)?;
             run.record_plan_author_attempt()
                 .map_err(|error| format!("plan author repair attempt: {error}"))?;
             let repair_attempt = run
@@ -1768,6 +1946,7 @@ where
                 let canonical_plan = plan_artifact_bytes(run, &artifact)?;
                 let attempt = start_plan_stage_invocation(
                     run,
+                    router,
                     bursar,
                     snapshot,
                     ledger_path,
@@ -1827,6 +2006,7 @@ where
                         )?;
                         let repair_attempt = start_plan_stage_invocation(
                             run,
+                            router,
                             bursar,
                             snapshot,
                             ledger_path,
@@ -1955,6 +2135,7 @@ where
                 }
                 let attempt = start_plan_stage_invocation(
                     run,
+                    router,
                     bursar,
                     snapshot,
                     ledger_path,
@@ -2008,6 +2189,7 @@ where
                         )?;
                         let repair_attempt = start_plan_stage_invocation(
                             run,
+                            router,
                             bursar,
                             snapshot,
                             ledger_path,
@@ -2143,6 +2325,7 @@ where
                 let canonical_plan = plan_artifact_bytes(run, &artifact)?;
                 let attempt = start_plan_stage_invocation(
                     run,
+                    router,
                     bursar,
                     snapshot,
                     ledger_path,
@@ -2199,6 +2382,7 @@ where
                         )?;
                         let repair_attempt = start_plan_stage_invocation(
                             run,
+                            router,
                             bursar,
                             snapshot,
                             ledger_path,
@@ -2985,7 +3169,6 @@ mod tests {
             Ok(self.snapshot.clone())
         }
     }
-
 
     struct CapturingAuthor {
         output: Vec<u8>,
@@ -3881,6 +4064,306 @@ enabled = true
         )
     }
 
+    fn dominant_profile_config() -> crate::config::Config {
+        crate::config::parse_str(
+            r#"
+[[role_binding]]
+role = "plan"
+profile_id = "planner-a"
+weight = 100
+enabled = true
+
+[[role_binding]]
+role = "plan"
+profile_id = "planner-b"
+weight = 1
+enabled = true
+
+[[role_binding]]
+role = "plan"
+profile_id = "planner-c"
+weight = 1
+enabled = true
+"#,
+        )
+        .expect("dominant-profile scheduler policy")
+    }
+
+    fn prepare_implementation_run(
+        paths: &PlanJobPaths,
+        config: &crate::config::Config,
+        bursar: &FakeBursar,
+        repo: &Path,
+        label: &str,
+        max_plan_revisions: u8,
+    ) -> PreparedPlan {
+        prepare(
+            paths,
+            config,
+            bursar,
+            PlanPrepareRequest {
+                repo: repo.to_path_buf(),
+                input: PlanPrepareInput::Artifact {
+                    bytes: label.as_bytes().to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare implementation plan")
+    }
+
+    fn prepared_author(paths: &PlanJobPaths, run_id: &str) -> String {
+        let run = crate::run::RunHandle::open(&paths.state_dir, run_id).expect("run");
+        load_approval(&run).expect("approval").author.profile_id
+    }
+
+    fn fixture_router(
+        paths: &PlanJobPaths,
+        config: &crate::config::Config,
+        bursar: &FakeBursar,
+    ) -> crate::role_routing::RoleRouter {
+        let policy = crate::role_routing::RoutingPolicy::from_config(config, &bursar.snapshot)
+            .expect("policy");
+        crate::role_routing::RoleRouter::with_pinned_snapshot(
+            &paths.state_dir,
+            policy,
+            bursar.snapshot.clone(),
+        )
+        .expect("router")
+    }
+
+    #[test]
+    fn committed_before_invocation_remains_active_across_idempotent_reconciliation() {
+        let (temp, paths, _config, bursar) = plan_fixture("committed-before-invocation");
+        let repo = initialized_repo(&temp);
+        let config = dominant_profile_config();
+        let prepared = prepare_implementation_run(&paths, &config, &bursar, &repo, "first", 0);
+        let run =
+            crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("first run");
+        let approval = load_approval(&run).expect("approval");
+        let router = fixture_router(&paths, &config, &bursar);
+        let committed = router
+            .commit(&approval.reservation)
+            .expect("commit before call");
+
+        reconcile_plan_reservations(&router, &paths.state_dir).expect("first reconciliation");
+        reconcile_plan_reservations(&router, &paths.state_dir).expect("second reconciliation");
+        assert_eq!(
+            router
+                .reservation(
+                    &crate::role_routing::RoleId::new("plan").expect("role"),
+                    crate::run::PlanStage::Planner,
+                    &committed.run_id,
+                )
+                .expect("reservation")
+                .expect("committed history"),
+            committed
+        );
+        let next = prepare_implementation_run(&paths, &config, &bursar, &repo, "second", 0);
+        assert_eq!(prepared_author(&paths, &next.run_id), "planner-b");
+    }
+
+    #[test]
+    fn unmatched_attempt_started_remains_active_until_finish_or_stage_transition() {
+        let (temp, paths, _config, bursar) = plan_fixture("attempt-started-capacity");
+        let repo = initialized_repo(&temp);
+        let config = dominant_profile_config();
+        let prepared = prepare_implementation_run(&paths, &config, &bursar, &repo, "first", 0);
+        let mut run =
+            crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("first run");
+        let approval = load_approval(&run).expect("approval");
+        let router = fixture_router(&paths, &config, &bursar);
+        router
+            .commit(&approval.reservation)
+            .expect("commit before call");
+        run.start_plan_authoring(approval.author.clone())
+            .expect("authoring checkpoint");
+        run.record_plan_author_attempt()
+            .expect("attempt checkpoint");
+        let profile = profile_for_execution(&bursar.snapshot, &approval.author).expect("profile");
+        append_plan_invocation(
+            &mut run,
+            &paths.ledger_path,
+            crate::run::EventKind::AttemptStarted,
+            crate::run::PlanStage::Planner,
+            &approval.author,
+            &profile,
+            b"crashed invocation",
+            None,
+            1,
+            "started",
+        )
+        .expect("started evidence");
+
+        reconcile_plan_reservations(&router, &paths.state_dir).expect("reconciliation");
+        let next = prepare_implementation_run(&paths, &config, &bursar, &repo, "second", 0);
+        assert_eq!(prepared_author(&paths, &next.run_id), "planner-b");
+    }
+
+    #[test]
+    fn attempt_finished_releases_capacity_before_crash_resume_stage_transition() {
+        let (temp, paths, _config, bursar) = plan_fixture("attempt-finished-capacity");
+        let repo = initialized_repo(&temp);
+        let config = dominant_profile_config();
+        let prepared = prepare_implementation_run(&paths, &config, &bursar, &repo, "first", 0);
+        approve(&paths, &prepared.run_id);
+        assert!(dispatch(
+            &paths,
+            &config,
+            &bursar,
+            &prepared.run_id,
+            &FailingAuthor(std::sync::Mutex::new(0)),
+        )
+        .is_err());
+
+        let router = fixture_router(&paths, &config, &bursar);
+        reconcile_plan_reservations(&router, &paths.state_dir).expect("first reconciliation");
+        reconcile_plan_reservations(&router, &paths.state_dir).expect("idempotent reconciliation");
+        let next = prepare_implementation_run(&paths, &config, &bursar, &repo, "second", 0);
+        assert_eq!(prepared_author(&paths, &next.run_id), "planner-a");
+    }
+
+    #[test]
+    fn terminal_rejected_owner_releases_committed_stage_capacity() {
+        let (temp, paths, _config, bursar) = plan_fixture("rejected-capacity");
+        let repo = initialized_repo(&temp);
+        let config = dominant_profile_config();
+        let prepared = prepare_implementation_run(&paths, &config, &bursar, &repo, "first", 0);
+        approve(&paths, &prepared.run_id);
+        let executor = ScriptedExecutor::new(
+            vec![Ok(implementation_document())],
+            vec![],
+            vec![Ok(peer_revise())],
+            vec![],
+        );
+        dispatch(&paths, &config, &bursar, &prepared.run_id, &executor)
+            .expect("terminal rejection");
+
+        let rejected =
+            crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("rejected run");
+        assert!(matches!(
+            rejected.plan().expect("plan").progress,
+            crate::run::PlanProgress::Terminal {
+                verdict: crate::run::PlanTerminalVerdict::Rejected
+            }
+        ));
+
+        let next = prepare_implementation_run(&paths, &config, &bursar, &repo, "second", 0);
+        assert_eq!(prepared_author(&paths, &next.run_id), "planner-a");
+    }
+
+    #[test]
+    fn terminal_blocked_owner_releases_committed_stage_capacity() {
+        let (temp, paths, _config, bursar) = plan_fixture("blocked-capacity");
+        let repo = initialized_repo(&temp);
+        let config = dominant_profile_config();
+        let prepared = prepare_implementation_run(&paths, &config, &bursar, &repo, "first", 0);
+        approve(&paths, &prepared.run_id);
+        let failing = FailingAuthor(std::sync::Mutex::new(0));
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &failing).is_err());
+        assert!(dispatch(&paths, &config, &bursar, &prepared.run_id, &failing).is_err());
+
+        let run =
+            crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("blocked run");
+        assert!(matches!(
+            run.plan().expect("plan").progress,
+            crate::run::PlanProgress::Terminal {
+                verdict: crate::run::PlanTerminalVerdict::Blocked
+            }
+        ));
+        let next = prepare_implementation_run(&paths, &config, &bursar, &repo, "second", 0);
+        assert_eq!(prepared_author(&paths, &next.run_id), "planner-a");
+    }
+
+    #[test]
+    fn sequential_terminal_plan_runs_release_committed_peer_capacity_without_rewinding_turns() {
+        let (temp, paths, _config, bursar) = plan_fixture("terminal-peer-capacity-release");
+        let repo = initialized_repo(&temp);
+        let config = crate::config::parse_str(
+            r#"
+[[role_binding]]
+role = "plan"
+profile_id = "planner-a"
+weight = 5
+enabled = true
+
+[[role_binding]]
+role = "plan"
+profile_id = "planner-b"
+weight = 4
+enabled = true
+
+[[role_binding]]
+role = "plan"
+profile_id = "planner-c"
+weight = 2
+enabled = true
+"#,
+        )
+        .expect("three-provider scheduler policy");
+        let expected_routes = [
+            ("planner-a", "planner-b"),
+            ("planner-b", "planner-a"),
+            ("planner-c", "planner-a"),
+        ];
+
+        for (index, (expected_author, expected_peer)) in expected_routes.into_iter().enumerate() {
+            let prepared = prepare(
+                &paths,
+                &config,
+                &bursar,
+                PlanPrepareRequest {
+                    repo: repo.clone(),
+                    input: PlanPrepareInput::Artifact {
+                        bytes: format!("terminal plan {index}").into_bytes(),
+                        tier: crate::run::PlanTier::Lead,
+                        complexity: crate::run::PlanComplexity::XL,
+                    },
+                    output_kind: PlanOutputKind::ImplementationPlan,
+                    max_plan_revisions: 0,
+                    require_second_opinion: false,
+                },
+            )
+            .expect("sequential preparation");
+            approve(&paths, &prepared.run_id);
+            dispatch(
+                &paths,
+                &config,
+                &bursar,
+                &prepared.run_id,
+                &FakeAuthor::new(vec![implementation_document()]),
+            )
+            .expect("terminal dispatch must not inherit completed peer capacity");
+
+            let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+            assert!(matches!(
+                run.plan().expect("plan").progress,
+                crate::run::PlanProgress::Terminal {
+                    verdict: crate::run::PlanTerminalVerdict::Accepted
+                }
+            ));
+            let events = crate::run::read_events(&run.events_path()).expect("events");
+            let route = events
+                .iter()
+                .filter_map(|event| event.plan_invocation.as_ref())
+                .map(|evidence| evidence.execution.profile_id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                route,
+                vec![
+                    expected_author,
+                    expected_author,
+                    expected_peer,
+                    expected_peer
+                ]
+            );
+        }
+    }
+
     #[test]
     fn spec_revision_resume_uses_distinct_omp_availability_key_identities() {
         let (temp, paths, config, bursar) = omp_plan_fixture("omp-second-opinion");
@@ -4717,7 +5200,6 @@ enabled = true
         let repo = initialized_repo(&temp);
         let prepared = prepare(
             &paths,
-
             &config,
             &bursar,
             PlanPrepareRequest {
@@ -4767,11 +5249,9 @@ enabled = true
                 ..
             }) if outcome == "blocked"
         ));
-        assert!(
-            !events
-                .iter()
-                .any(|event| event.outcome.as_deref() == Some("peer_provider_diversity_degraded"))
-        );
+        assert!(!events
+            .iter()
+            .any(|event| event.outcome.as_deref() == Some("peer_provider_diversity_degraded")));
         assert!(
             !events.iter().any(|event| {
                 event.kind == crate::run::EventKind::AttemptFinished
@@ -4870,8 +5350,7 @@ enabled = true
         )
         .expect("prepare");
         approve(&paths, &prepared.run_id);
-        let mut run =
-            crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let mut run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
         let approval = load_approval(&run).expect("approval");
         run.start_plan_authoring(approval.author.clone())
             .expect("author binding");
@@ -5216,7 +5695,6 @@ enabled = true
     fn revision_malformed_attempt_limit_is_terminal_and_nonresumable() {
         assert_revision_attempt_exhaustion(
             "revision-malformed-exhaustion",
-
             Ok(b"bad revision JSON".to_vec()),
             "malformed",
         );

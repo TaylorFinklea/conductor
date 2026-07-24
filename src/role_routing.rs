@@ -411,10 +411,12 @@ impl RoleRouter {
             }
             let mut in_flight = BTreeMap::<&str, u32>::new();
             for stored in state.reservations.values() {
-                if matches!(
-                    stored.reservation.state,
-                    ReservationState::PendingApproval | ReservationState::Committed
-                ) {
+                if stored.capacity_active
+                    && matches!(
+                        stored.reservation.state,
+                        ReservationState::PendingApproval | ReservationState::Committed
+                    )
+                {
                     let count = in_flight
                         .entry(stored.reservation.selected_profile_id.as_str())
                         .or_default();
@@ -486,6 +488,7 @@ impl RoleRouter {
                 reservation.run_id.as_str().to_string(),
                 PersistedReservation {
                     reservation: reservation.clone(),
+                    capacity_active: true,
                 },
             );
             store_lane(&paths.state_path, &state)?;
@@ -802,6 +805,122 @@ impl RoleRouter {
         let _ = fs2::FileExt::unlock(&guard);
         outcome
     }
+    pub(crate) fn reservations(
+        &self,
+        role_id: &RoleId,
+        stage: PlanStage,
+    ) -> Result<Vec<Reservation>> {
+        let lane = LaneKey::new(self.policy.digest(), role_id.clone(), stage);
+        let paths = LanePaths::new(&self.root, &lane);
+        create_lane_dir(&paths)?;
+        let guard = open_lock(&paths.lock_path)?;
+        guard.lock_exclusive().map_err(|error| {
+            RoleRoutingError::new(format!(
+                "failed to lock role-routing lane {}: {error}",
+                paths.lock_path.display()
+            ))
+        })?;
+        let outcome = load_lane(&paths.state_path, &lane).map(|state| {
+            state
+                .reservations
+                .into_values()
+                .map(|stored| stored.reservation)
+                .collect()
+        });
+        let _ = fs2::FileExt::unlock(&guard);
+        outcome
+    }
+
+    /// Reactivates a committed stage reservation immediately before a resumed
+    /// invocation. The original scheduler turn and score evidence are reused.
+    pub(crate) fn activate_capacity(
+        &self,
+        reservation: &Reservation,
+        max_in_flight_per_profile: u32,
+    ) -> Result<bool> {
+        self.set_capacity_active(reservation, true, max_in_flight_per_profile)
+    }
+
+    /// Releases only the active capacity owned by a committed stage. The
+    /// reservation and its irreversible score transition remain durable.
+    pub(crate) fn release_capacity(&self, reservation: &Reservation) -> Result<bool> {
+        self.set_capacity_active(reservation, false, u32::MAX)
+    }
+
+    fn set_capacity_active(
+        &self,
+        reservation: &Reservation,
+        requested: bool,
+        max_in_flight_per_profile: u32,
+    ) -> Result<bool> {
+        let lane = LaneKey::new(
+            self.policy.digest(),
+            reservation.role_id.clone(),
+            reservation.stage,
+        );
+        let paths = LanePaths::new(&self.root, &lane);
+        create_lane_dir(&paths)?;
+        let guard = open_lock(&paths.lock_path)?;
+        guard.lock_exclusive().map_err(|error| {
+            RoleRoutingError::new(format!(
+                "failed to lock role-routing lane {}: {error}",
+                paths.lock_path.display()
+            ))
+        })?;
+        let outcome = (|| {
+            let mut state = load_lane(&paths.state_path, &lane)?;
+            let Some(stored) = state.reservations.get(reservation.run_id.as_str()) else {
+                return Err(RoleRoutingError::new(
+                    "role-routing reservation does not exist",
+                ));
+            };
+            if stored.reservation != *reservation {
+                return Err(RoleRoutingError::new(
+                    "role-routing reservation does not match the durable reservation",
+                ));
+            }
+            if !matches!(stored.reservation.state, ReservationState::Committed) {
+                return Err(RoleRoutingError::new(
+                    "only committed role-routing reservations have invocation capacity",
+                ));
+            }
+            if stored.capacity_active == requested {
+                return Ok(false);
+            }
+            if requested {
+                let active_for_profile = state
+                    .reservations
+                    .values()
+                    .filter(|candidate| {
+                        candidate.capacity_active
+                            && candidate.reservation.run_id != reservation.run_id
+                            && candidate.reservation.selected_profile_id
+                                == reservation.selected_profile_id
+                            && matches!(
+                                candidate.reservation.state,
+                                ReservationState::PendingApproval | ReservationState::Committed
+                            )
+                    })
+                    .count();
+                if active_for_profile
+                    >= usize::try_from(max_in_flight_per_profile).unwrap_or(usize::MAX)
+                {
+                    return Err(RoleRoutingError::new(
+                        "role-routing profile has no available in-flight capacity",
+                    ));
+                }
+            }
+            state
+                .reservations
+                .get_mut(reservation.run_id.as_str())
+                .expect("existing reservation was checked")
+                .capacity_active = requested;
+            store_lane(&paths.state_path, &state)?;
+            Ok(true)
+        })();
+        let _ = fs2::FileExt::unlock(&guard);
+        outcome
+    }
 
     pub(crate) fn policy_reset_from(
         &self,
@@ -923,6 +1042,9 @@ impl RoleRouter {
                         .get_mut(reservation.run_id.as_str())
                         .expect("existing reservation was checked");
                     stored.reservation.state = requested;
+                    if matches!(stored.reservation.state, ReservationState::Canceled) {
+                        stored.capacity_active = false;
+                    }
                     let updated = stored.reservation.clone();
                     store_lane(&paths.state_path, &state)?;
                     Ok(updated)
@@ -1029,6 +1151,12 @@ struct LaneFamilyState {
 #[serde(deny_unknown_fields)]
 struct PersistedReservation {
     reservation: Reservation,
+    #[serde(default = "capacity_active_default")]
+    capacity_active: bool,
+}
+
+const fn capacity_active_default() -> bool {
+    true
 }
 
 fn load_lane(path: &Path, expected: &LaneKey) -> Result<LaneState> {
@@ -1560,16 +1688,14 @@ mod tests {
             },
         )
         .expect("seed state");
-        assert!(
-            router
-                .reserve(
-                    RunId::new("overflow-run").expect("run"),
-                    role,
-                    PlanStage::Planner,
-                    &[],
-                )
-                .is_err()
-        );
+        assert!(router
+            .reserve(
+                RunId::new("overflow-run").expect("run"),
+                role,
+                PlanStage::Planner,
+                &[],
+            )
+            .is_err());
     }
 
     #[test]
@@ -1615,6 +1741,78 @@ mod tests {
                 .expect("reservation")
                 .sequence,
             1
+        );
+    }
+
+    #[test]
+    fn legacy_committed_capacity_release_is_backward_compatible_idempotent_and_score_preserving() {
+        let temp = TempDir::new("legacy-committed-capacity");
+        let snapshot = pinned_snapshot("profile-a", "provider-a", &["plan"]);
+        let policy = RoutingPolicy::new("a".repeat(64), vec![binding("plan", "profile-a", 1)])
+            .expect("policy");
+        let role = RoleId::new("plan").expect("role");
+        let router =
+            RoleRouter::with_pinned_snapshot(temp.path(), policy.clone(), snapshot.clone())
+                .expect("router");
+        let prepared = router
+            .prepare_planner(
+                RunId::new("legacy-run").expect("run"),
+                role.clone(),
+                strict_constraints(&snapshot, "plan"),
+            )
+            .expect("prepare");
+        let committed = router.commit(&prepared.reservation).expect("commit");
+        let lane = super::LaneKey::new(policy.digest(), role.clone(), PlanStage::Planner);
+        let paths = super::LanePaths::new(temp.path(), &lane);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.state_path).expect("lane bytes"))
+                .expect("lane JSON");
+        legacy["reservations"]["legacy-run"]
+            .as_object_mut()
+            .expect("persisted reservation")
+            .remove("capacity_active");
+        std::fs::write(
+            &paths.state_path,
+            serde_json::to_vec_pretty(&legacy).expect("legacy JSON"),
+        )
+        .expect("legacy lane");
+
+        let restarted = RoleRouter::with_pinned_snapshot(temp.path(), policy, snapshot.clone())
+            .expect("restarted router");
+        assert!(
+            restarted
+                .prepare_planner(
+                    RunId::new("blocked-by-legacy").expect("run"),
+                    role.clone(),
+                    strict_constraints(&snapshot, "plan"),
+                )
+                .is_err(),
+            "missing capacity_active must default to active before reconciliation"
+        );
+        assert!(restarted
+            .release_capacity(&committed)
+            .expect("first release"));
+        assert!(!restarted
+            .release_capacity(&committed)
+            .expect("idempotent release"));
+        assert_eq!(
+            restarted
+                .reservation(&role, PlanStage::Planner, &committed.run_id)
+                .expect("reservation")
+                .expect("committed history"),
+            committed
+        );
+        assert_eq!(
+            restarted
+                .prepare_planner(
+                    RunId::new("after-release").expect("run"),
+                    role,
+                    strict_constraints(&snapshot, "plan"),
+                )
+                .expect("released capacity")
+                .reservation
+                .sequence,
+            2
         );
     }
 
@@ -1665,16 +1863,14 @@ mod tests {
                 .expect("policy"),
         )
         .expect("router");
-        assert!(
-            router
-                .reconcile_orphans(
-                    &RoleId::new("planner").expect("role"),
-                    PlanStage::Planner,
-                    &[],
-                )
-                .expect("fresh lane reconciliation")
-                .is_empty()
-        );
+        assert!(router
+            .reconcile_orphans(
+                &RoleId::new("planner").expect("role"),
+                PlanStage::Planner,
+                &[],
+            )
+            .expect("fresh lane reconciliation")
+            .is_empty());
     }
 
     #[test]
@@ -1814,9 +2010,8 @@ mod tests {
                 "must fail closed: {source}"
             );
         }
-        assert!(
-            crate::config::parse_str(
-                r#"[[role_binding]]
+        assert!(crate::config::parse_str(
+            r#"[[role_binding]]
                    role = "planner"
                    profile_id = "profile-a"
                    weight = 1
@@ -1826,9 +2021,8 @@ mod tests {
                    profile_id = "profile-a"
                    weight = 2
                    enabled = true"#,
-            )
-            .is_err()
-        );
+        )
+        .is_err());
     }
 
     #[test]
@@ -1921,15 +2115,13 @@ mod tests {
 
         let mut denied = strict_constraints(&snapshot, "plan");
         denied.budget_available = false;
-        assert!(
-            router
-                .prepare_planner(
-                    RunId::new("budget-denied").expect("run"),
-                    RoleId::new("plan").expect("role"),
-                    denied,
-                )
-                .is_err()
-        );
+        assert!(router
+            .prepare_planner(
+                RunId::new("budget-denied").expect("run"),
+                RoleId::new("plan").expect("role"),
+                denied,
+            )
+            .is_err());
     }
 
     #[test]
@@ -1953,19 +2145,17 @@ mod tests {
             .expect("router");
         let author = super::approved_execution(&snapshot.profiles[0], &snapshot.providers[0]);
 
-        assert!(
-            router
-                .bind_reviewer(
-                    RunId::new("too-early").expect("run"),
-                    RoleId::new("plan").expect("role"),
-                    PlanStage::SecondOpinion,
-                    author.clone(),
-                    None,
-                    true,
-                    strict_constraints(&snapshot, "plan"),
-                )
-                .is_err()
-        );
+        assert!(router
+            .bind_reviewer(
+                RunId::new("too-early").expect("run"),
+                RoleId::new("plan").expect("role"),
+                PlanStage::SecondOpinion,
+                author.clone(),
+                None,
+                true,
+                strict_constraints(&snapshot, "plan"),
+            )
+            .is_err());
         let peer = router
             .bind_reviewer(
                 RunId::new("peer-run").expect("run"),
@@ -2045,15 +2235,13 @@ mod tests {
                 false,
             )
             .expect("peer contingency");
-        assert!(
-            two_router
-                .validate_preapproval_contingencies(
-                    &RoleId::new("plan").expect("role"),
-                    &strict_constraints(&two, "plan"),
-                    true,
-                )
-                .is_err()
-        );
+        assert!(two_router
+            .validate_preapproval_contingencies(
+                &RoleId::new("plan").expect("role"),
+                &strict_constraints(&two, "plan"),
+                true,
+            )
+            .is_err());
     }
 
     fn binding(role: &str, profile: &str, weight: u32) -> RoleBinding {
