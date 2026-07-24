@@ -1266,6 +1266,82 @@ fn is_quiescent_lock_only_lane(path: &Path) -> Result<bool> {
 /// Historical policy lanes remain in the source snapshot. Current scores and
 /// reservation history are retained while the ownership schema and policy
 /// digest are rebound to the identity-only renamed policy.
+fn terminal_plan_stage_is_proven(source_root: &Path, reservation: &Reservation) -> Result<bool> {
+    let owner = reservation
+        .run_id
+        .as_str()
+        .strip_suffix("-peer-review-bind")
+        .or_else(|| {
+            reservation
+                .run_id
+                .as_str()
+                .strip_suffix("-second-opinion-bind")
+        })
+        .unwrap_or_else(|| reservation.run_id.as_str());
+    let run_root = source_root.join("runs-v2").join(owner);
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(run_root.join("manifest.json"))
+            .map_err(|error| RoleRoutingError::new(format!("read reservation owner: {error}")))?,
+    )
+    .map_err(|error| RoleRoutingError::new(format!("parse reservation owner: {error}")))?;
+    if manifest.get("schema").and_then(serde_json::Value::as_str) != Some("conductor/run@2")
+        || manifest.get("run_id").and_then(serde_json::Value::as_str) != Some(owner)
+        || manifest.get("job").and_then(serde_json::Value::as_str) != Some("plan")
+        || manifest
+            .get("lifecycle")
+            .and_then(serde_json::Value::as_str)
+            != Some("finished")
+        || manifest
+            .pointer("/details/state/progress/state")
+            .and_then(serde_json::Value::as_str)
+            != Some("terminal")
+    {
+        return Ok(false);
+    }
+    let outcome = manifest
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| RoleRoutingError::new("terminal reservation owner has no outcome"))?;
+    let contents = std::fs::read_to_string(run_root.join("events.jsonl"))
+        .map_err(|error| RoleRoutingError::new(format!("read reservation events: {error}")))?;
+    let mut started = 0_u64;
+    let mut finished = 0_u64;
+    let mut terminal = None::<String>;
+    let stage = stage_label(reservation.stage);
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let event: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| RoleRoutingError::new(format!("parse reservation event: {error}")))?;
+        if event.get("schema").and_then(serde_json::Value::as_str) != Some("conductor/event@2")
+            || event.get("run_id").and_then(serde_json::Value::as_str) != Some(owner)
+        {
+            return Ok(false);
+        }
+        let kind = event.get("kind").and_then(serde_json::Value::as_str);
+        let event_stage = event
+            .pointer("/plan_invocation/stage")
+            .and_then(serde_json::Value::as_str);
+        if event_stage == Some(stage) {
+            if kind == Some("attempt_started") {
+                started = started.saturating_add(1);
+            } else if kind == Some("attempt_finished") {
+                finished = finished.saturating_add(1);
+            }
+        }
+        if kind == Some("run_finished") {
+            if terminal.is_some() {
+                return Ok(false);
+            }
+            terminal = event
+                .get("outcome")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+        } else if terminal.is_some() {
+            return Ok(false);
+        }
+    }
+    Ok(started > 0 && started == finished && terminal.as_deref() == Some(outcome))
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the one-shot lane transaction validates and rewrites one complete typed scheduler envelope"
@@ -1358,6 +1434,12 @@ pub(crate) fn migrate_legacy_state(
                 return Err(RoleRoutingError::new(
                     "legacy role-routing reservation identity is inconsistent",
                 ));
+            }
+            if stored.capacity_active
+                && matches!(stored.reservation.state, ReservationState::Committed)
+                && terminal_plan_stage_is_proven(source_root, &stored.reservation)?
+            {
+                stored.capacity_active = false;
             }
             if stored.capacity_active
                 && matches!(
