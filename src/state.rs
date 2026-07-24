@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -497,6 +498,19 @@ fn rewrite_artifact_hash(value: &mut serde_json::Value, path: &str, hash: &str) 
     }
 }
 
+fn is_archive_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let Some(top_level) = relative.components().next() else {
+        return false;
+    };
+    matches!(
+        top_level.as_os_str().to_str(),
+        Some("runs" | "logs" | "worker-commit-hooks" | "leases" | "arena")
+    )
+}
+
 fn tree_digest(root: &Path) -> io::Result<String> {
     fn collect(root: &Path, path: &Path, entries: &mut Vec<PathBuf>) -> io::Result<()> {
         for entry in fs::read_dir(path)? {
@@ -511,7 +525,7 @@ fn tree_digest(root: &Path) -> io::Result<String> {
             entries.push(entry.path());
             if kind.is_dir() {
                 collect(root, &entry.path(), entries)?;
-            } else if !kind.is_file() {
+            } else if !(kind.is_file() || kind.is_fifo() && is_archive_path(root, &entry.path())) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "state migration source contains an unknown entry",
@@ -529,11 +543,19 @@ fn tree_digest(root: &Path) -> io::Result<String> {
     for path in entries {
         let relative = path.strip_prefix(root).map_err(io::Error::other)?;
         hash.update(relative.as_os_str().as_encoded_bytes());
-        if path.is_dir() {
+        let kind = fs::symlink_metadata(&path)?.file_type();
+        if kind.is_dir() {
             hash.update(b"d");
-        } else {
+        } else if kind.is_file() {
             hash.update(b"f");
-            hash.update(fs::read(path)?);
+            hash.update(fs::read(&path)?);
+        } else if kind.is_fifo() && is_archive_path(root, &path) {
+            hash.update(b"p");
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "state migration source contains an unknown entry",
+            ));
         }
         hash.update(b"\0");
     }
@@ -648,6 +670,27 @@ mod tests {
     }
 
     #[test]
+    fn migration_rejects_special_nodes_in_runtime_roots() {
+        let root = migration_root("runtime-special");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        let plans = source.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let fifo = plans.join("live.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let error = migrate_live_state(&source, &destination, &migration_policy())
+            .expect_err("special runtime state must fail closed");
+        assert!(error.to_string().contains("unknown entry"));
+        assert!(!destination.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn migration_recognizes_exact_archive_roots_without_copying_them() {
         let root = migration_root("archives");
         let source = root.join("source");
@@ -658,6 +701,13 @@ mod tests {
             std::fs::create_dir_all(&archive_root).unwrap();
             std::fs::write(archive_root.join("retained-in-snapshot"), archive).unwrap();
         }
+
+        let fifo = source.join("runs").join("worker-lineage.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
 
         let source_digest = tree_digest(&source).unwrap();
         migrate_live_state(&source, &destination, &migration_policy()).unwrap();
