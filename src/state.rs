@@ -59,9 +59,10 @@ pub(crate) struct MigrationSummary {
 
 /// Copies quiescent live Conductor state into a new Undertake-owned root.
 ///
-/// The source remains untouched. The destination must not exist, legacy
-/// archives under `runs/` are intentionally left behind, and any unknown live
-/// state fails closed before the staging directory is published.
+/// The source remains untouched. The destination must not exist. Exact legacy
+/// archive roots (`runs`, `logs`, `worker-commit-hooks`, `leases`, and `arena`)
+/// are intentionally left behind; any other unknown live state fails closed
+/// before the staging directory is published.
 pub(crate) fn migrate_live_state(
     source: &Path,
     destination: &Path,
@@ -70,7 +71,10 @@ pub(crate) fn migrate_live_state(
     if destination.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!("state migration destination already exists: {}", destination.display()),
+            format!(
+                "state migration destination already exists: {}",
+                destination.display()
+            ),
         ));
     }
     let source = source.canonicalize()?;
@@ -146,7 +150,16 @@ fn validate_top_level(source: &Path) -> io::Result<()> {
         })?;
         if !matches!(
             name,
-            "journal.json" | "ratchet.json" | "plans" | "runs-v2" | "role-routing" | "runs"
+            "journal.json"
+                | "ratchet.json"
+                | "plans"
+                | "runs-v2"
+                | "role-routing"
+                | "runs"
+                | "logs"
+                | "worker-commit-hooks"
+                | "leases"
+                | "arena"
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -179,9 +192,7 @@ fn validate_quiescent_runs(source: &Path) -> io::Result<()> {
         let path = entry.path().join("manifest.json");
         let value: serde_json::Value =
             serde_json::from_slice(&fs::read(&path)?).map_err(io::Error::other)?;
-        if value.get("schema").and_then(serde_json::Value::as_str)
-            != Some("conductor/run@2")
-        {
+        if value.get("schema").and_then(serde_json::Value::as_str) != Some("conductor/run@2") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown legacy run schema: {}", path.display()),
@@ -259,7 +270,10 @@ fn migrate_runs(source: &Path, destination: &Path) -> io::Result<u64> {
     for entry in fs::read_dir(runs)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown runs-v2 entry"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown runs-v2 entry",
+            ));
         }
         let run_target = target.join(entry.file_name());
         fs::create_dir(&run_target)?;
@@ -308,7 +322,10 @@ fn migrate_run_manifest(
         serde_json::from_slice(&fs::read(source.join("manifest.json"))?)
             .map_err(io::Error::other)?;
     if value.get("schema").and_then(serde_json::Value::as_str) != Some("conductor/run@2") {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown legacy run schema"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unknown legacy run schema",
+        ));
     }
     rename_optional_object_key(
         &mut value,
@@ -320,8 +337,7 @@ fn migrate_run_manifest(
     if let Some(hash) = roster_hash {
         rewrite_artifact_hash(&mut value, "roster.json", hash);
     }
-    serde_json::from_value::<crate::run::RunManifest>(value.clone())
-        .map_err(io::Error::other)?;
+    serde_json::from_value::<crate::run::RunManifest>(value.clone()).map_err(io::Error::other)?;
     let mut bytes = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
     bytes.push(b'\n');
     fs::write(destination.join("manifest.json"), bytes)?;
@@ -336,11 +352,8 @@ fn migrate_run_events(source: &Path, destination: &Path) -> io::Result<u64> {
         if line.trim().is_empty() {
             continue;
         }
-        let mut value: serde_json::Value =
-            serde_json::from_str(line).map_err(io::Error::other)?;
-        if value.get("schema").and_then(serde_json::Value::as_str)
-            != Some("conductor/event@2")
-        {
+        let mut value: serde_json::Value = serde_json::from_str(line).map_err(io::Error::other)?;
+        if value.get("schema").and_then(serde_json::Value::as_str) != Some("conductor/event@2") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unknown legacy event schema",
@@ -348,8 +361,7 @@ fn migrate_run_events(source: &Path, destination: &Path) -> io::Result<u64> {
         }
         value["schema"] = serde_json::Value::String(crate::run::EVENT_SCHEMA.to_string());
         rewrite_owned_strings(&mut value);
-        serde_json::from_value::<crate::run::RunEvent>(value.clone())
-            .map_err(io::Error::other)?;
+        serde_json::from_value::<crate::run::RunEvent>(value.clone()).map_err(io::Error::other)?;
         serde_json::to_writer(&mut output, &value).map_err(io::Error::other)?;
         output.push(b'\n');
     }
@@ -392,13 +404,12 @@ fn copy_run_payloads(source: &Path, destination: &Path) -> io::Result<u64> {
     Ok(copied)
 }
 
-fn rename_object_key(
-    value: &mut serde_json::Value,
-    old: &str,
-    new: &str,
-) -> io::Result<()> {
+fn rename_object_key(value: &mut serde_json::Value, old: &str, new: &str) -> io::Result<()> {
     let object = value.as_object_mut().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "legacy state envelope is not an object")
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy state envelope is not an object",
+        )
     })?;
     let field = object.remove(old).ok_or_else(|| {
         io::Error::new(
@@ -421,7 +432,10 @@ fn rename_optional_object_key(
     new: &str,
 ) -> io::Result<()> {
     let object = value.as_object_mut().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "legacy state envelope is not an object")
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy state envelope is not an object",
+        )
     })?;
     if let Some(field) = object.remove(old) {
         if object.insert(new.to_string(), field).is_some() {
@@ -575,19 +589,16 @@ mod tests {
 
         crate::role_routing::RoutingPolicy::new(
             "a".repeat(64),
-            [
-                ("planner", "alpha", 1),
-                ("planner", "beta", 1),
-            ]
-            .into_iter()
-            .map(|(role, profile, weight)| {
-                crate::role_routing::RoleBinding::new(
-                    crate::role_routing::RoleId::new(role).unwrap(),
-                    crate::role_routing::ProfileId::new(profile).unwrap(),
-                    NonZeroU32::new(weight).unwrap(),
-                )
-            })
-            .collect(),
+            [("planner", "alpha", 1), ("planner", "beta", 1)]
+                .into_iter()
+                .map(|(role, profile, weight)| {
+                    crate::role_routing::RoleBinding::new(
+                        crate::role_routing::RoleId::new(role).unwrap(),
+                        crate::role_routing::ProfileId::new(profile).unwrap(),
+                        NonZeroU32::new(weight).unwrap(),
+                    )
+                })
+                .collect(),
         )
         .unwrap()
     }
@@ -637,6 +648,31 @@ mod tests {
     }
 
     #[test]
+    fn migration_recognizes_exact_archive_roots_without_copying_them() {
+        let root = migration_root("archives");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        for archive in ["runs", "logs", "worker-commit-hooks", "leases", "arena"] {
+            let archive_root = source.join(archive);
+            std::fs::create_dir_all(&archive_root).unwrap();
+            std::fs::write(archive_root.join("retained-in-snapshot"), archive).unwrap();
+        }
+
+        let source_digest = tree_digest(&source).unwrap();
+        migrate_live_state(&source, &destination, &migration_policy()).unwrap();
+
+        assert_eq!(tree_digest(&source).unwrap(), source_digest);
+        for archive in ["runs", "logs", "worker-commit-hooks", "leases", "arena"] {
+            assert!(
+                !destination.join(archive).exists(),
+                "archive-only root was copied: {archive}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn migration_requires_zero_in_flight_runs() {
         let root = migration_root("in-flight");
         let source = root.join("source");
@@ -664,7 +700,11 @@ mod tests {
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         manifest["schema"] = serde_json::json!("conductor/run@2");
-        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
 
         let error = migrate_live_state(&source, &destination, &migration_policy())
             .expect_err("nonterminal run must block migration");
@@ -782,7 +822,11 @@ mod tests {
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         manifest["schema"] = serde_json::json!("conductor/run@2");
-        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
         let events_path = run_dir.join("events.jsonl");
         let legacy_events = std::fs::read_to_string(&events_path)
             .unwrap()
@@ -818,8 +862,7 @@ mod tests {
         crate::run::read_manifest(&migrated_run_dir.join("manifest.json")).unwrap();
         crate::run::read_events(&migrated_run_dir.join("events.jsonl")).unwrap();
 
-        let restarted =
-            crate::role_routing::RoleRouter::new(&destination, policy.clone()).unwrap();
+        let restarted = crate::role_routing::RoleRouter::new(&destination, policy.clone()).unwrap();
         let next = restarted
             .reserve(
                 crate::role_routing::RunId::new("run-two").unwrap(),
