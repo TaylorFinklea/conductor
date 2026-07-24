@@ -657,6 +657,43 @@ pub(crate) fn validate_preapproval_contingencies_for_snapshot(
     constraints: &HardEligibility,
     require_three_way_team: bool,
 ) -> Result<()> {
+    validate_contingencies_for_snapshot(
+        policy,
+        snapshot,
+        role_id,
+        constraints,
+        require_three_way_team,
+        true,
+    )
+}
+
+/// Validates configured author/reviewer topology without treating transient
+/// provider availability as a configuration defect.
+pub(crate) fn validate_configured_contingencies_for_snapshot(
+    policy: &RoutingPolicy,
+    snapshot: &crate::musterroll::RosterSnapshot,
+    role_id: &RoleId,
+    constraints: &HardEligibility,
+    require_three_way_team: bool,
+) -> Result<()> {
+    validate_contingencies_for_snapshot(
+        policy,
+        snapshot,
+        role_id,
+        constraints,
+        require_three_way_team,
+        false,
+    )
+}
+
+fn validate_contingencies_for_snapshot(
+    policy: &RoutingPolicy,
+    snapshot: &crate::musterroll::RosterSnapshot,
+    role_id: &RoleId,
+    constraints: &HardEligibility,
+    require_three_way_team: bool,
+    require_current_availability: bool,
+) -> Result<()> {
     let mut candidates = Vec::<String>::new();
     for binding in policy.bindings_for(role_id) {
         let profile = snapshot
@@ -678,7 +715,16 @@ pub(crate) fn validate_preapproval_contingencies_for_snapshot(
                 )
             })?;
         let execution = approved_execution(profile, provider);
-        if hard_rejection_reasons(profile, provider, role_id, constraints, &execution).is_empty() {
+        if eligibility_rejection_reasons(
+            profile,
+            provider,
+            role_id,
+            constraints,
+            &execution,
+            require_current_availability,
+        )
+        .is_empty()
+        {
             candidates.push(profile.provider_id.clone());
         }
     }
@@ -1643,6 +1689,17 @@ fn hard_rejection_reasons(
     constraints: &HardEligibility,
     execution: &crate::run::ApprovedExecution,
 ) -> Vec<String> {
+    eligibility_rejection_reasons(profile, provider, role_id, constraints, execution, true)
+}
+
+fn eligibility_rejection_reasons(
+    profile: &crate::musterroll::RosterProfile,
+    provider: &crate::musterroll::RosterProvider,
+    role_id: &RoleId,
+    constraints: &HardEligibility,
+    execution: &crate::run::ApprovedExecution,
+    require_current_availability: bool,
+) -> Vec<String> {
     let mut reasons = Vec::new();
     if !constraints.budget_available {
         reasons.push("budget_exhausted".to_string());
@@ -1665,16 +1722,21 @@ fn hard_rejection_reasons(
     {
         reasons.push("execution_coordinate_not_approved".to_string());
     }
-    if !profile.enabled || profile.state != "healthy" || !profile.eligible {
+    if !profile.enabled
+        || (require_current_availability
+            && (profile.state != "healthy" || !profile.eligible))
+    {
         reasons.push("profile_unavailable".to_string());
     }
     if !provider.enabled
-        || provider.state != "healthy"
-        || !provider.eligible
-        || !matches!(
-            provider.availability,
-            crate::musterroll::Availability::Healthy | crate::musterroll::Availability::Caution
-        )
+        || (require_current_availability
+            && (provider.state != "healthy"
+                || !provider.eligible
+                || !matches!(
+                    provider.availability,
+                    crate::musterroll::Availability::Healthy
+                        | crate::musterroll::Availability::Caution
+                )))
     {
         reasons.push("provider_unavailable".to_string());
     }

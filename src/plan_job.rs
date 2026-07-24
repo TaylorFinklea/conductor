@@ -1291,7 +1291,7 @@ pub(crate) fn validate_initial_policy(
     let role = crate::role_routing::RoleId::new("plan")
         .map_err(|error| format!("planner role: {error}"))?;
     let constraints = planner_constraints(snapshot, crate::config::Tier::Lead)?;
-    crate::role_routing::validate_preapproval_contingencies_for_snapshot(
+    crate::role_routing::validate_configured_contingencies_for_snapshot(
         &policy,
         snapshot,
         &role,
@@ -3480,6 +3480,84 @@ enabled = true
 
         validate_initial_policy(&config, &musterroll.snapshot)
             .expect("three provider plan pool is valid for every author, peer, and spec team");
+    }
+    #[test]
+    fn initial_policy_preflight_ignores_transient_availability_but_dispatch_does_not() {
+        let (temp, _paths, config, musterroll) =
+            plan_fixture("initial-policy-transient-availability");
+        let mut unavailable_snapshot = musterroll.snapshot;
+        for provider in &mut unavailable_snapshot.providers {
+            provider.state = if provider.provider_id == "opencode-go" {
+                "exhausted".to_string()
+            } else {
+                "unknown".to_string()
+            };
+            provider.availability = if provider.provider_id == "opencode-go" {
+                crate::musterroll::Availability::Exhausted
+            } else {
+                crate::musterroll::Availability::Unknown
+            };
+            provider.eligible = false;
+            provider.ineligibility_reason = Some("transient test state".to_string());
+        }
+        for profile in &mut unavailable_snapshot.profiles {
+            profile.state = "unavailable".to_string();
+            profile.eligible = false;
+            profile.ineligibility_reason = Some("transient test state".to_string());
+        }
+
+        validate_initial_policy(&config, &unavailable_snapshot)
+            .expect("static plan topology must not depend on transient availability");
+
+        let policy =
+            crate::role_routing::RoutingPolicy::from_config(&config, &unavailable_snapshot)
+                .expect("static policy");
+        let router = crate::role_routing::RoleRouter::with_pinned_snapshot(
+            &temp.0,
+            policy,
+            unavailable_snapshot.clone(),
+        )
+        .expect("router");
+        let error = router
+            .prepare_planner(
+                crate::role_routing::RunId::new("runtime-unavailable").expect("run id"),
+                crate::role_routing::RoleId::new("plan").expect("role"),
+                planner_constraints(&unavailable_snapshot, crate::config::Tier::Lead)
+                    .expect("constraints"),
+            )
+            .expect_err("runtime dispatch must remain fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("no hard-eligible profile remains"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn initial_policy_preflight_rejects_same_provider_only_contingencies() {
+        let (_temp, _paths, _config, musterroll) =
+            plan_fixture("initial-policy-same-provider");
+        let same_provider_config = crate::config::parse_str(
+            r#"
+[[role_binding]]
+role = "plan"
+profile_id = "planner-a"
+weight = 1
+enabled = true
+
+[[role_binding]]
+role = "plan"
+profile_id = "planner-d"
+weight = 1
+enabled = true
+"#,
+        )
+        .expect("same-provider policy parses before cross-provider preflight");
+
+        let error = validate_initial_policy(&same_provider_config, &musterroll.snapshot)
+            .expect_err("same-provider-only policy has no legal peer contingency");
+        assert!(error.contains("provider-distinct peer"), "{error}");
     }
     #[test]
     fn initial_policy_preflight_rejects_a_spec_pool_without_three_provider_contingencies() {
