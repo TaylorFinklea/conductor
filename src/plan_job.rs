@@ -2759,23 +2759,66 @@ fn execution_tier(
     }
 }
 
-/// Cancels an unstarted plan or an explicitly cancellable pre-authoring block,
-/// releasing the pending reservation while preserving scheduler rotation.
+#[derive(Clone, Copy)]
+enum PlanCancelMode {
+    PreAuthoring,
+    FailedAuthoring,
+}
+
+fn plan_cancel_mode(run: &crate::run::RunHandle) -> Result<PlanCancelMode, String> {
+    let plan = run.plan().map_err(|error| error.to_string())?;
+    if matches!(
+        plan.progress,
+        crate::run::PlanProgress::Prepared
+            | crate::run::PlanProgress::Blocked { cancellable: true }
+    ) {
+        return Ok(PlanCancelMode::PreAuthoring);
+    }
+    if !matches!(plan.progress, crate::run::PlanProgress::Authoring { .. }) {
+        return Err(
+            "plan cancel is legal only before authoring or after a failed author attempt"
+                .to_string(),
+        );
+    }
+    let planner_attempt = plan.stage_attempts.planner;
+    let events =
+        crate::run::read_events(&run.events_path()).map_err(|error| format!("plan events: {error}"))?;
+    let latest = events.iter().rev().find_map(|event| {
+        event
+            .plan_invocation
+            .as_ref()
+            .filter(|evidence| evidence.stage == crate::run::PlanStage::Planner)
+            .map(|evidence| (event, evidence))
+    });
+    if matches!(
+        latest,
+        Some((
+            crate::run::RunEvent {
+                kind: crate::run::EventKind::AttemptFinished,
+                outcome: Some(outcome),
+                ..
+            },
+            evidence,
+        )) if outcome == "failed"
+            && planner_attempt > 0
+            && evidence.attempt == planner_attempt
+    ) {
+        Ok(PlanCancelMode::FailedAuthoring)
+    } else {
+        Err("plan authoring cancellation requires a terminal failed latest attempt".to_string())
+    }
+}
+
+/// Cancels an unstarted plan, a cancellable pre-authoring block, or authoring
+/// whose latest planner invocation is durably evidenced as failed.
 pub(crate) fn cancel(
     paths: &PlanJobPaths,
     config: &crate::config::Config,
     run_id: &str,
 ) -> Result<(), String> {
-    let mut run = crate::run::RunHandle::open(&paths.state_dir, run_id)
+    let run = crate::run::RunHandle::open(&paths.state_dir, run_id)
         .map_err(|error| format!("plan run: {error}"))?;
-    let approval = load_approval(&run)?;
-    if !matches!(
-        run.plan().map_err(|error| error.to_string())?.progress,
-        crate::run::PlanProgress::Prepared
-            | crate::run::PlanProgress::Blocked { cancellable: true }
-    ) {
-        return Err("plan cancel is legal only before authoring starts".to_string());
-    }
+    plan_cancel_mode(&run)?;
     let roster_bytes = std::fs::read(run.dir().join("roster.json"))
         .map_err(|error| format!("captured Musterroll roster: {error}"))?;
     let snapshot = crate::musterroll::parse_roster_snapshot(&roster_bytes)
@@ -2785,17 +2828,38 @@ pub(crate) fn cancel(
     let router =
         crate::role_routing::RoleRouter::with_pinned_snapshot(&paths.state_dir, policy, snapshot)
             .map_err(|error| format!("role router: {error}"))?;
+    let reservation_run_id = crate::role_routing::RunId::new(run_id.to_string())
+        .map_err(|error| error.to_string())?;
     let _guard = router
-        .acquire_run_transition(
-            &crate::role_routing::RunId::new(run_id.to_string())
-                .map_err(|error| error.to_string())?,
-        )
+        .acquire_run_transition(&reservation_run_id)
         .map_err(|error| format!("plan run guard: {error}"))?;
-    router
-        .cancel(&approval.reservation)
-        .map_err(|error| format!("planner reservation: {error}"))?;
-    run.cancel_prepared_plan()
-        .map_err(|error| format!("plan cancellation: {error}"))
+    let mut run = crate::run::RunHandle::open(&paths.state_dir, run_id)
+        .map_err(|error| format!("plan run after guard: {error}"))?;
+    let mode = plan_cancel_mode(&run)?;
+    let role = crate::role_routing::RoleId::new("plan").map_err(|error| error.to_string())?;
+    let reservation = router
+        .reservation(
+            &role,
+            crate::role_routing::PlanStage::Planner,
+            &reservation_run_id,
+        )
+        .map_err(|error| format!("planner reservation: {error}"))?
+        .ok_or_else(|| "planner reservation is missing".to_string())?;
+    match mode {
+        PlanCancelMode::PreAuthoring => {
+            router
+                .cancel(&reservation)
+                .map_err(|error| format!("planner reservation: {error}"))?;
+            run.cancel_prepared_plan()
+        }
+        PlanCancelMode::FailedAuthoring => {
+            router
+                .release_capacity(&reservation)
+                .map_err(|error| format!("planner reservation capacity: {error}"))?;
+            run.cancel_failed_authoring_plan()
+        }
+    }
+    .map_err(|error| format!("plan cancellation: {error}"))
 }
 
 pub(crate) fn status(paths: &PlanJobPaths, run_id: &str) -> Result<String, String> {
@@ -4199,9 +4263,65 @@ enabled = true
         )
         .expect("started evidence");
 
+        assert!(
+            cancel(&paths, &config, &prepared.run_id).is_err(),
+            "an unmatched attempt_started event must remain noncancellable"
+        );
+
         reconcile_plan_reservations(&router, &paths.state_dir).expect("reconciliation");
         let next = prepare_implementation_run(&paths, &config, &musterroll, &repo, "second", 0);
         assert_eq!(prepared_author(&paths, &next.run_id), "planner-b");
+    }
+
+    #[test]
+    fn successful_authoring_evidence_is_not_cancellable_before_stage_transition() {
+        let (temp, paths, _config, musterroll) = plan_fixture("returned-authoring-cancel");
+        let repo = initialized_repo(&temp);
+        let config = dominant_profile_config();
+        let prepared = prepare_implementation_run(&paths, &config, &musterroll, &repo, "first", 0);
+        let mut run =
+            crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        let approval = load_approval(&run).expect("approval");
+        let router = fixture_router(&paths, &config, &musterroll);
+        router
+            .commit(&approval.reservation)
+            .expect("commit before call");
+        run.start_plan_authoring(approval.author.clone())
+            .expect("authoring checkpoint");
+        run.record_plan_author_attempt()
+            .expect("attempt checkpoint");
+        let profile = profile_for_execution(&musterroll.snapshot, &approval.author).expect("profile");
+        append_plan_invocation(
+            &mut run,
+            &paths.ledger_path,
+            crate::run::EventKind::AttemptStarted,
+            crate::run::PlanStage::Planner,
+            &approval.author,
+            &profile,
+            b"successful invocation",
+            None,
+            1,
+            "started",
+        )
+        .expect("started evidence");
+        append_plan_invocation(
+            &mut run,
+            &paths.ledger_path,
+            crate::run::EventKind::AttemptFinished,
+            crate::run::PlanStage::Planner,
+            &approval.author,
+            &profile,
+            b"successful invocation",
+            Some(b"returned plan"),
+            1,
+            "returned",
+        )
+        .expect("returned evidence");
+
+        assert!(
+            cancel(&paths, &config, &prepared.run_id).is_err(),
+            "a successful authoring result must remain noncancellable"
+        );
     }
 
     #[test]
@@ -4829,6 +4949,78 @@ enabled = true
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
         cancel(&paths, &config, &prepared.run_id).expect("cancel blocked plan");
         assert_eq!(status(&paths, &prepared.run_id).expect("status"), "blocked");
+    }
+
+    #[test]
+    fn failed_authoring_attempt_can_be_canceled_without_reactivating_capacity() {
+        let (temp, paths, config, musterroll) = plan_fixture("cancel-failed-authoring");
+        let repo = initialized_repo(&temp);
+        let prepared = prepare(
+            &paths,
+            &config,
+            &musterroll,
+            PlanPrepareRequest {
+                repo,
+                input: PlanPrepareInput::Artifact {
+                    bytes: b"author this".to_vec(),
+                    tier: crate::run::PlanTier::Lead,
+                    complexity: crate::run::PlanComplexity::XL,
+                },
+                output_kind: PlanOutputKind::ImplementationPlan,
+                max_plan_revisions: 1,
+                require_second_opinion: false,
+            },
+        )
+        .expect("prepare");
+        approve(&paths, &prepared.run_id);
+        let author = FailingAuthor(std::sync::Mutex::new(0));
+
+        assert!(dispatch(&paths, &config, &musterroll, &prepared.run_id, &author).is_err());
+        assert_eq!(status(&paths, &prepared.run_id).expect("status"), "authoring");
+        cancel(&paths, &config, &prepared.run_id).expect("cancel failed authoring");
+
+        let run = crate::run::RunHandle::open(&paths.state_dir, &prepared.run_id).expect("run");
+        assert!(matches!(
+            run.manifest().lifecycle,
+            crate::run::RunLifecycle::Finished
+        ));
+        let events = crate::run::read_events(&run.events_path()).expect("events");
+        assert!(matches!(
+            events.last(),
+            Some(crate::run::RunEvent {
+                kind: crate::run::EventKind::RunFinished,
+                outcome: Some(outcome),
+                ..
+            }) if outcome == "canceled"
+        ));
+        let roster_bytes = std::fs::read(run.dir().join("roster.json")).expect("roster");
+        let snapshot =
+            crate::musterroll::parse_roster_snapshot(&roster_bytes).expect("snapshot");
+        let policy = crate::role_routing::RoutingPolicy::from_config(&config, &snapshot)
+            .expect("routing policy");
+        let router = crate::role_routing::RoleRouter::with_pinned_snapshot(
+            &paths.state_dir,
+            policy,
+            snapshot,
+        )
+        .expect("router");
+        let role = crate::role_routing::RoleId::new("plan").expect("role");
+        let reservation_run_id =
+            crate::role_routing::RunId::new(prepared.run_id.clone()).expect("run id");
+        let reservation = router
+            .reservation(
+                &role,
+                crate::role_routing::PlanStage::Planner,
+                &reservation_run_id,
+            )
+            .expect("reservation lookup")
+            .expect("reservation");
+        assert!(
+            !router
+                .release_capacity(&reservation)
+                .expect("capacity remains inactive"),
+            "cancel must release planner capacity idempotently"
+        );
     }
 
     #[test]

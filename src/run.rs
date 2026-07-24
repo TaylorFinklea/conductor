@@ -1967,6 +1967,21 @@ impl RunHandle {
         self.finish("canceled")
     }
 
+    pub(crate) fn cancel_failed_authoring_plan(&mut self) -> Result<()> {
+        if !matches!(self.plan()?.progress, PlanProgress::Authoring { .. }) {
+            return Err(RunError::new(
+                "failed-authoring cancellation requires active authoring state",
+            ));
+        }
+        self.plan_mut("canceling failed authoring plan")?.progress =
+            PlanProgress::Terminal {
+                verdict: PlanTerminalVerdict::Blocked,
+            };
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()?;
+        self.finish("canceled")
+    }
+
     /// Marks a plan document with unresolved author questions as terminal
     /// needs-input rather than allowing a schema-shaped artifact to proceed.
     pub(crate) fn finish_plan_needs_input(&mut self, artifact: ArtifactRef) -> Result<()> {
