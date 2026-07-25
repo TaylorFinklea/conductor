@@ -2,7 +2,7 @@
 
 ## Goal
 
-Add a read-only `undertake dashboard` TUI that makes one active Undertake run understandable without opening state files, reports, or service-specific CLIs. The opening view prioritizes current work; fleet and service health remain secondary. This first version establishes a clean command-intent boundary for later OMP-powered actions but performs no mutations.
+Add a read-only `undertake dashboard` TUI that makes one Undertake run understandable without opening state files, reports, or service-specific CLIs. The opening view prioritizes current work; fleet and service health remain secondary. This first version establishes a separate command-intent boundary for later OMP-powered actions but performs no mutations.
 
 ## Product boundary
 
@@ -10,62 +10,165 @@ Add a read-only `undertake dashboard` TUI that makes one active Undertake run un
 - Reads local authoritative artifacts and read-only service outputs directly.
 - Never approves, dispatches, retries, cancels, resumes, edits routing, writes service state, or launches a model.
 - No daemon, socket, database, background service, or new cross-service wire protocol.
-- A later phase may add full operations through explicit command intents; it must not grant mutation authority to the snapshot reader or render layer.
+- Snapshot readers and renderers receive no mutable `RunHandle` and never open a run directory for write.
+- Never touches `leases/`, `heartbeat`, `promotion.json`, or `approval.json`; observation cannot perturb pending-work or quarantine scans.
+- A later phase may add operations through an authorized executor calling public CLIs. Mutation authority never enters readers or rendering code.
 
 ## Command contract
 
 ```text
-undertake dashboard [--run <run-id>] [--refresh-ms <milliseconds>]
+undertake dashboard [--run <run-id>] [--refresh-ms <milliseconds>] [--config <path>]
 ```
 
-- No `--run`: select the newest nonterminal run, otherwise the newest terminal run.
-- `--run`: pin the selected run; an unknown ID is a visible terminal error with exit code 2.
-- Default refresh: 1000 ms. Accepted range: 250–60000 ms; invalid values exit 2.
+- `--config` follows existing CLI parsing and state/report-root resolution, including `UNDERTAKE_REPORTS_HOME`; duplicate or unknown arguments exit 2.
+- `--run` passes the existing single-normal-component run-ID validation before joining `runs-v2/`. Unknown IDs exit 2.
+- `--refresh-ms` governs local artifact polling only. Default 1000 ms; accepted range 250–60000; invalid values exit 2.
+- Musterroll refreshes no more often than every 30 seconds.
+- Afterfact and Cautionlight refresh only on demand via `r` while Evidence is focused, never more often than every 300 seconds.
 - `q` exits 0. Terminal setup failures and unrecoverable initial source errors exit 1.
-- The command restores the terminal on normal exit, error, panic, and interrupt.
+
+### Run discovery and selection
+
+- “Newest” means greatest parsed RFC3339 `manifest.created_at`, never directory-name order. Ties break by directory name descending.
+- Scan at most the 200 most recently modified `runs-v2/<id>/manifest.json` files, each capped at 128 KiB.
+- Default selection is the newest run whose lifecycle is nonterminal, even when liveness is abandoned; otherwise select the newest terminal run.
+- A malformed newest candidate is selected and displayed with its error rather than silently falling back.
+
+## Dependencies and feature gate
+
+- Add optional `ratatui = 0.29.0` and `crossterm = 0.28.1` dependencies behind a default-on `tui` feature, matching the existing roster-TUI decision.
+- These releases support the repository’s Rust 1.85 MSRV (`ratatui` 0.29 requires 1.74; `crossterm` 0.28.1 requires 1.63). Ratatui 0.30 is prohibited because it requires Rust 1.88.
+- `undertake dashboard` is compiled only with `tui`; a no-default-features build retains the non-TUI CLI.
+- Record release-binary size before/after and accept the increase only if the stripped release remains operationally reasonable; size is evidence, not a fixed speculative threshold.
 
 ## Architecture
 
-### Source adapters
+### Undertake run adapter
 
-Each adapter is read-only and returns typed data plus freshness/error metadata.
+Reads only from the configured Undertake state root:
 
-1. **Undertake run adapter**
-   - Reads active `runs-v2/<run-id>/manifest.json` and `events.jsonl`.
-   - Reads the matching Harness Deck report when present, including `status` and `live`.
-   - Reads bounded tails from attempt stdout/stderr logs; never loads an unbounded log into memory.
-2. **Musterroll adapter**
-   - Invokes `musterroll status --json` with stdin closed and a bounded timeout.
-   - Preserves provider availability, source, checked/data-as-of/expiry timestamps, usage windows, and reason.
-3. **Afterfact adapter**
-   - Invokes `afterfact events --since 24h` with stdin closed, bounded output, and a bounded timeout.
-   - Parses only `afterfact/event@2` JSONL and locally correlates typed run/attempt identifiers; it never enables `--unsafe-include-tool-input`.
-4. **Cautionlight adapter**
-   - Pipes the already bounded Afterfact event bytes to `cautionlight inspect --stdin` with bounded output and a bounded timeout.
-   - Parses only `cautionlight/finding@1` JSONL and associates findings by typed artifact/run identifiers.
+- atomic `runs-v2/<run-id>/manifest.json`;
+- `heartbeat` metadata, without touching it;
+- run-local `roster.json`;
+- bounded incremental `events.jsonl`;
+- fixed-allowlist local logs;
+- matching Harness Deck report when the job has a defined join.
+
+Use dashboard-local forward-compatible mirrors of `undertake/run@2` and `undertake/event@2`: ignore unknown fields, but fail the source closed on unknown schema. Do not weaken operational readers used for mutation or recovery.
+
+Resolve opaque profile IDs through the run-local `musterroll/roster@2` snapshot using existing Musterroll parsing. Never parse identity from a profile-ID string and never reopen the source roster artifact. Display manifest roster path/hash/size and policy digest as provenance only.
+
+#### Event tailing
+
+- Read incrementally from the last successfully parsed newline.
+- Cap input at 8 MiB and retain at most 5,000 events per run; show truncation.
+- A trailing partial line is an ordinary concurrent append: do not advance the offset, do not mark stale, retry next tick.
+- A complete invalid line, sequence gap, or schema mismatch is a source error; retain the last valid snapshot generation.
+- Unknown outcome strings are displayed verbatim after sanitization and length caps, never interpreted as success.
+
+#### Liveness
+
+Lifecycle and liveness are separate. Derive liveness from heartbeat/`updated_at`, configured 60-second stale-claim threshold, 5-second expected heartbeat, and nonmutating owner/worker process probes:
+
+- `live`: nonterminal and heartbeat younger than the stale threshold;
+- `silent`: heartbeat stale but a recorded PID currently exists; PID reuse makes this evidence, not proof;
+- `abandoned`: heartbeat stale, no recorded PID exists, and no `run_finished` event exists;
+- `unknown`: no usable heartbeat or recorded PID evidence;
+- `finished`: terminal lifecycle.
+
+The primary badge is liveness; lifecycle and stage remain separate fields. The Patchstand pilot `run-work-20260725T183920.469500000-p45813-000000` must render `abandoned`, not `running`.
+
+#### Attempts
+
+Reconstruction is job-specific:
+
+- Work/review/consult: join `attempt_started` outcomes shaped `running:<attempt-directory>` to fixed run-local `attempts/<NNN>-<opaque-profile-id>/`; ordinal comes from `<NNN>`. Resolve provider, harness, model, and dispatch ID only from `roster.json`.
+- Plan: use typed `plan_invocation` evidence and route stages. Stage-marker events such as `planner_authoring` are markers, not worker attempts.
+- Role appears only when typed source data supplies it. Other views omit the column.
+- Duration is matching finish timestamp minus start timestamp. Unpaired starts show elapsed time and “no finish event.”
+- Unresolvable profile identity remains visible as the opaque ID with an unresolved marker.
+- A job with no attempts shows an explicit empty state; no synthetic placeholder.
+
+#### Logs and artifacts
+
+Open only this fixed allowlist after canonicalizing the run directory, joining relative components, canonicalizing the candidate, and confirming containment:
+
+- `attempts/*/worker.stdout.log`;
+- `attempts/*/worker.stderr.log`;
+- `artifacts/verify/stdout.log`;
+- `artifacts/verify/stderr.log`.
+
+`manifest.artifacts[].path` and event artifact paths are display-only and are never opened; valid manifests can contain absolute out-of-run paths. Never derive a read path from model output, an artifact path string, an opaque profile ID, or an event-reported cwd.
+
+Tail at most 64 KiB. Seek from EOF, discard through the first newline when starting mid-file, decode lossily, strip any leading partial escape sequence, then sanitize all control characters. Show truncation and source path.
+
+#### Harness Deck join
+
+- Work: `details.state.cycle_id` maps to the report run directory.
+- Plan: `run_id` maps to the report run directory.
+- Consult/review: no report; show “no Harness Deck report for this job.”
+- Resolve paths only through existing report-root/run-directory validation.
+
+#### Verification precedence
+
+1. durable `details.state.mechanical` when present;
+2. latest valid `verify_finished` event;
+3. `not run`.
+
+`verifier.mechanical` supplies the command string. Disagreement is visible rather than silently reconciled.
+
+### Musterroll adapter
+
+Reuse `MusterrollClient::status` through `CommandMusterrollClient`; do not add a second parser. Add a bounded subprocess implementation behind the existing trait seam if required. Preserve provider availability, source, checked/data-as-of/expiry timestamps, windows, and reason. Render only an allowlisted sanitized subset of `ProviderStatus.extra`, initially `observation_expiry_basis` and `observation_model`; drop other keys.
+
+### Afterfact adapter
+
+Optional, on-demand, and independently timestamped:
+
+- Run `afterfact events --since 1h` with stdin closed.
+- Cap stdout at 4 MiB/20,000 lines and stderr at 256 KiB; timeout after 60 seconds.
+- Exit 0 is complete. Exit 1 is partial success: parse valid `afterfact/event@2` JSONL and show a bounded coverage-gap summary from stderr. Exit ≥2, spawn failure, or timeout is an error.
+- Correlation is explicitly heuristic, never called typed: exact canonical prefix match of `event.repo.cwd` against `<state-root>/runs-v2/<run-id>/`, or exact `git_commit` equality with a typed worker commit when present. Event paths are comparison data only and are never opened. Show correlated and uncorrelated counts.
+
+### Cautionlight adapter
+
+Cautionlight remains roadmap-deferred. V1 includes its parser, bounded pipeline adapter, empty/deferred panel, and fixtures, but does not make it a live acceptance requirement. When enabled later, pipe the bounded Afterfact bytes into `cautionlight inspect --stdin` under the same process/output/timeout policy. Exit 1 is partial success; parse valid `cautionlight/finding@1` JSONL and preserve coverage warnings.
 
 ### Snapshot reducer
 
 Adapters reduce into an immutable `DashboardSnapshot` containing:
 
-- selected run identity, job, lifecycle, stage, target repo/Bead, start/update timestamps;
+- run identity, job, lifecycle, liveness, stage, target repo/Bead, and timestamps;
 - progress and elapsed time;
-- attempts with role, ordinal, profile ID, provider ID, harness, lifecycle, duration, and failure summary;
-- verification state and command outcome;
-- bounded log tails with source paths and truncation indicators;
+- reconstructed attempts and stage markers;
+- verification state/evidence;
+- bounded sanitized log tails;
 - provider availability;
-- Afterfact correlation/ingestion state;
-- Cautionlight findings by severity;
+- Afterfact correlation/coverage state;
+- Cautionlight deferred/findings state;
 - recent terminal runs;
-- per-source freshness and errors.
+- per-source last-ok, last-attempt, in-flight, next-attempt, truncation, freshness, and error metadata.
 
-The renderer consumes only `DashboardSnapshot`; it never reads files or launches commands.
+The renderer consumes only `DashboardSnapshot`. Build the next generation off-screen and replace the current snapshot atomically in memory. A source failure retains that source’s last valid value and marks it stale with the current error. Never present independently sampled services as one distributed transaction.
 
-A refresh is generation-based: build the next complete snapshot off-screen, then replace the current snapshot. A source failure retains that source's last valid value and marks it stale with the current error. Data from different generations is visibly timestamped; it is never presented as one atomic distributed transaction.
+### Runtime and concurrency
 
-### TUI runtime
+- One main event loop owns terminal input and rendering and never blocks on an adapter.
+- Local files are polled synchronously within strict byte/count bounds.
+- Service subprocess workers communicate through bounded `std::sync::mpsc` channels. At most one request per adapter is in flight; refresh ticks drop while pending.
+- Every worker entry catches ordinary errors. Because release uses `panic = "abort"`, install terminal restoration before any worker starts; a worker panic still aborts, but the panic hook restores the terminal first.
+- Spawn subprocesses in process groups, cap output while reading, terminate the whole group on timeout/cap breach, and reap before replacement or exit. Reuse existing bounded dispatch primitives where safe rather than `Command::output()`.
 
-Use Ratatui and Crossterm. One event loop owns terminal input, refresh scheduling, and rendering. Slow service commands run outside the render-critical section with one in-flight request per adapter; refresh ticks do not accumulate work. Subprocesses have bounded output and timeouts and are reaped before replacement or exit.
+### Terminal restoration
+
+Before raw mode or alternate-screen entry:
+
+- install a panic hook that restores raw mode/screen/cursor then delegates to the prior hook; panic hooks run under `panic = "abort"`;
+- create an idempotent restoration guard for normal/error exit;
+- handle Ctrl-C as a key event under raw mode;
+- use safe dependency-provided signal handling for `SIGTERM`/`SIGHUP` restoration and, if supported, `SIGTSTP`/`SIGCONT`; project code remains `unsafe_code = "forbid"`.
+
+Restoration is idempotent and cannot panic.
 
 ## Views
 
@@ -73,19 +176,21 @@ Use Ratatui and Crossterm. One event loop owns terminal input, refresh schedulin
 
 Opening screen:
 
-- header: run ID, job, lifecycle/stage, target, elapsed time, last update, stale indicator;
-- progress: current step and bounded progress when reported;
-- attempts: role, model/profile, provider, harness, status, elapsed time, retry/fallback relationship;
-- verification: pending/running/passed/failed plus concise evidence;
-- log tail: latest selected attempt output, source label, truncation/staleness state;
-- downstream: Afterfact correlation and Cautionlight finding summary.
+- run ID, job, lifecycle, primary liveness badge, target, elapsed time, last update;
+- current stage and bounded progress;
+- attempts/stage markers with profile/model/provider/harness when resolvable;
+- mechanical and qualitative verification state with precedence/source;
+- selected bounded log tail;
+- Afterfact correlation/coverage summary and Cautionlight deferred/findings summary.
+
+Per-job empty states are explicit. Consult can have empty state/no attempts; Plan shows route stages; work/review omit unavailable roles; jobs without reports say so.
 
 ### Secondary panels
 
-- **Providers:** Musterroll availability, usage windows, expiry, and exclusion reason.
-- **Evidence:** Afterfact attempts/correlation and Cautionlight findings.
+- **Providers:** Musterroll availability, windows, expiry, and exclusion reason.
+- **Evidence:** on-demand Afterfact correlation/coverage and Cautionlight deferred/findings state.
 - **Recent runs:** newest terminal runs with outcome and target.
-- **Help:** keys, source meanings, freshness semantics, and read-only notice.
+- **Help:** keys, freshness/liveness semantics, data-source caveats, and read-only notice.
 
 ### Navigation
 
@@ -93,53 +198,62 @@ Opening screen:
 - `Tab`/`Shift-Tab`: panel focus.
 - `Enter`: selected attempt or run detail.
 - `l`: toggle focused log detail.
-- `r`: immediate refresh without starting a duplicate in-flight refresh.
+- `r`: immediate eligible refresh; no duplicate in-flight request.
 - `?`: help.
 - `q`: quit.
 
-Layouts support normal terminals and a compact mode. Below the documented minimum dimensions, render a resize message instead of clipping or panicking. Color is supplemental; status always has text or symbols.
+Compact and normal layouts are required. Below minimum dimensions, render a resize message. Color is supplemental; every state has text or symbols.
 
 ## Error and trust model
 
-- Treat Bead text, model output, logs, report prose, and findings as untrusted display data.
-- Never interpret ANSI/control sequences from artifacts or logs. Sanitize control characters before rendering.
-- Never follow paths supplied by displayed model output. Read only paths derived from configured state roots and validated run artifacts.
-- Bound file sizes, line counts, subprocess output, and render string lengths.
-- A malformed newest run does not silently select an older run; display the malformed run and its error.
-- Missing optional services degrade their panels only.
-- Schema mismatches are explicit and fail closed for that source.
-- Provider `unknown`, `exhausted`, and stale states remain distinct.
-- The dashboard is observational. It must not acquire dispatch leases or alter run recovery behavior.
+- Bead text, model output, logs, report prose, events, provider extras, and findings are untrusted display data.
+- Strip ANSI/control sequences and length-cap every displayed string.
+- Bound every file, retained collection, subprocess output, and read duration.
+- Never follow data-derived paths outside the fixed canonical allowlist.
+- Malformed newest runs remain visible; no silent fallback.
+- Optional/missing services affect only their panels.
+- Schema mismatch fails that source closed and retains prior valid data as stale.
+- `unknown`, `silent`, `abandoned`, `exhausted`, `partial`, and `stale` remain distinct.
+- Read-only observation acquires no dispatch lease and changes no recovery behavior.
 
 ## Future action boundary
 
-Define UI actions as internal, typed intents even though v1 implements only navigation, refresh, and quit. Future mutation intents—approve, dispatch, cancel, resume, retry, and routing changes—must be handled by a separate authorized command executor, likely OMP-powered. The executor must call public Undertake/service commands, preserve approval scopes and concurrency guards, emit durable evidence, and return results that re-enter through normal source adapters. It must never mutate private state files directly.
+V1 defines typed UI intents only for navigation, selection, refresh, help, and quit. Future approve/dispatch/cancel/resume/retry/routing intents go to a separate authorized executor, likely OMP-powered. That executor must:
 
-## Verification
+- invoke public Undertake/service commands, never private file mutation;
+- preserve exact approval scope, leases, provider gates, and concurrency guards;
+- emit normal durable events/artifacts;
+- return results through existing adapters;
+- have no ability to hand mutable run state to readers or renderer.
 
-1. Parser fixtures for current and terminal `undertake/run@2`, `undertake/event@2`, Harness Deck live reports, and Musterroll status.
-2. Reducer tests for lifecycle transitions, retries/fallbacks, stale-source retention, malformed schemas, missing optional services, and out-of-order event rejection/labeling.
-3. Security tests for ANSI/control-sequence stripping, oversized logs/events, path containment, and bounded subprocess output.
-4. Deterministic render snapshots at compact, normal, and wide terminal sizes; status remains legible without color.
-5. PTY smoke test: launch against a synthetic active run, observe refresh, navigate, show logs/help, quit, and verify terminal restoration.
-6. Live acceptance: run against the bounded Patchstand pilot and confirm active stage, selected Codex profile/provider/harness, attempt progression, verification outcome, Afterfact correlation state, and Cautionlight state match authoritative artifacts.
-7. Existing full test suite and strict Clippy remain green. Formatting is scoped to edited files because this repository is not baseline-rustfmt-clean.
+## Discriminating verification
+
+1. **Liveness:** nonterminal + heartbeat older than 60 seconds + dead recorded PIDs + no finish event renders `abandoned`; fresh heartbeat renders `live`. Use the failed Patchstand run as a regression fixture.
+2. **Torn append:** partial final event line produces no error/stale marker; completing it yields exactly one event. Complete invalid line produces a durable source error with last-valid retention.
+3. **Bounds:** event/log caps truncate visibly without unbounded allocation.
+4. **Path containment:** absolute `/etc/passwd` artifact and traversal artifact are never opened; fixed allowlist still works.
+5. **Attempt reconstruction:** nested plan markers are not attempts; work attempt joins opaque profile to run-local roster; unresolved profile is explicit.
+6. **Correlation:** substring-only fake run path does not correlate; exact canonical prefix does. No correlated event path is opened.
+7. **Partial service success:** fake Afterfact/Cautionlight emits valid JSONL then exits 1; data and coverage warning render. Exit 2 is error.
+8. **Subprocess containment:** oversized and hanging fake tools are process-group killed/reaped; UI input remains responsive.
+9. **Terminal restoration:** PTY verifies `q`, `SIGTERM`, and induced release-profile panic leave raw/alternate mode and restore cursor.
+10. **Forward compatibility:** unknown extra manifest/event fields render; unknown schema fails only that source.
+11. **Sanitization:** split UTF-8 and partial CSI log tails produce no terminal control output.
+12. **Rendering:** compact/normal/wide deterministic snapshots remain legible without color and include explicit job empty states.
+13. **Live Patchstand acceptance:** show the exact failed pilot as work job, `abandoned` liveness, implementing stage, Luna profile resolved to OpenAI Codex/Codex harness via `roster.json`, canonical `pnpm check` failure, and available Afterfact heuristic correlation/coverage counts. Cautionlight uses fixtures while deferred.
+14. Full `cargo test`, strict `cargo clippy --all-targets --all-features -- -D warnings`, no-default-features build, scoped formatting, and release build pass.
 
 ## Acceptance criteria
 
-- `undertake dashboard` tracks a real active run without mutating any service or repository.
-- The opening screen answers: what is running, where, at which stage, under which model/profile/provider/harness, for how long, and what failed or remains.
-- Stale, missing, malformed, and unsupported sources are distinguishable.
-- Logs and untrusted prose cannot inject terminal controls or cause arbitrary path reads.
-- Refresh remains responsive while service queries are slow.
-- Terminal state is restored on every exit path.
+- `undertake dashboard` tracks a real run without mutating any service or repository.
+- The opening screen accurately distinguishes lifecycle from liveness and answers what ran, where, at which stage, under which resolved execution identity, for how long, and what failed or remains.
+- The abandoned Patchstand pilot is never presented as actively running.
+- Stale, missing, malformed, partial, truncated, deferred, and unsupported sources are distinguishable.
+- Untrusted bytes cannot inject terminal controls or trigger arbitrary path reads.
+- Input remains responsive while service queries are slow.
+- Terminal state is restored on normal exit, error, signal, and aborting panic.
 - The architecture permits later full actions without moving mutation authority into readers or rendering code.
 
 ## Mandatory pre-implementation review gate
 
-Before implementation, this specification must receive adversarial reviews from both:
-
-- Anthropic Claude Opus 5 through OMP;
-- Ollama Cloud GLM-5.2 through OMP.
-
-Both reviews must assess specification completeness, source-contract assumptions, terminal safety, concurrency, failure semantics, test discriminating power, and the future action boundary. Findings must be reconciled into this specification, and any unresolved blocker prevents implementation. After the gate passes, implementation may be dispatched among Opus, Sonnet, Ollama Cloud GLM-5.2, and Ollama Cloud MiniMax M3 as appropriate.
+This revision reconciles mandatory adversarial reviews from Anthropic Claude Opus 5 and Ollama Cloud GLM-5.2, both through OMP. No implementation begins until both reviewers’ blockers are incorporated and the human approves the reconciled specification. Implementation may then be dispatched among Opus, Sonnet, Ollama Cloud GLM-5.2, and Ollama Cloud MiniMax M3 as appropriate.
