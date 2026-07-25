@@ -448,6 +448,45 @@ fn previously_valid_run_source_goes_stale_retaining_its_value() {
     );
 }
 
+/// A run-source tick never samples a service, so it must carry the existing
+/// service states forward *by reference*. Deep-copying them would reproduce up
+/// to 20,000 retained Afterfact events on every refresh to rebuild a value
+/// nothing modified.
+#[test]
+fn a_run_source_tick_shares_service_states_rather_than_copying_them() {
+    let temp = TempState::new();
+    let run_id = "run-work-20260725T120000.000000000-p2-000000";
+    temp.write_run(
+        run_id,
+        &temp.work_manifest(run_id, "2026-07-25T12:00:00Z", "running"),
+    );
+    let source = temp.source();
+    let first: DateTime<Utc> = "2026-07-25T20:00:00Z".parse().expect("first");
+
+    let cold = source.snapshot(None, &RunSelection::Newest, first);
+
+    assert!(
+        matches!(*cold.musterroll, SourceState::Absent { last_attempt: None, .. }),
+        "an unsampled service starts never-read, got {:?}",
+        cold.musterroll
+    );
+    assert!(
+        matches!(*cold.cautionlight, SourceState::Deferred { .. }),
+        "Cautionlight is deliberately deferred, not merely unread, got {:?}",
+        cold.cautionlight
+    );
+
+    let second: DateTime<Utc> = "2026-07-25T20:00:05Z".parse().expect("second");
+    let next = source.snapshot(Some(&cold), &RunSelection::Newest, second);
+
+    assert!(Arc::ptr_eq(&cold.musterroll, &next.musterroll));
+    assert!(Arc::ptr_eq(&cold.afterfact, &next.afterfact));
+    assert!(
+        Arc::ptr_eq(&cold.cautionlight, &next.cautionlight),
+        "the tick must share the service state, not rebuild it"
+    );
+}
+
 /// The 200-candidate cap bounds *discovery*, not explicit selection. Pinning
 /// the dashboard to a named run with `--run <id>` must keep working for a run
 /// older than the newest 200 — otherwise the one thing an operator does to

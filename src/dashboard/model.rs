@@ -13,6 +13,7 @@
 //! (`Live`, `Silent`, `Abandoned`, `Unknown`, `Finished`) must never collapse
 //! into one another — see [`RunLiveness`].
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -435,8 +436,15 @@ pub(crate) struct RunSnapshot {
 /// The top-level immutable snapshot the renderer consumes. Task 1 populates
 /// the run-source portion; Task 2 adds service source states (Musterroll,
 /// Afterfact, Cautionlight) and Task 3 adds UI-only selection state.
+///
+/// Deliberately not `Eq`: a Musterroll usage `Window` carries a float
+/// percentage, so the service states this gained in Task 2 are only
+/// `PartialEq`. Snapshot comparison is a test and change-detection
+/// convenience, never an identity claim, so the weaker bound is the honest
+/// one.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DashboardSnapshot {
+    /// The selected run, with its per-source state.
     pub(crate) run: SourceState<RunSnapshot>,
     /// Recent terminal runs (bounded).
     pub(crate) recent: SourceState<Vec<RecentRun>>,
@@ -450,11 +458,17 @@ pub(crate) struct DashboardSnapshot {
     /// perfectly `Fresh` while some entries were skipped.
     pub(crate) discovery_warning: Option<String>,
     /// Musterroll provider availability state.
-    pub(crate) musterroll: SourceState<MusterrollSnapshot>,
+    ///
+    /// The three service states are shared rather than owned. Each service
+    /// samples on its own cadence, so every run-source tick carries the
+    /// current one forward unchanged; owning it would deep-copy up to
+    /// 20,000 retained Afterfact events per refresh to reproduce a value
+    /// nothing modified.
+    pub(crate) musterroll: Arc<SourceState<MusterrollSnapshot>>,
     /// Afterfact correlation/coverage state.
-    pub(crate) afterfact: SourceState<AfterfactSnapshot>,
+    pub(crate) afterfact: Arc<SourceState<AfterfactSnapshot>>,
     /// Cautionlight deferred/findings state.
-    pub(crate) cautionlight: SourceState<CautionlightSnapshot>,
+    pub(crate) cautionlight: Arc<SourceState<CautionlightSnapshot>>,
 }
 
 #[cfg(test)]

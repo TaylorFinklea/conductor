@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
-use std::process::{Command, Stdio};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -686,7 +685,7 @@ impl CommandMusterrollClient {
 
 impl MusterrollClient for CommandMusterrollClient {
     fn status(&self) -> Result<StatusReport> {
-        let outcome = crate::dashboard::BoundedCommand::new("musterroll")
+        let outcome = crate::process::BoundedCommand::new("musterroll")
             .args(["status", "--json"])
             .stdout_cap(4 * 1024 * 1024)
             .stderr_cap(256 * 1024)
@@ -713,7 +712,7 @@ impl MusterrollClient for CommandMusterrollClient {
     }
 
     fn roster_snapshot(&self) -> Result<RosterSnapshot> {
-        let outcome = crate::dashboard::BoundedCommand::new("musterroll")
+        let outcome = crate::process::BoundedCommand::new("musterroll")
             .args(["roster", "snapshot", "--json"])
             .stdout_cap(4 * 1024 * 1024)
             .stderr_cap(256 * 1024)
@@ -739,7 +738,7 @@ impl MusterrollClient for CommandMusterrollClient {
 
     fn observe(&self, request: &ObservationRequest) -> Result<()> {
         let args = observation_args(request);
-        let outcome = crate::dashboard::BoundedCommand::new("musterroll")
+        let outcome = crate::process::BoundedCommand::new("musterroll")
             .args(&args)
             .stdout_cap(4 * 1024 * 1024)
             .stderr_cap(256 * 1024)
@@ -768,21 +767,6 @@ fn spawn_error(command: &str, error: &io::Error) -> MusterrollError {
         io::ErrorKind::NotFound => MusterrollError::unavailable("musterroll unavailable on PATH"),
         _ => MusterrollError::command(format!("failed to spawn {command}: {error}")),
     }
-}
-
-fn command_failure(command: &str, output: &std::process::Output) -> MusterrollError {
-    let status = output
-        .status
-        .code()
-        .map_or_else(|| "signal".to_string(), |code| code.to_string());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let detail = if stderr.trim().is_empty() {
-        stdout.trim()
-    } else {
-        stderr.trim()
-    };
-    MusterrollError::command(format!("{command} exited {status}: {detail}"))
 }
 
 #[allow(dead_code)]

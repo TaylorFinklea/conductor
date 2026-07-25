@@ -17,6 +17,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -25,6 +26,10 @@ use super::STALE_HEARTBEAT_THRESHOLD;
 use crate::dashboard::model::{
     AttemptRecord, DashboardSnapshot, LogTail, RecentRun, RunIdentity, RunLiveness, RunSnapshot,
     SourceState, StageMarker, VerificationRecord, VerificationSource,
+};
+use crate::dashboard::sanitize::sanitize_text;
+use crate::dashboard::services::{
+    AfterfactSnapshot, CautionlightDashboardSource, CautionlightSnapshot, MusterrollSnapshot,
 };
 use crate::musterroll::{self, RosterSnapshot};
 use crate::run::{RunJob, RunLifecycle};
@@ -220,6 +225,7 @@ impl DashboardRunSource {
                 // an unreadable entry within it is a bounded warning, not a
                 // dead source.
                 let message = error.message().to_string();
+                let (musterroll, afterfact, cautionlight) = carried_services(previous);
                 DashboardSnapshot {
                     run: previous
                         .map_or_else(SourceState::never_read, |previous| previous.run.clone())
@@ -228,18 +234,9 @@ impl DashboardRunSource {
                         .map_or_else(SourceState::never_read, |previous| previous.recent.clone())
                         .degraded(now, message),
                     discovery_warning: None,
-                    musterroll: previous
-                        .map(|p| p.musterroll.clone())
-                        .unwrap_or_else(SourceState::never_read),
-                    afterfact: previous
-                        .map(|p| p.afterfact.clone())
-                        .unwrap_or_else(SourceState::never_read),
-                    cautionlight: previous
-                        .map(|p| p.cautionlight.clone())
-                        .unwrap_or_else(|| SourceState::Deferred {
-                            last_attempt: None,
-                            error: None,
-                        }),
+                    musterroll,
+                    afterfact,
+                    cautionlight,
                 }
             }
         }
@@ -277,25 +274,46 @@ impl DashboardRunSource {
                 .map_or_else(SourceState::never_read, |previous| previous.run.clone())
                 .degraded(now, error.message().to_string()),
         };
+        let (musterroll, afterfact, cautionlight) = carried_services(previous);
         DashboardSnapshot {
             run,
             recent,
             discovery_warning: scan.warnings.message(),
-            musterroll: previous
-                .map(|p| p.musterroll.clone())
-                .unwrap_or_else(SourceState::never_read),
-            afterfact: previous
-                .map(|p| p.afterfact.clone())
-                .unwrap_or_else(SourceState::never_read),
-            cautionlight: previous
-                .map(|p| p.cautionlight.clone())
-                .unwrap_or_else(|| SourceState::Deferred {
-                    last_attempt: None,
-                    error: None,
-                }),
+            musterroll,
+            afterfact,
+            cautionlight,
         }
     }
 }
+
+/// Carries the three service source states across a run-source tick.
+///
+/// The run source never samples a service — Task 3's runtime owns their
+/// cadence — so a tick must neither reset them nor deep-copy their retained
+/// evidence. Sharing keeps a refresh O(1) in the number of retained Afterfact
+/// events. Cautionlight starts [`SourceState::Deferred`] rather than absent:
+/// v1 deliberately never runs it, which is a different fact from never having
+/// managed to.
+fn carried_services(previous: Option<&DashboardSnapshot>) -> CarriedServices {
+    match previous {
+        Some(previous) => (
+            Arc::clone(&previous.musterroll),
+            Arc::clone(&previous.afterfact),
+            Arc::clone(&previous.cautionlight),
+        ),
+        None => (
+            Arc::new(SourceState::never_read()),
+            Arc::new(SourceState::never_read()),
+            Arc::new(CautionlightDashboardSource::default_state()),
+        ),
+    }
+}
+
+type CarriedServices = (
+    Arc<SourceState<MusterrollSnapshot>>,
+    Arc<SourceState<AfterfactSnapshot>>,
+    Arc<SourceState<CautionlightSnapshot>>,
+);
 
 // ---------------------------------------------------------------------------
 // Forward-compatible manifest mirror
@@ -1442,17 +1460,7 @@ fn read_log_tail_bytes(path: &Path) -> Result<(String, bool), DashboardError> {
         }
     }
     let decoded = String::from_utf8_lossy(&bytes).into_owned();
-    Ok((sanitize_log_text(&decoded), truncated))
-}
-
-/// Strips every control character except newline (which preserves line
-/// structure) from log text. Untrusted log bytes must never inject terminal
-/// control sequences; this is the render boundary's single sanitization
-/// pass for log tails.
-fn sanitize_log_text(text: &str) -> String {
-    text.chars()
-        .filter(|&character| character == '\n' || !character.is_control())
-        .collect()
+    Ok((sanitize_text(&decoded), truncated))
 }
 
 /// Parses one complete event line, enforcing the schema and sequence

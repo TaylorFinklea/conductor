@@ -20,7 +20,7 @@
 
 pub(crate) mod model;
 pub(crate) mod run_source;
-pub(crate) mod process;
+pub(crate) mod sanitize;
 pub(crate) mod services;
 
 // Re-exported for later tasks: the renderer (Task 3), service adapters
@@ -35,12 +35,15 @@ pub(crate) use model::{
 pub(crate) use run_source::{
     DashboardError, DashboardRunSource, LogSelector, RunSelection, RunSourceConfig,
 };
+// Bounded subprocess execution lives at the crate root, not under this
+// `tui`-gated module: `CommandMusterrollClient` needs it in a
+// `--no-default-features` build.
 #[allow(unused_imports)]
-pub(crate) use process::{BoundedCommand, CommandOutcome};
+pub(crate) use crate::process::{BoundedCommand, CommandOutcome};
 #[allow(unused_imports)]
 pub(crate) use services::{
-    AfterfactDashboardSource, AfterfactSnapshot, CautionlightDashboardSource,
-    CautionlightSnapshot, MusterrollDashboardSource, MusterrollSnapshot, ServiceSnapshot,
+    AfterfactDashboardSource, AfterfactSnapshot, CautionlightDashboardSource, CautionlightSnapshot,
+    MusterrollDashboardSource, MusterrollSnapshot, ServiceSnapshot,
 };
 
 /// The stale-claim threshold, taken from operational recovery rather than
