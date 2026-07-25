@@ -258,7 +258,7 @@ mod tests {
             priority: 1,
             issue_type: "task".to_string(),
             assignee: None,
-            owner: "fixture".to_string(),
+            owner: Some("fixture".to_string()),
             created_at: "2026-07-01T00:00:00Z".to_string(),
             created_by: "fixture".to_string(),
             updated_at: "2026-07-01T00:00:00Z".to_string(),

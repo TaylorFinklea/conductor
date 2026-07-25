@@ -2530,7 +2530,7 @@ mod tests {
             priority: 1,
             issue_type: "task".to_string(),
             assignee: Some("undertake".to_string()),
-            owner: "test".to_string(),
+            owner: Some("test".to_string()),
             created_at: "2026-07-02T00:00:00Z".to_string(),
             created_by: "test".to_string(),
             updated_at: "2026-07-02T00:00:00Z".to_string(),

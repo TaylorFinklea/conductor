@@ -1003,7 +1003,7 @@ mod tests {
             priority: 1,
             issue_type: "task".to_string(),
             assignee: None,
-            owner: "owner".to_string(),
+            owner: Some("owner".to_string()),
             created_at: "2026-07-13T00:00:00Z".to_string(),
             created_by: "owner".to_string(),
             updated_at: "2026-07-13T00:00:00Z".to_string(),

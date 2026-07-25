@@ -96,7 +96,8 @@ pub(crate) struct Issue {
     pub(crate) issue_type: String,
     #[serde(default)]
     pub(crate) assignee: Option<String>,
-    pub(crate) owner: String,
+    #[serde(default)]
+    pub(crate) owner: Option<String>,
     pub(crate) created_at: String,
     pub(crate) created_by: String,
     pub(crate) updated_at: String,
@@ -324,6 +325,11 @@ mod tests {
     const BLOCKED_ZERO: &str = include_str!("../tests/fixtures/bd-blocked-zero.json");
     const BLOCKED_ALL_BLOCKED: &str = include_str!("../tests/fixtures/bd-blocked-all-blocked.json");
     const SHOW_BOGUS_ERROR: &str = include_str!("../tests/fixtures/bd-show-bogus-error.json");
+    const READY_OWNER_ABSENT: &str =
+        include_str!("../tests/fixtures/bd-ready-owner-absent.json");
+    const READY_OWNER_NULL: &str = include_str!("../tests/fixtures/bd-ready-owner-null.json");
+    const READY_OWNER_WRONG_TYPE: &str =
+        include_str!("../tests/fixtures/bd-ready-owner-wrong-type.json");
 
     #[test]
     fn bd_client_parse_ready_reads_issue_fields_and_metadata() {
@@ -343,7 +349,7 @@ mod tests {
         assert_eq!(issue.priority, 1);
         assert_eq!(issue.issue_type, "task");
         assert_eq!(issue.assignee, None);
-        assert_eq!(issue.owner, "taylor.finklea@gmail.com");
+        assert_eq!(issue.owner.as_deref(), Some("taylor.finklea@gmail.com"));
         assert_eq!(issue.created_by, "Taylor Finklea");
         assert_eq!(
             issue.labels.as_deref(),
@@ -361,6 +367,52 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("senior")
         );
+    }
+
+    #[test]
+    fn bd_client_parse_ready_owner_absent_key_is_unassigned() {
+        // Real bd 1.1.0 output under a fresh identity omits the `owner`
+        // key from `bd ready --json` entirely (captured against the
+        // installed binary under an isolated HOME). Absence must parse
+        // as an unassigned owner, not a hard JSON error.
+        let issues = parse_issue_array(READY_OWNER_ABSENT, "bd ready")
+            .expect("owner-absent fixture parses");
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].owner, None);
+    }
+
+    #[test]
+    fn bd_client_parse_ready_owner_explicit_null_is_unassigned() {
+        // Defensive coverage: an explicit JSON `null` must also collapse
+        // to unassigned, even though the live bd 1.1.0 binary omits the
+        // key rather than nulling it.
+        let issues = parse_issue_array(READY_OWNER_NULL, "bd ready")
+            .expect("owner-null fixture parses");
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].owner, None);
+    }
+
+    #[test]
+    fn bd_client_parse_ready_owner_present_string_is_preserved() {
+        let issues = parse_issue_array(READY_WITH_ITEMS, "bd ready")
+            .expect("owner-present fixture parses");
+
+        assert_eq!(
+            issues[0].owner.as_deref(),
+            Some("taylor.finklea@gmail.com")
+        );
+    }
+
+    #[test]
+    fn bd_client_parse_ready_owner_wrong_type_fails_closed() {
+        // A malformed `owner` (wrong JSON type) must never be silently
+        // coerced into unassigned; that would hide a real schema
+        // regression. Strict parsing still rejects it.
+        let err = parse_issue_array(READY_OWNER_WRONG_TYPE, "bd ready")
+            .expect_err("owner of the wrong type must fail closed");
+        assert_eq!(err.kind, BdErrorKind::Json);
     }
 
     #[test]
@@ -698,6 +750,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bd_client_real_subprocess_ready_tolerates_owner_absent_under_isolated_identity() {
+        // Live-contract regression for the bd 1.1.0 owner-omission fix.
+        // A HOME with no bd identity configured makes the real `bd`
+        // binary omit the `owner` key entirely from `bd ready --json`
+        // (confirmed by direct inspection of the installed 1.1.0
+        // binary). The strict `Issue` parser must treat that absence as
+        // an unassigned owner rather than failing the whole parse.
+        if !bd_on_path() {
+            return;
+        }
+
+        let temp = TempDir::new("bd-client-owner-absent");
+        let isolated_home = TempDir::new("bd-client-owner-absent-home");
+        init_bd_repo_with_home(temp.path(), isolated_home.path());
+        setup_issue_with_home(
+            temp.path(),
+            isolated_home.path(),
+            &[
+                "create",
+                "owner absent probe",
+                "--id",
+                "fixture-owner-absent-probe",
+                "--description",
+                "probe description",
+                "--acceptance",
+                "probe acceptance",
+                "-t",
+                "task",
+                "-p",
+                "1",
+            ],
+        );
+
+        let output = Command::new("bd")
+            .arg("-C")
+            .arg(temp.path())
+            .arg("ready")
+            .arg("--json")
+            .env("HOME", isolated_home.path())
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn bd ready under isolated HOME");
+        assert!(
+            output.status.success(),
+            "bd ready failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("\"owner\""),
+            "fixture assumption broken: live bd now emits an owner key under an isolated HOME; \
+             stdout={stdout}"
+        );
+
+        let issues = parse_issue_array(&stdout, "bd ready").expect("owner-absent output parses");
+        let issue = issues
+            .into_iter()
+            .find(|issue| issue.id == "fixture-owner-absent-probe")
+            .expect("ready returns the probe issue");
+        assert_eq!(issue.owner, None);
+    }
+
     struct TempDir(PathBuf);
 
     impl TempDir {
@@ -753,6 +869,40 @@ mod tests {
             .arg(repo)
             .args(args)
             .arg("--json")
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn bd setup command");
+        assert!(
+            output.status.success(),
+            "bd setup failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_bd_repo_with_home(repo: &Path, home: &Path) {
+        let output = Command::new("bd")
+            .current_dir(repo)
+            .args(["init", "--non-interactive", "-p", "fixture"])
+            .env("HOME", home)
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn bd init");
+        assert!(
+            output.status.success(),
+            "bd init failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn setup_issue_with_home(repo: &Path, home: &Path, args: &[&str]) {
+        let output = Command::new("bd")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .arg("--json")
+            .env("HOME", home)
             .stdin(Stdio::null())
             .output()
             .expect("spawn bd setup command");
