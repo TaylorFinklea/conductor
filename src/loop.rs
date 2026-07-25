@@ -17,7 +17,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::dispatch::{ChildProcess, CommitProbe, Exec, ProcessStatus, SpawnRequest};
+use crate::dispatch::{
+    ChildProcess, CommitProbe, CommitReceiptEvidence, Exec, ProcessStatus, SpawnRequest,
+};
 use crate::quarantine::RepoLease;
 use crate::run::{
     EventInput, EventKind, NewRun, RunHandle, RunJob, RunLimits, RunTarget, RunVerifier,
@@ -341,13 +343,12 @@ impl LoopKernel {
             let after = commits
                 .head(&request.repo)
                 .map_err(|error| LoopError::new(format!("read post-worker HEAD: {error}")))?;
-            let worker_commit = worker.authenticated_commit;
             let authenticated = worker.status.success()
-                && worker_commit.as_ref().is_some_and(|commit| after.as_deref() == Some(commit))
-                && worker_commit.as_ref().is_some_and(|commit| {
-                    commits
-                        .is_direct_child(&request.repo, before.as_deref(), commit)
-                        .unwrap_or(false)
+                && after.as_deref().is_some_and(|commit| {
+                    worker.receipt_evidence.rejection_for(commit).is_none()
+                        && commits
+                            .is_direct_child(&request.repo, before.as_deref(), commit)
+                            .unwrap_or(false)
                 });
             if !authenticated {
                 fail_attempt(
@@ -418,7 +419,7 @@ impl LoopKernel {
 
 struct ProcessRun {
     status: ProcessStatus,
-    authenticated_commit: Option<String>,
+    receipt_evidence: CommitReceiptEvidence,
 }
 
 fn run_worker_process<E: Exec + ?Sized>(
@@ -466,7 +467,7 @@ fn finish_process(mut child: Box<dyn ChildProcess>, timeout: Duration) -> Result
         .map_err(|error| LoopError::new(format!("prove subprocess quiescent: {error}")))?;
     Ok(ProcessRun {
         status,
-        authenticated_commit: child.authenticated_worker_commit(),
+        receipt_evidence: child.commit_receipt_evidence(),
     })
 }
 
@@ -729,12 +730,30 @@ mod tests {
         pgid: Option<u32>,
     }
     impl ChildProcess for TestChild {
-        fn wait_for(&mut self, _timeout: Duration) -> crate::dispatch::Result<Option<ProcessStatus>> { Ok(Some(self.status)) }
-        fn terminate(&mut self) -> crate::dispatch::Result<()> { Ok(()) }
-        fn kill(&mut self) -> crate::dispatch::Result<()> { Ok(()) }
-        fn wait(&mut self) -> crate::dispatch::Result<ProcessStatus> { Ok(self.status) }
-        fn authenticated_worker_commit(&self) -> Option<String> { self.commit.clone() }
-        fn id(&self) -> Option<u32> { self.pgid }
+        fn wait_for(
+            &mut self,
+            _timeout: Duration,
+        ) -> crate::dispatch::Result<Option<ProcessStatus>> {
+            Ok(Some(self.status))
+        }
+        fn terminate(&mut self) -> crate::dispatch::Result<()> {
+            Ok(())
+        }
+        fn kill(&mut self) -> crate::dispatch::Result<()> {
+            Ok(())
+        }
+        fn wait(&mut self) -> crate::dispatch::Result<ProcessStatus> {
+            Ok(self.status)
+        }
+        fn id(&self) -> Option<u32> {
+            self.pgid
+        }
+        fn commit_receipt_evidence(&self) -> CommitReceiptEvidence {
+            self.commit.clone().map_or_else(
+                CommitReceiptEvidence::default,
+                CommitReceiptEvidence::accepting,
+            )
+        }
     }
 
     fn spawn(command: &str) -> SpawnRequest {
@@ -764,6 +783,22 @@ mod tests {
     fn loop_rejects_a_commit_not_authenticated_to_its_worker() {
         let harness = TestHarness::new(vec![success_worker('b')], vec![], false);
         assert_eq!(LoopKernel::run(&harness, &harness, &harness, &harness, &harness.request().with_max_iterations(1)).expect("terminal"), LoopTerminal::Failed);
+    }
+
+    #[test]
+    fn loop_rejects_direct_child_without_matching_kernel_receipt() {
+        let harness = TestHarness::new(vec![success_worker('c')], vec![], true);
+        assert_eq!(
+            LoopKernel::run(
+                &harness,
+                &harness,
+                &harness,
+                &harness,
+                &harness.request().with_max_iterations(1)
+            )
+            .expect("terminal"),
+            LoopTerminal::Failed
+        );
     }
 
     #[test]
