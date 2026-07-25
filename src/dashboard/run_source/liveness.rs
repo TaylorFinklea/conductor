@@ -204,8 +204,8 @@ fn patchstand_pilot_shape_is_abandoned() {
 
     assert_eq!(run.selection_error, None, "real manifest shape must parse");
     assert_eq!(run.identity.run_id, PATCHSTAND_RUN_ID);
-    assert_eq!(run.identity.job, RunJob::Work);
-    assert_eq!(run.identity.lifecycle, RunLifecycle::Running);
+    assert_eq!(run.identity.job, Some(RunJob::Work));
+    assert_eq!(run.identity.lifecycle, Some(RunLifecycle::Running));
     assert_eq!(run.identity.liveness, RunLiveness::Abandoned);
     assert_eq!(run.identity.stage.as_deref(), Some("implementing"));
     assert_eq!(run.identity.target_bead.as_deref(), Some("patchstand-thk"));

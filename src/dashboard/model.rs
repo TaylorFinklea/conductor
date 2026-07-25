@@ -206,8 +206,17 @@ impl RunLiveness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunIdentity {
     pub(crate) run_id: String,
-    pub(crate) job: RunJob,
-    pub(crate) lifecycle: RunLifecycle,
+    /// The run's job, or `None` when the manifest could not be read or
+    /// parsed. Never defaulted: an unreadable *plan* run rendered as a
+    /// `Work` run is a fabricated fact, and no consumer can tell it apart
+    /// from a real work run that merely carries an error. Consumers branch
+    /// on `None` (paired with [`RunSnapshot::selection_error`]) instead.
+    pub(crate) job: Option<RunJob>,
+    /// The run's lifecycle, or `None` when the manifest could not be read or
+    /// parsed. Never defaulted for the same reason as [`Self::job`]: the
+    /// terminal/nonterminal split the whole liveness distinction rests on
+    /// cannot be guessed, and `Started` is a claim there is no evidence for.
+    pub(crate) lifecycle: Option<RunLifecycle>,
     pub(crate) liveness: RunLiveness,
     /// The manifest's parsed `created_at`, used for tie-breaking and recent-run
     /// ordering. `None` when the manifest was malformed enough that the
@@ -236,6 +245,33 @@ pub(crate) struct RunIdentity {
     /// The manifest musterroll roster artifact provenance (path, sha256) for
     /// display only; never reopened.
     pub(crate) musterroll_roster_artifact: Option<(String, String)>,
+}
+
+impl RunIdentity {
+    /// The identity of a run whose manifest could not be read or parsed:
+    /// the directory-derived `run_id`, an explicitly unknown job and
+    /// lifecycle, and [`RunLiveness::Unknown`]. Every remaining field is
+    /// genuinely empty, which displays as blank rather than as a wrong
+    /// value. Constructing this shape in one place keeps the unreadable-run
+    /// case from drifting back into a pile of plausible-looking defaults.
+    pub(crate) fn unknown(run_id: &str) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            job: None,
+            lifecycle: None,
+            liveness: RunLiveness::Unknown,
+            created_at: None,
+            created_at_text: String::new(),
+            updated_at_text: String::new(),
+            target_repo: String::new(),
+            target_bead: None,
+            stage: None,
+            schema: String::new(),
+            roster_snapshot: None,
+            roster_policy_sha256: None,
+            musterroll_roster_artifact: None,
+        }
+    }
 }
 
 /// One reconstructed attempt for a work/review/consult job, or one stage
@@ -404,6 +440,15 @@ pub(crate) struct DashboardSnapshot {
     pub(crate) run: SourceState<RunSnapshot>,
     /// Recent terminal runs (bounded).
     pub(crate) recent: SourceState<Vec<RecentRun>>,
+    /// A bounded warning from the discovery pass: run directory entries that
+    /// could not be read cleanly were skipped rather than failing the whole
+    /// source, and this is the only signal that they existed. Bounded by
+    /// construction — one count and the first error, never a per-entry list,
+    /// so an unreadable directory cannot grow the render payload.
+    ///
+    /// Distinct from a [`SourceState`] error: both sources here can be
+    /// perfectly `Fresh` while some entries were skipped.
+    pub(crate) discovery_warning: Option<String>,
 }
 
 #[cfg(test)]

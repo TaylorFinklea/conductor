@@ -156,7 +156,7 @@ impl DashboardRunSource {
     fn resolve_run_id(&self, selection: &RunSelection) -> Result<String, DashboardError> {
         match selection {
             RunSelection::Explicit(id) => self.validated_explicit_run_id(id),
-            RunSelection::Newest => newest_run_id(&self.scan_candidates()?),
+            RunSelection::Newest => newest_run_id(&self.scan_candidates()?.candidates),
         }
     }
 
@@ -190,7 +190,7 @@ impl DashboardRunSource {
 
     /// Reads the recent terminal runs (bounded) for the secondary panel.
     pub(crate) fn recent_runs(&self) -> Result<Vec<RecentRun>, DashboardError> {
-        Ok(recent_from_candidates(&self.scan_candidates()?))
+        Ok(recent_from_candidates(&self.scan_candidates()?.candidates))
     }
 
     /// Builds the full dashboard snapshot: the selected run and recent runs.
@@ -213,28 +213,46 @@ impl DashboardRunSource {
         selection: &RunSelection,
         now: DateTime<Utc>,
     ) -> DashboardSnapshot {
-        let (prior_run, prior_recent) = match previous {
-            Some(previous) => (previous.run.clone(), previous.recent.clone()),
-            None => (SourceState::never_read(), SourceState::never_read()),
-        };
-        let candidates = match self.scan_candidates() {
-            Ok(candidates) => candidates,
+        match self.scan_candidates() {
+            Ok(scan) => self.snapshot_from_scan(previous, selection, now, &scan),
             Err(error) => {
+                // Only the runs directory itself being unopenable gets here;
+                // an unreadable entry within it is a bounded warning, not a
+                // dead source.
                 let message = error.message().to_string();
-                return DashboardSnapshot {
-                    run: prior_run.degraded(now, message.clone()),
-                    recent: prior_recent.degraded(now, message),
-                };
+                DashboardSnapshot {
+                    run: previous
+                        .map_or_else(SourceState::never_read, |previous| previous.run.clone())
+                        .degraded(now, message.clone()),
+                    recent: previous
+                        .map_or_else(SourceState::never_read, |previous| previous.recent.clone())
+                        .degraded(now, message),
+                    discovery_warning: None,
+                }
             }
-        };
+        }
+    }
+
+    /// Builds the snapshot from one already-completed discovery pass.
+    ///
+    /// Split from [`Self::snapshot`] so the skip-and-warn policy can be
+    /// exercised end to end against a synthesized unreadable directory entry
+    /// (see [`Self::scan_entries`]).
+    fn snapshot_from_scan(
+        &self,
+        previous: Option<&DashboardSnapshot>,
+        selection: &RunSelection,
+        now: DateTime<Utc>,
+        scan: &DiscoveryScan,
+    ) -> DashboardSnapshot {
         let recent = SourceState::Fresh {
-            value: recent_from_candidates(&candidates),
+            value: recent_from_candidates(&scan.candidates),
             last_ok: now,
             last_attempt: now,
-            truncated: candidates.len() >= DISCOVERY_CANDIDATE_CAP,
+            truncated: scan.candidates.len() >= DISCOVERY_CANDIDATE_CAP,
         };
         let run = match self
-            .resolve_run_id_with(&candidates, selection)
+            .resolve_run_id_with(&scan.candidates, selection)
             .and_then(|run_id| self.snapshot_for_run(&run_id, now))
         {
             Ok(snapshot) => SourceState::Fresh {
@@ -243,9 +261,15 @@ impl DashboardRunSource {
                 last_ok: now,
                 last_attempt: now,
             },
-            Err(error) => prior_run.degraded(now, error.message().to_string()),
+            Err(error) => previous
+                .map_or_else(SourceState::never_read, |previous| previous.run.clone())
+                .degraded(now, error.message().to_string()),
         };
-        DashboardSnapshot { run, recent }
+        DashboardSnapshot {
+            run,
+            recent,
+            discovery_warning: scan.warnings.message(),
+        }
     }
 }
 
@@ -445,6 +469,51 @@ struct DiscoveryCandidate {
     manifest: Result<DashboardManifest, DashboardError>,
 }
 
+/// Bounded accounting of run directory entries discovery could not read
+/// cleanly. One unreadable entry must not blank every panel, and it must not
+/// vanish silently either: the entry is skipped (or, for an unreadable mtime,
+/// kept with degraded cap ordering) and counted here.
+///
+/// Bounded by construction — a count and the first error, never a per-entry
+/// list. A warning that grew with the failure count would put an unbounded
+/// amount of untrusted directory content on the render path, the same failure
+/// this module's byte caps exist to prevent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DiscoveryWarnings {
+    count: usize,
+    first: Option<String>,
+}
+
+impl DiscoveryWarnings {
+    fn record(&mut self, error: String) {
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some(error);
+        }
+    }
+
+    /// The single display message, or `None` when discovery was clean.
+    fn message(&self) -> Option<String> {
+        let first = self.first.as_deref()?;
+        Some(if self.count == 1 {
+            format!("discovery could not fully read 1 run directory entry: {first}")
+        } else {
+            format!(
+                "discovery could not fully read {} run directory entries; first: {first}",
+                self.count
+            )
+        })
+    }
+}
+
+/// One completed discovery pass: the bounded candidate set plus whatever
+/// could not be read while producing it.
+#[derive(Debug, Clone, Default)]
+struct DiscoveryScan {
+    candidates: Vec<DiscoveryCandidate>,
+    warnings: DiscoveryWarnings,
+}
+
 /// The expected schema tag for dashboard manifests (matches the operational
 /// `undertake/run@2`).
 const EXPECTED_MANIFEST_SCHEMA: &str = "undertake/run@2";
@@ -579,12 +648,15 @@ impl DashboardRunSource {
     /// [`DISCOVERY_CANDIDATE_CAP`] candidate manifests. Each manifest is read
     /// at most [`DISCOVERY_MANIFEST_MAX_BYTES`]. Malformed manifests become
     /// candidates with an error (so a malformed newest run is still visible).
-    fn scan_candidates(&self) -> Result<Vec<DiscoveryCandidate>, DashboardError> {
+    ///
+    /// Only failing to open the runs directory itself fails the source; an
+    /// unreadable entry inside it is skipped and counted.
+    fn scan_candidates(&self) -> Result<DiscoveryScan, DashboardError> {
         let root = self.config.runs_dir();
         let entries = match std::fs::read_dir(&root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Vec::new());
+                return Ok(DiscoveryScan::default());
             }
             Err(error) => {
                 return Err(DashboardError::new(format!(
@@ -593,16 +665,46 @@ impl DashboardRunSource {
                 )));
             }
         };
+        Ok(Self::scan_entries(entries))
+    }
+
+    /// Reduces one directory listing to bounded discovery candidates,
+    /// skipping and counting entries that cannot be read.
+    ///
+    /// Split from [`Self::scan_candidates`] because a per-entry
+    /// `readdir`/`stat` failure cannot be provoked at a *single* entry through
+    /// Unix permissions — search permission is a property of the parent
+    /// directory, so removing it fails every entry and `read_dir` itself. The
+    /// only way to test "one bad entry, the rest still render" is to feed a
+    /// real listing plus one synthesized failing entry.
+    fn scan_entries<I>(entries: I) -> DiscoveryScan
+    where
+        I: IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+    {
+        let mut warnings = DiscoveryWarnings::default();
         // (mtime, dir_name, path) so we can sort by most recently modified
         // and take the top DISCOVERY_CANDIDATE_CAP.
         let mut dir_entries: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|error| {
-                DashboardError::new(format!("failed to read run directory entry: {error}"))
-            })?;
-            let file_type = entry.file_type().map_err(|error| {
-                DashboardError::new(format!("failed to stat run entry: {error}"))
-            })?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    // The iterator failed before yielding a name or a path,
+                    // so the error is all there is to report.
+                    warnings.record(format!("failed to read run directory entry: {error}"));
+                    continue;
+                }
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    warnings.record(format!(
+                        "failed to stat run entry {}: {error}",
+                        entry.path().display()
+                    ));
+                    continue;
+                }
+            };
             if !file_type.is_dir() {
                 continue;
             }
@@ -610,11 +712,21 @@ impl DashboardRunSource {
             if !path.is_file() {
                 continue;
             }
-            let mtime = entry
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(std::time::UNIX_EPOCH);
+            // An unreadable mtime degrades only the candidate *cap* ordering
+            // — selection and the recent panel order by the manifest's
+            // `created_at` — so the entry is kept (sorting oldest) with the
+            // degradation recorded, rather than dropped over a fact discovery
+            // does not actually need.
+            let mtime = match entry.metadata().and_then(|metadata| metadata.modified()) {
+                Ok(mtime) => mtime,
+                Err(error) => {
+                    warnings.record(format!(
+                        "failed to read mtime of run entry {}: {error}",
+                        entry.path().display()
+                    ));
+                    std::time::UNIX_EPOCH
+                }
+            };
             let dir_name = entry.file_name().to_string_lossy().to_string();
             dir_entries.push((mtime, dir_name, path));
         }
@@ -644,7 +756,10 @@ impl DashboardRunSource {
                 manifest,
             });
         }
-        Ok(candidates)
+        DiscoveryScan {
+            candidates,
+            warnings,
+        }
     }
 
     /// Reads the full snapshot for a run id. The manifest is re-read here (the
@@ -663,22 +778,7 @@ impl DashboardRunSource {
         let snapshot = match manifest_result {
             Ok((manifest, _truncated)) => self.build_snapshot(run_id, &run_dir, &manifest, now),
             Err(error) => RunSnapshot {
-                identity: RunIdentity {
-                    run_id: run_id.to_string(),
-                    job: RunJob::Work,
-                    lifecycle: RunLifecycle::Started,
-                    liveness: RunLiveness::Unknown,
-                    created_at: None,
-                    created_at_text: String::new(),
-                    updated_at_text: String::new(),
-                    target_repo: String::new(),
-                    target_bead: None,
-                    stage: None,
-                    schema: String::new(),
-                    roster_snapshot: None,
-                    roster_policy_sha256: None,
-                    musterroll_roster_artifact: None,
-                },
+                identity: RunIdentity::unknown(run_id),
                 attempts: Vec::new(),
                 stage_markers: Vec::new(),
                 verification: VerificationRecord {
@@ -716,8 +816,8 @@ impl DashboardRunSource {
         let stage = derive_stage(&manifest.details, job);
         let identity = RunIdentity {
             run_id: run_id.to_string(),
-            job,
-            lifecycle,
+            job: Some(job),
+            lifecycle: Some(lifecycle),
             liveness,
             created_at,
             created_at_text: manifest.created_at.clone(),
@@ -918,7 +1018,10 @@ impl DashboardRunSource {
     /// Test-only: how many candidates the bounded discovery pass kept.
     #[cfg(test)]
     pub(crate) fn scan_candidates_len_for_tests(&self) -> usize {
-        self.scan_candidates().expect("scan candidates").len()
+        self.scan_candidates()
+            .expect("scan candidates")
+            .candidates
+            .len()
     }
 
     /// Test-only entry point exposing the private `snapshot_for_run` with an

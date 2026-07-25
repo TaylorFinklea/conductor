@@ -482,3 +482,164 @@ fn explicit_id_beyond_the_candidate_cap_still_resolves() {
     assert_eq!(run.identity.run_id, pinned);
     assert_eq!(run.selection_error, None);
 }
+
+/// A run whose manifest cannot be read has an *unknown* identity, not a
+/// plausible one. The broken run here is a `plan` run; the snapshot
+/// previously carried `job: Work, lifecycle: Started`, so a broken plan run
+/// rendered as a started work run and no consumer could tell it apart from
+/// the real work run sitting in the same directory.
+#[test]
+fn malformed_manifest_reports_unknown_identity_instead_of_fabricating_work_started() {
+    let temp = TempState::new();
+    // A real, valid work run: the exact identity a fabricated one would
+    // impersonate.
+    let valid = "run-work-20260725T100000.000000000-p1-000000";
+    temp.write_run(
+        valid,
+        &temp.work_manifest(valid, "2026-07-25T10:00:00Z", "started"),
+    );
+    // A newer plan run whose manifest is unparseable, so it is selected.
+    let broken = "run-plan-20260725T120000.000000000-p2-000000";
+    let broken_dir = temp.runs_dir().join(broken);
+    fs::create_dir_all(&broken_dir).unwrap();
+    fs::write(broken_dir.join("manifest.json"), b"{ not valid json").unwrap();
+
+    let source = temp.source();
+    let run = source.select(&RunSelection::Newest).expect("select");
+
+    assert_eq!(run.identity.run_id, broken);
+    assert!(
+        run.selection_error.is_some(),
+        "the unreadable manifest must stay visible as an error"
+    );
+    assert_eq!(
+        run.identity.job, None,
+        "an unreadable manifest must not claim a job"
+    );
+    assert_eq!(
+        run.identity.lifecycle, None,
+        "an unreadable manifest must not claim a lifecycle"
+    );
+    assert_eq!(run.identity.liveness, RunLiveness::Unknown);
+
+    // `None` means unknown, not "the dashboard stopped reporting identity":
+    // the readable run in the same directory still reports its real one.
+    let readable = source
+        .select(&RunSelection::Explicit(valid.to_string()))
+        .expect("select valid");
+    assert_eq!(readable.identity.job, Some(RunJob::Work));
+    assert_eq!(readable.identity.lifecycle, Some(RunLifecycle::Started));
+}
+
+/// One unreadable directory entry must not take the whole source down: the
+/// readable run still renders, and the failure stays visible as a bounded
+/// discovery warning rather than vanishing.
+///
+/// The failing entry is synthesized rather than provoked on disk. A
+/// per-entry `readdir`/`stat` failure is governed by the *parent*
+/// directory's search permission, so no on-disk arrangement breaks exactly
+/// one entry of a real listing — which is precisely the case that must be
+/// discriminated from "the directory itself is unreadable".
+#[test]
+fn one_unreadable_dirent_is_skipped_and_the_readable_run_still_renders() {
+    let temp = TempState::new();
+    let run_id = "run-work-20260725T120000.000000000-p1-000000";
+    temp.write_run(
+        run_id,
+        &temp.work_manifest(run_id, "2026-07-25T12:00:00Z", "running"),
+    );
+    let source = temp.source();
+
+    let entries = fs::read_dir(temp.runs_dir())
+        .expect("read runs dir")
+        .chain(std::iter::once(Err(std::io::Error::other(
+            "simulated readdir failure",
+        ))));
+    let scan = DashboardRunSource::scan_entries(entries);
+
+    assert_eq!(
+        scan.candidates.len(),
+        1,
+        "the readable run must survive an unreadable sibling entry"
+    );
+    let warning = scan
+        .warnings
+        .message()
+        .expect("the skipped entry must stay visible");
+    assert!(
+        warning.contains("simulated readdir failure"),
+        "the warning must say what failed, got: {warning}"
+    );
+
+    let now: DateTime<Utc> = "2026-07-25T20:00:00Z".parse().expect("now");
+    let snapshot = source.snapshot_from_scan(None, &RunSelection::Newest, now, &scan);
+    assert!(
+        snapshot.run.is_fresh(),
+        "one bad entry must not degrade the run source, got: {:?}",
+        snapshot.run
+    );
+    assert_eq!(
+        snapshot.run.value().map(|run| run.identity.run_id.as_str()),
+        Some(run_id)
+    );
+    assert_eq!(
+        snapshot.discovery_warning.as_deref(),
+        Some(warning.as_str()),
+        "the warning must reach the snapshot the renderer consumes"
+    );
+}
+
+/// The discovery warning is bounded: many unreadable entries collapse into
+/// one counted message carrying only the first error, never a per-entry list
+/// that grows with the directory.
+#[test]
+fn many_unreadable_dirents_collapse_into_one_bounded_warning() {
+    let temp = TempState::new();
+    let run_id = "run-work-20260725T120000.000000000-p1-000000";
+    temp.write_run(
+        run_id,
+        &temp.work_manifest(run_id, "2026-07-25T12:00:00Z", "running"),
+    );
+
+    let failures = (0..50).map(|index| Err(std::io::Error::other(format!("failure {index}"))));
+    let entries = fs::read_dir(temp.runs_dir())
+        .expect("read runs dir")
+        .chain(failures);
+    let scan = DashboardRunSource::scan_entries(entries);
+
+    assert_eq!(scan.candidates.len(), 1, "the readable run must survive");
+    let warning = scan.warnings.message().expect("warning");
+    assert!(
+        warning.contains("50 run directory entries"),
+        "the count must be reported, got: {warning}"
+    );
+    assert!(
+        warning.contains("failure 0"),
+        "the first error is retained, got: {warning}"
+    );
+    assert!(
+        !warning.contains("failure 1"),
+        "later errors must not accumulate into the message, got: {warning}"
+    );
+}
+
+/// A clean discovery pass carries no warning, so the warning means
+/// "something was unreadable" rather than being permanent decoration.
+#[test]
+fn a_clean_discovery_pass_carries_no_warning() {
+    let temp = TempState::new();
+    let run_id = "run-work-20260725T120000.000000000-p1-000000";
+    temp.write_run(
+        run_id,
+        &temp.work_manifest(run_id, "2026-07-25T12:00:00Z", "running"),
+    );
+    // A non-directory entry and a directory with no manifest are ordinary,
+    // not failures: neither may raise a warning.
+    fs::write(temp.runs_dir().join("stray-file"), b"not a run").unwrap();
+    fs::create_dir_all(temp.runs_dir().join("empty-dir")).unwrap();
+
+    let now: DateTime<Utc> = "2026-07-25T20:00:00Z".parse().expect("now");
+    let snapshot = temp.source().snapshot(None, &RunSelection::Newest, now);
+    assert_eq!(snapshot.discovery_warning, None);
+    assert!(snapshot.run.is_fresh());
+}
