@@ -228,6 +228,18 @@ impl DashboardRunSource {
                         .map_or_else(SourceState::never_read, |previous| previous.recent.clone())
                         .degraded(now, message),
                     discovery_warning: None,
+                    musterroll: previous
+                        .map(|p| p.musterroll.clone())
+                        .unwrap_or_else(SourceState::never_read),
+                    afterfact: previous
+                        .map(|p| p.afterfact.clone())
+                        .unwrap_or_else(SourceState::never_read),
+                    cautionlight: previous
+                        .map(|p| p.cautionlight.clone())
+                        .unwrap_or_else(|| SourceState::Deferred {
+                            last_attempt: None,
+                            error: None,
+                        }),
                 }
             }
         }
@@ -269,6 +281,18 @@ impl DashboardRunSource {
             run,
             recent,
             discovery_warning: scan.warnings.message(),
+            musterroll: previous
+                .map(|p| p.musterroll.clone())
+                .unwrap_or_else(SourceState::never_read),
+            afterfact: previous
+                .map(|p| p.afterfact.clone())
+                .unwrap_or_else(SourceState::never_read),
+            cautionlight: previous
+                .map(|p| p.cautionlight.clone())
+                .unwrap_or_else(|| SourceState::Deferred {
+                    last_attempt: None,
+                    error: None,
+                }),
         }
     }
 }

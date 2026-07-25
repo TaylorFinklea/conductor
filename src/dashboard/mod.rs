@@ -20,6 +20,8 @@
 
 pub(crate) mod model;
 pub(crate) mod run_source;
+pub(crate) mod process;
+pub(crate) mod services;
 
 // Re-exported for later tasks: the renderer (Task 3), service adapters
 // (Task 2), and CLI wiring (Task 4) consume these; nothing in-tree uses the
@@ -32,6 +34,13 @@ pub(crate) use model::{
 #[allow(unused_imports)]
 pub(crate) use run_source::{
     DashboardError, DashboardRunSource, LogSelector, RunSelection, RunSourceConfig,
+};
+#[allow(unused_imports)]
+pub(crate) use process::{BoundedCommand, CommandOutcome};
+#[allow(unused_imports)]
+pub(crate) use services::{
+    AfterfactDashboardSource, AfterfactSnapshot, CautionlightDashboardSource,
+    CautionlightSnapshot, MusterrollDashboardSource, MusterrollSnapshot, ServiceSnapshot,
 };
 
 /// The stale-claim threshold, taken from operational recovery rather than

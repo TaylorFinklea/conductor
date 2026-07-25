@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use super::services::{AfterfactSnapshot, CautionlightSnapshot, MusterrollSnapshot};
 use crate::run::{RunJob, RunLifecycle};
 
 /// Per-source freshness, error, and truncation metadata carried alongside a
@@ -434,9 +435,8 @@ pub(crate) struct RunSnapshot {
 /// The top-level immutable snapshot the renderer consumes. Task 1 populates
 /// the run-source portion; Task 2 adds service source states (Musterroll,
 /// Afterfact, Cautionlight) and Task 3 adds UI-only selection state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DashboardSnapshot {
-    /// The selected run, with its per-source state.
     pub(crate) run: SourceState<RunSnapshot>,
     /// Recent terminal runs (bounded).
     pub(crate) recent: SourceState<Vec<RecentRun>>,
@@ -449,6 +449,12 @@ pub(crate) struct DashboardSnapshot {
     /// Distinct from a [`SourceState`] error: both sources here can be
     /// perfectly `Fresh` while some entries were skipped.
     pub(crate) discovery_warning: Option<String>,
+    /// Musterroll provider availability state.
+    pub(crate) musterroll: SourceState<MusterrollSnapshot>,
+    /// Afterfact correlation/coverage state.
+    pub(crate) afterfact: SourceState<AfterfactSnapshot>,
+    /// Cautionlight deferred/findings state.
+    pub(crate) cautionlight: SourceState<CautionlightSnapshot>,
 }
 
 #[cfg(test)]

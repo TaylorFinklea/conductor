@@ -56,13 +56,12 @@ impl MusterrollError {
         }
     }
 
-    fn command(message: impl Into<String>) -> Self {
+    pub(crate) fn command(message: impl Into<String>) -> Self {
         Self {
             kind: MusterrollErrorKind::Command,
             message: message.into(),
         }
     }
-
     fn json(message: impl Into<String>) -> Self {
         Self {
             kind: MusterrollErrorKind::Json,
@@ -687,51 +686,78 @@ impl CommandMusterrollClient {
 
 impl MusterrollClient for CommandMusterrollClient {
     fn status(&self) -> Result<StatusReport> {
-        let output = Command::new("musterroll")
+        let outcome = crate::dashboard::BoundedCommand::new("musterroll")
             .args(["status", "--json"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
+            .stdout_cap(4 * 1024 * 1024)
+            .stderr_cap(256 * 1024)
+            .timeout(std::time::Duration::from_secs(60))
+            .run()
             .map_err(|error| spawn_error("musterroll status --json", &error))?;
 
-        if !output.status.success() {
-            return Err(command_failure("musterroll status --json", &output));
+        if outcome.timed_out || outcome.stdout_truncated {
+            return Err(MusterrollError::command(
+                "musterroll status --json timed out or exceeded output bounds",
+            ));
         }
 
-        serde_json::from_slice(&output.stdout).map_err(|error| {
+        if outcome.exit_code != Some(0) {
+            return Err(MusterrollError::command(format!(
+                "musterroll status --json exited with code {:?}",
+                outcome.exit_code
+            )));
+        }
+
+        serde_json::from_slice(&outcome.stdout).map_err(|error| {
             MusterrollError::json(format!("failed to parse musterroll status --json: {error}"))
         })
     }
 
     fn roster_snapshot(&self) -> Result<RosterSnapshot> {
-        let output = Command::new("musterroll")
+        let outcome = crate::dashboard::BoundedCommand::new("musterroll")
             .args(["roster", "snapshot", "--json"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
+            .stdout_cap(4 * 1024 * 1024)
+            .stderr_cap(256 * 1024)
+            .timeout(std::time::Duration::from_secs(60))
+            .run()
             .map_err(|error| spawn_error("musterroll roster snapshot --json", &error))?;
 
-        if !output.status.success() {
-            return Err(command_failure("musterroll roster snapshot --json", &output));
+        if outcome.timed_out || outcome.stdout_truncated {
+            return Err(MusterrollError::command(
+                "musterroll roster snapshot --json timed out or exceeded output bounds",
+            ));
         }
 
-        parse_roster_snapshot(&output.stdout)
+        if outcome.exit_code != Some(0) {
+            return Err(MusterrollError::command(format!(
+                "musterroll roster snapshot --json exited with code {:?}",
+                outcome.exit_code
+            )));
+        }
+
+        parse_roster_snapshot(&outcome.stdout)
     }
 
     fn observe(&self, request: &ObservationRequest) -> Result<()> {
         let args = observation_args(request);
-        let output = Command::new("musterroll")
+        let outcome = crate::dashboard::BoundedCommand::new("musterroll")
             .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
+            .stdout_cap(4 * 1024 * 1024)
+            .stderr_cap(256 * 1024)
+            .timeout(std::time::Duration::from_secs(60))
+            .run()
             .map_err(|error| spawn_error("musterroll observe", &error))?;
 
-        if !output.status.success() {
-            return Err(command_failure("musterroll observe", &output));
+        if outcome.timed_out || outcome.stdout_truncated {
+            return Err(MusterrollError::command(
+                "musterroll observe timed out or exceeded output bounds",
+            ));
+        }
+
+        if outcome.exit_code != Some(0) {
+            return Err(MusterrollError::command(format!(
+                "musterroll observe exited with code {:?}",
+                outcome.exit_code
+            )));
         }
         Ok(())
     }
