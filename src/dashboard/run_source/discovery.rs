@@ -1,0 +1,484 @@
+//! Bounded run discovery tests: `cargo test dashboard::run_source::discovery`.
+
+use super::test_support::TempState;
+use super::*;
+use std::fs;
+
+#[test]
+fn selects_newest_by_created_at_not_directory_name() {
+    let temp = TempState::new();
+    // Directory names are in reverse of created_at order; the run named
+    // "aaa" must lose to "zzz" only if "zzz" is newer, and vice versa.
+    temp.write_run(
+        "run-work-20260725T100000.000000000-p1-000000",
+        &temp.work_manifest(
+            "run-work-20260725T100000.000000000-p1-000000",
+            "2026-07-25T10:00:00Z",
+            "running",
+        ),
+    );
+    temp.write_run(
+        "run-work-20260725T120000.000000000-p2-000000",
+        &temp.work_manifest(
+            "run-work-20260725T120000.000000000-p2-000000",
+            "2026-07-25T12:00:00Z",
+            "running",
+        ),
+    );
+    // A directory named alphabetically later but with an earlier
+    // created_at must NOT win.
+    temp.write_run(
+        "run-work-20260725T090000.000000000-p3-000000",
+        &temp.work_manifest(
+            "run-work-20260725T090000.000000000-p3-000000",
+            "2026-07-25T09:00:00Z",
+            "running",
+        ),
+    );
+
+    let source = temp.source();
+    let run = source.select(&RunSelection::Newest).expect("select");
+    assert_eq!(
+        run.identity.run_id,
+        "run-work-20260725T120000.000000000-p2-000000"
+    );
+}
+
+/// Tie-break: equal `created_at` timestamps break by directory name
+/// descending (the directory that sorts later wins).
+#[test]
+fn tie_breaks_by_directory_name_descending() {
+    let temp = TempState::new();
+    let ts = "2026-07-25T12:00:00Z";
+    temp.write_run(
+        "run-work-20260725T120000.000000000-aaa-000000",
+        &temp.work_manifest(
+            "run-work-20260725T120000.000000000-aaa-000000",
+            ts,
+            "running",
+        ),
+    );
+    temp.write_run(
+        "run-work-20260725T120000.000000000-zzz-000000",
+        &temp.work_manifest(
+            "run-work-20260725T120000.000000000-zzz-000000",
+            ts,
+            "running",
+        ),
+    );
+    let source = temp.source();
+    let run = source.select(&RunSelection::Newest).expect("select");
+    assert_eq!(
+        run.identity.run_id,
+        "run-work-20260725T120000.000000000-zzz-000000"
+    );
+}
+
+/// The 200-candidate cap: only the 200 most recently modified manifests are
+/// The 200-candidate cap: only the 200 most recently modified manifests are
+/// scanned. A 201st run with the newest `created_at` but the oldest mtime
+/// is excluded from discovery.
+#[test]
+fn caps_at_two_hundred_candidates() {
+    let temp = TempState::new();
+    // The 201st run: newest created_at, but written first (oldest mtime).
+    let newest_id = "run-work-20260725T235959.000000000-p999-000000";
+    temp.write_run(
+        newest_id,
+        &temp.work_manifest(newest_id, "2026-07-25T23:59:59Z", "running"),
+    );
+    // 200 runs written after, each with a valid, strictly-older created_at
+    // and a newer mtime (so all 200 are within the cap and the 201st is
+    // the oldest by mtime).
+    for i in 0..200u32 {
+        let minute = i % 59;
+        let second = i;
+        let id = format!("run-work-20260725T12{minute:02}{second:02}.000000000-p{i:03}-000000");
+        let ts = format!("2026-07-25T12:{minute:02}:{second:02}Z");
+        temp.write_run(&id, &temp.work_manifest(&id, &ts, "running"));
+    }
+
+    let source = temp.source();
+    // The 201st run (newest created_at, oldest mtime) must be excluded by
+    // the 200-candidate cap; it must never be selected.
+    let run = source.select(&RunSelection::Newest).expect("select");
+    assert_ne!(
+        run.identity.run_id, newest_id,
+        "the 201st run (oldest mtime) must be excluded by the 200-candidate cap"
+    );
+}
+
+/// The 128 KiB manifest cap: a manifest larger than 128 KiB is truncated
+/// during read; if the truncation breaks JSON it fails the source closed.
+#[test]
+fn manifest_read_is_capped_at_128_kib() {
+    let temp = TempState::new();
+    let run_id = "run-work-20260725T120000.000000000-p1-000000";
+    let run_dir = temp.write_run(
+        run_id,
+        &temp.work_manifest(run_id, "2026-07-25T12:00:00Z", "running"),
+    );
+    // Overwrite manifest with a >128 KiB document whose first 128 KiB is
+    // valid JSON (a deeply nested object) but which is truncated mid-value
+    // at the cap. Easiest: write a valid manifest followed by 200 KiB of
+    // trailing whitespace inside the JSON object via an unknown field
+    // with a huge string. The cap reads only the first 128 KiB, cutting
+    // the string mid-value, so JSON parse fails.
+    let huge = "x".repeat(200 * 1024);
+    let manifest = serde_json::json!({
+        "schema": "undertake/run@2",
+        "run_id": run_id,
+        "job": "work",
+        "target": {"repo": "/repo", "bead": "b"},
+        "details": {"job": "work", "state": {"cycle_id": "c", "authorization_sha256": "a".repeat(64), "stage": "implementing"}},
+        "created_at": "2026-07-25T12:00:00Z",
+        "updated_at": "2026-07-25T12:00:00Z",
+        "approved_profiles": [],
+        "limits": {},
+        "verifier": {},
+        "lifecycle": "running",
+        "unknown_blob": huge,
+    });
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    assert!(bytes.len() > 128 * 1024);
+    fs::write(run_dir.join("manifest.json"), &bytes).unwrap();
+
+    let source = temp.source();
+    let run = source
+        .select(&RunSelection::Explicit(run_id.to_string()))
+        .expect("select");
+    // The truncated manifest fails closed: the snapshot carries the error.
+    assert!(
+        run.selection_error
+            .as_ref()
+            .is_some_and(|e| e.contains("failed to parse manifest")),
+        "truncated manifest must surface a parse error, got: {:?}",
+        run.selection_error
+    );
+}
+
+/// A validated explicit id: an explicit run id must pass run-id validation
+/// before joining `runs-v2/`.
+#[test]
+fn explicit_id_is_validated() {
+    let temp = TempState::new();
+    let source = temp.source();
+    // Traversal is rejected.
+    let err = source
+        .select(&RunSelection::Explicit("../etc/passwd".to_string()))
+        .expect_err("traversal id rejected");
+    assert!(err.message().contains("invalid run id"));
+    // Multi-component rejected.
+    let err = source
+        .select(&RunSelection::Explicit("a/b".to_string()))
+        .expect_err("multi-component rejected");
+    assert!(err.message().contains("invalid run id"));
+    // Empty rejected.
+    let err = source
+        .select(&RunSelection::Explicit(String::new()))
+        .expect_err("empty rejected");
+    assert!(err.message().contains("invalid run id"));
+}
+
+/// An unknown explicit id fails closed.
+#[test]
+fn explicit_unknown_id_fails_closed() {
+    let temp = TempState::new();
+    let source = temp.source();
+    let err = source
+        .select(&RunSelection::Explicit(
+            "run-work-20260725T120000.000000000-p1-000000".to_string(),
+        ))
+        .expect_err("unknown id fails closed");
+    assert!(err.message().contains("unknown run id"));
+}
+
+/// A malformed newest candidate is selected and displayed with its error
+/// rather than silently falling back to an older, valid run.
+#[test]
+fn malformed_newest_candidate_is_selected_with_error() {
+    let temp = TempState::new();
+    // A valid older run.
+    temp.write_run(
+        "run-work-20260725T100000.000000000-p1-000000",
+        &temp.work_manifest(
+            "run-work-20260725T100000.000000000-p1-000000",
+            "2026-07-25T10:00:00Z",
+            "running",
+        ),
+    );
+    // A malformed newer run (invalid JSON).
+    let malformed_dir = temp
+        .runs_dir()
+        .join("run-work-20260725T120000.000000000-p2-000000");
+    fs::create_dir_all(&malformed_dir).unwrap();
+    fs::write(malformed_dir.join("manifest.json"), b"{ not valid json").unwrap();
+
+    let source = temp.source();
+    let run = source.select(&RunSelection::Newest).expect("select");
+    assert_eq!(
+        run.identity.run_id,
+        "run-work-20260725T120000.000000000-p2-000000"
+    );
+    assert!(
+        run.selection_error
+            .as_ref()
+            .is_some_and(|e| e.contains("failed to parse manifest")),
+        "malformed newest must carry a selection error, got: {:?}",
+        run.selection_error
+    );
+}
+
+/// Forward compatibility: unknown extra manifest fields are tolerated.
+#[test]
+fn unknown_manifest_fields_are_tolerated() {
+    let temp = TempState::new();
+    let run_id = "run-work-20260725T120000.000000000-p1-000000";
+    let mut manifest = temp.work_manifest(run_id, "2026-07-25T12:00:00Z", "running");
+    manifest["future_field"] = serde_json::json!({"anything": "here"});
+    manifest["another"] = serde_json::json!(42);
+    temp.write_run(run_id, &manifest);
+    let source = temp.source();
+    let run = source
+        .select(&RunSelection::Explicit(run_id.to_string()))
+        .expect("select");
+    assert!(run.selection_error.is_none());
+    assert_eq!(run.identity.run_id, run_id);
+}
+
+/// An unknown manifest schema fails the source closed.
+#[test]
+fn unknown_manifest_schema_fails_closed() {
+    let temp = TempState::new();
+    let run_id = "run-work-20260725T120000.000000000-p1-000000";
+    let mut manifest = temp.work_manifest(run_id, "2026-07-25T12:00:00Z", "running");
+    manifest["schema"] = serde_json::json!("undertake/run@3");
+    temp.write_run(run_id, &manifest);
+    let source = temp.source();
+    let run = source
+        .select(&RunSelection::Explicit(run_id.to_string()))
+        .expect("select");
+    assert!(
+        run.selection_error
+            .as_ref()
+            .is_some_and(|e| e.contains("unknown schema")),
+        "unknown schema must fail closed, got: {:?}",
+        run.selection_error
+    );
+}
+
+/// Default selection prefers the newest nonterminal run even when a newer
+/// terminal run exists.
+#[test]
+fn default_prefers_newest_nonterminal_over_newer_terminal() {
+    let temp = TempState::new();
+    // An older nonterminal run.
+    temp.write_run(
+        "run-work-20260725T100000.000000000-p1-000000",
+        &temp.work_manifest(
+            "run-work-20260725T100000.000000000-p1-000000",
+            "2026-07-25T10:00:00Z",
+            "running",
+        ),
+    );
+    // A newer terminal run.
+    temp.write_run(
+        "run-work-20260725T120000.000000000-p2-000000",
+        &temp.work_manifest(
+            "run-work-20260725T120000.000000000-p2-000000",
+            "2026-07-25T12:00:00Z",
+            "finished",
+        ),
+    );
+    let source = temp.source();
+    let run = source.select(&RunSelection::Newest).expect("select");
+    // The nonterminal run is preferred despite being older.
+    assert_eq!(
+        run.identity.run_id,
+        "run-work-20260725T100000.000000000-p1-000000"
+    );
+}
+
+/// When no nonterminal run exists, the newest terminal run is selected.
+#[test]
+fn falls_back_to_newest_terminal_run() {
+    let temp = TempState::new();
+    temp.write_run(
+        "run-work-20260725T100000.000000000-p1-000000",
+        &temp.work_manifest(
+            "run-work-20260725T100000.000000000-p1-000000",
+            "2026-07-25T10:00:00Z",
+            "finished",
+        ),
+    );
+    temp.write_run(
+        "run-work-20260725T120000.000000000-p2-000000",
+        &temp.work_manifest(
+            "run-work-20260725T120000.000000000-p2-000000",
+            "2026-07-25T12:00:00Z",
+            "finished",
+        ),
+    );
+    let source = temp.source();
+    let run = source.select(&RunSelection::Newest).expect("select");
+    assert_eq!(
+        run.identity.run_id,
+        "run-work-20260725T120000.000000000-p2-000000"
+    );
+}
+
+/// Mixed plan and work ids are both eligible for discovery.
+#[test]
+fn mixed_plan_and_work_ids_are_eligible() {
+    let temp = TempState::new();
+    let work_id = "run-work-20260725T100000.000000000-p1-000000";
+    temp.write_run(
+        work_id,
+        &temp.work_manifest(work_id, "2026-07-25T10:00:00Z", "running"),
+    );
+    let plan_id = "run-plan-20260725T120000.000000000-p2-000000";
+    let plan_manifest = serde_json::json!({
+        "schema": "undertake/run@2",
+        "run_id": plan_id,
+        "job": "plan",
+        "target": {"repo": "/repo/x"},
+        "details": {"job": "plan", "state": {
+            "target": {"repo": "/repo/x", "input": {"kind": "bead", "bead_id": "b1", "artifact": {"path": "in.txt", "sha256": "a".repeat(64)}, "tier": "junior", "complexity": "S"}},
+            "routes": {"stages": [
+                {"stage": "planner", "capability_role": "author", "candidates": [{"profile_id": "p", "provider_id": "pr", "availability_key": "ak", "execution_key": "ek"}], "provider_distinct_from": [], "constraints": {"distinct_execution_from": [], "tier_at_least": [], "provider_diversity": "none"}},
+                {"stage": "peer_review", "capability_role": "peer", "candidates": [{"profile_id": "p2", "provider_id": "pr", "availability_key": "ak", "execution_key": "ek2"}], "provider_distinct_from": [], "constraints": {"distinct_execution_from": [], "tier_at_least": [], "provider_diversity": "none"}},
+                {"stage": "second_opinion", "capability_role": "judge", "candidates": [{"profile_id": "p3", "provider_id": "pr", "availability_key": "ak", "execution_key": "ek3"}], "provider_distinct_from": [], "constraints": {"distinct_execution_from": [], "tier_at_least": [], "provider_diversity": "none"}}
+            ]},
+            "progress": {"state": "prepared"},
+            "stage_attempts": {"planner": 0, "peer_review": 0, "second_opinion": 0},
+            "revision_limit": 0,
+            "stage_attempt_limit": 1
+        }},
+        "created_at": "2026-07-25T12:00:00Z",
+        "updated_at": "2026-07-25T12:00:00Z",
+        "approved_profiles": [],
+        "limits": {},
+        "verifier": {},
+        "lifecycle": "running",
+    });
+    temp.write_run(plan_id, &plan_manifest);
+    let source = temp.source();
+    let run = source.select(&RunSelection::Newest).expect("select");
+    assert_eq!(run.identity.run_id, plan_id);
+}
+
+/// An empty runs directory yields a "no runs found" error.
+#[test]
+fn empty_runs_directory_yields_no_runs_error() {
+    let temp = TempState::new();
+    let source = temp.source();
+    let err = source
+        .select(&RunSelection::Newest)
+        .expect_err("empty must error");
+    assert!(err.message().contains("no runs found"));
+}
+
+/// A source that has never produced a value must report `Absent` with its
+/// failed attempt and error — never `Stale` with a fabricated `last_ok`.
+/// A renderer reading `last_ok == now` would present a source that has
+/// never succeeded as freshly read.
+#[test]
+fn never_succeeded_run_source_is_absent_with_error_not_fake_stale() {
+    let temp = TempState::new();
+    let now: DateTime<Utc> = "2026-07-25T20:00:00Z".parse().expect("now");
+    let snapshot = temp.source().snapshot(
+        None,
+        &RunSelection::Explicit("no-such-run".to_string()),
+        now,
+    );
+
+    assert!(
+        matches!(snapshot.run, SourceState::Absent { .. }),
+        "never-read source must be Absent, got {:?}",
+        snapshot.run
+    );
+    assert_eq!(snapshot.run.last_ok(), None, "nothing ever succeeded");
+    assert_eq!(snapshot.run.last_attempt(), Some(now));
+    assert!(
+        snapshot
+            .run
+            .error()
+            .is_some_and(|error| error.contains("unknown run id")),
+        "got: {:?}",
+        snapshot.run.error()
+    );
+    assert!(!snapshot.run.is_fresh());
+}
+
+/// Once a source has produced a value, a later failure retains that value
+/// and marks it `Stale` with the real `last_ok` — the state the model's
+/// docs describe.
+#[test]
+fn previously_valid_run_source_goes_stale_retaining_its_value() {
+    let temp = TempState::new();
+    let run_id = "run-work-20260725T120000.000000000-p2-000000";
+    temp.write_run(
+        run_id,
+        &temp.work_manifest(run_id, "2026-07-25T12:00:00Z", "running"),
+    );
+    let source = temp.source();
+    let first: DateTime<Utc> = "2026-07-25T20:00:00Z".parse().expect("first");
+    let good = source.snapshot(None, &RunSelection::Newest, first);
+    assert!(good.run.is_fresh());
+    assert_eq!(
+        good.run.value().map(|run| run.identity.run_id.as_str()),
+        Some(run_id)
+    );
+
+    fs::remove_dir_all(temp.runs_dir().join(run_id)).expect("remove run");
+    let second: DateTime<Utc> = "2026-07-25T20:00:05Z".parse().expect("second");
+    let degraded = source.snapshot(Some(&good), &RunSelection::Newest, second);
+
+    assert!(
+        matches!(degraded.run, SourceState::Stale { .. }),
+        "a source with a prior value degrades to Stale, got {:?}",
+        degraded.run
+    );
+    assert_eq!(degraded.run.last_ok(), Some(first), "the real last success");
+    assert_eq!(degraded.run.last_attempt(), Some(second));
+    assert_eq!(
+        degraded.run.value().map(|run| run.identity.run_id.as_str()),
+        Some(run_id),
+        "the last valid value is retained"
+    );
+}
+
+/// The 200-candidate cap bounds *discovery*, not explicit selection. Pinning
+/// the dashboard to a named run with `--run <id>` must keep working for a run
+/// older than the newest 200 — otherwise the one thing an operator does to
+/// inspect a specific stranded run silently reports "unknown run id".
+#[test]
+fn explicit_id_beyond_the_candidate_cap_still_resolves() {
+    let temp = TempState::new();
+    let pinned = "run-work-20260101T000000.000000000-p0-000000";
+    temp.write_run(
+        pinned,
+        &temp.work_manifest(pinned, "2026-01-01T00:00:00Z", "running"),
+    );
+    // Every one of these is newer, so the pinned run falls outside the
+    // most-recently-modified window discovery keeps.
+    for index in 0..250 {
+        let run_id = format!("run-work-20260725T1200{index:02}.000000000-p{index}-000000");
+        temp.write_run(
+            &run_id,
+            &temp.work_manifest(&run_id, "2026-07-25T12:00:00Z", "running"),
+        );
+    }
+
+    let source = temp.source();
+    assert_eq!(
+        source.scan_candidates_len_for_tests(),
+        200,
+        "discovery itself stays capped"
+    );
+    let run = source
+        .select(&RunSelection::Explicit(pinned.to_string()))
+        .expect("explicit selection ignores the discovery cap");
+    assert_eq!(run.identity.run_id, pinned);
+    assert_eq!(run.selection_error, None);
+}

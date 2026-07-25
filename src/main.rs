@@ -25,6 +25,8 @@ mod scan;
 mod state;
 mod triage;
 mod verify;
+#[cfg(feature = "tui")]
+mod dashboard;
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
