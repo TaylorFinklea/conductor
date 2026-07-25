@@ -1,6 +1,6 @@
 # current-state.md — undertake
 
-Branch: feat/omp-role-aware-routing
+Branch: `main` — fast-forwarded from `feat/four-tool-clean-rename` (`c9d3ab6`); pushed, in sync with `origin/main`. Rename cutover complete; `conductor-043` cross-repo gate fixed at this commit and closed 2026-07-25 (guildhall `decisions.md` [2026-07-25]).
 
 Strict Undertake v2 cutover COMPLETE (2026-07-22): active runs now use only
 `musterroll/roster@2`, `undertake/run@2`, and `undertake/event@2`; each prepared
