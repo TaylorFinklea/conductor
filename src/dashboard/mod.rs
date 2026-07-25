@@ -6,20 +6,33 @@
 //! forward-compatible artifact readers that produce it; it never writes run,
 //! service, or repository state and never receives a mutable `RunHandle`.
 //!
-//! Later tasks add the renderer, runtime, service adapters, and CLI wiring;
 //! Task 1 establishes the snapshot interfaces (`DashboardSnapshot`,
 //! `RunSnapshot`, `RunLiveness`, `SourceState<T>`, `DashboardRunSource`,
 //! `RunSelection`, and `RunSourceConfig`) and the bounded run discovery,
-//! liveness, events, attempts, verification, and log-tail readers.
+//! liveness, events, attempts, verification, and log-tail readers. Task 2
+//! adds the bounded service adapters. Task 3 adds the pure renderer
+//! (`render`), the read-only intent/state layer and terminal-safe event
+//! loop (`runtime`), and the crate's only mutation-free dashboard entry
+//! point, `run_dashboard`. Task 4 wires the `undertake dashboard` CLI
+//! command to it.
 
-// Task 1 ships the whole snapshot interface; its consumers (Task 2 service
-// adapters, Task 3 renderer/runtime, Task 4 CLI) land in later tasks. Lint
-// levels are lexically scoped, so this one allow covers the whole subtree —
-// drop it once the renderer consumes the model.
+// `run_dashboard` (this task) is reachable from `main.rs` via the PTY
+// test-harness dispatch, so Task 3's own code is no longer dead by itself —
+// but plenty of Task 1/2 surface still is: `DashboardRunSource::select`/
+// `recent_runs` (the runtime drives everything through `snapshot()`
+// instead, per Task 1's own concern about the discovery warning living only
+// there), three of the four `LogSelector` variants (only `WorkerStdout` is
+// wired to a key), and the whole Cautionlight adapter (deliberately never
+// invoked — see `runtime`'s module doc). These are real, intentional gaps
+// for *this* task, not bugs; Task 4's CLI wiring is expected to close some
+// of them. Lint levels are lexically scoped, so this one allow covers the
+// whole subtree.
 #![allow(dead_code)]
 
 pub(crate) mod model;
+pub(crate) mod render;
 pub(crate) mod run_source;
+pub(crate) mod runtime;
 pub(crate) mod sanitize;
 pub(crate) mod services;
 
@@ -40,6 +53,14 @@ pub(crate) use run_source::{
 // `--no-default-features` build.
 #[allow(unused_imports)]
 pub(crate) use crate::process::{BoundedCommand, CommandOutcome};
+#[allow(unused_imports)]
+pub(crate) use render::{Panel, UiState};
+#[allow(unused_imports)]
+pub(crate) use runtime::run_dashboard;
+#[allow(unused_imports)]
+pub(crate) use runtime::state::{DashboardApp, DashboardIntent};
+#[allow(unused_imports)]
+pub(crate) use runtime::terminal::TerminalGuard;
 #[allow(unused_imports)]
 pub(crate) use services::{
     AfterfactDashboardSource, AfterfactSnapshot, CautionlightDashboardSource, CautionlightSnapshot,
@@ -84,24 +105,25 @@ mod tests {
             "Cargo.toml [features] must declare `default = [\"tui\"]`"
         );
         assert!(
-            features_section.contains(r#"tui = ["dep:ratatui", "dep:crossterm"]"#),
-            "Cargo.toml [features] must declare `tui = [\"dep:ratatui\", \"dep:crossterm\"]`"
+            features_section
+                .contains(r#"tui = ["dep:ratatui", "dep:crossterm", "dep:signal-hook"]"#),
+            "Cargo.toml [features] must declare `tui = [\"dep:ratatui\", \"dep:crossterm\", \"dep:signal-hook\"]`"
         );
     }
 
     /// A no-default-features build must not pull the dashboard runtime
     /// dependencies. This is checked at compile time by the module gate:
     /// `mod dashboard` is compiled only with `tui`, so a
-    /// `--no-default-features` build never links ratatui/crossterm and never
-    /// compiles this test module at all. `cargo check --no-default-features`
-    /// succeeding without those dependencies is the direct runtime proof;
-    /// this test additionally confirms both dependencies are marked
-    /// `optional = true` in the manifest, the mechanism that makes the gate
-    /// possible.
+    /// `--no-default-features` build never links ratatui/crossterm/
+    /// signal-hook and never compiles this test module at all. `cargo check
+    /// --no-default-features` succeeding without those dependencies is the
+    /// direct runtime proof; this test additionally confirms all three
+    /// dependencies are marked `optional = true` in the manifest, the
+    /// mechanism that makes the gate possible.
     #[test]
     fn dashboard_feature_gate_no_default_features_omits_runtime_deps() {
         let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
-        for dep_line_prefix in ["ratatui = {", "crossterm = {"] {
+        for dep_line_prefix in ["ratatui = {", "crossterm = {", "signal-hook = {"] {
             let line = manifest
                 .lines()
                 .find(|line| line.starts_with(dep_line_prefix))
