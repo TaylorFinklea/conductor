@@ -34,6 +34,43 @@ use crate::run::{RunJob, RunLifecycle};
 pub(crate) const MIN_WIDTH: u16 = 60;
 pub(crate) const MIN_HEIGHT: u16 = 16;
 
+/// At or above this width the main area splits into a focused detail pane
+/// plus an overview column summarizing the other three panels. Below it a
+/// sidebar narrow enough to fit would be too narrow to say anything, so the
+/// layout stays a single focused panel. Derived from the two panes rather
+/// than guessed: the threshold *is* the point at which both are usable.
+pub(crate) const NORMAL_MIN_WIDTH: u16 = MIN_DETAIL_WIDTH + OVERVIEW_WIDTH;
+
+/// The narrowest focused detail pane worth splitting for.
+const MIN_DETAIL_WIDTH: u16 = 56;
+
+/// The overview column's width. Fixed rather than proportional, so the
+/// summaries read identically at every normal-or-wider size and all extra
+/// width goes to the panel that has the focus.
+const OVERVIEW_WIDTH: u16 = 44;
+
+/// How the main area is divided. Spec §205 requires both layouts, and the
+/// choice is deterministic in the frame width alone — height never binds,
+/// because the overview column is a vertical stack of three panes that
+/// still fits the main area at [`MIN_HEIGHT`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LayoutMode {
+    /// One focused panel filling the main area.
+    Compact,
+    /// Focused detail pane, plus an overview column of the other three.
+    Normal,
+}
+
+impl LayoutMode {
+    pub(crate) const fn for_width(width: u16) -> Self {
+        if width >= NORMAL_MIN_WIDTH {
+            Self::Normal
+        } else {
+            Self::Compact
+        }
+    }
+}
+
 /// The dashboard's focusable panels. `Tab`/`Shift-Tab` cycle through them.
 /// Help is a separate overlay toggled by `?`, not a fifth tab stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,16 +199,39 @@ pub(crate) fn render(
 
     render_banner(frame, banner_area, snapshot, ui);
     render_tabs(frame, tabs_area, ui);
-    match ui.focus {
-        Panel::ActiveRun => render_active_run(frame, main_area, snapshot, ui, now),
-        Panel::Providers => render_providers(frame, main_area, snapshot),
-        Panel::Evidence => render_evidence(frame, main_area, snapshot),
-        Panel::RecentRuns => render_recent_runs(frame, main_area, snapshot, ui),
+    match LayoutMode::for_width(area.width) {
+        LayoutMode::Compact => render_panel(frame, main_area, ui.focus, snapshot, ui, now),
+        LayoutMode::Normal => {
+            let [detail_area, overview_area] =
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(OVERVIEW_WIDTH)])
+                    .areas(main_area);
+            render_panel(frame, detail_area, ui.focus, snapshot, ui, now);
+            render_overview_column(frame, overview_area, snapshot, ui, now);
+        }
     }
     render_footer(frame, footer_area, snapshot);
 
     if ui.help_visible {
         render_help_overlay(frame, area);
+    }
+}
+
+/// Draws one panel's full detail into `area`. The focused panel gets this
+/// treatment at every size; under [`LayoutMode::Normal`] the other three
+/// get [`overview_lines`] instead.
+fn render_panel(
+    frame: &mut Frame,
+    area: Rect,
+    panel: Panel,
+    snapshot: &DashboardSnapshot,
+    ui: &UiState,
+    now: DateTime<Utc>,
+) {
+    match panel {
+        Panel::ActiveRun => render_active_run(frame, area, snapshot, ui, now),
+        Panel::Providers => render_providers(frame, area, snapshot),
+        Panel::Evidence => render_evidence(frame, area, snapshot),
+        Panel::RecentRuns => render_recent_runs(frame, area, snapshot, ui),
     }
 }
 
@@ -586,18 +646,30 @@ fn format_stage_marker(marker: &StageMarker) -> String {
     )
 }
 
-fn format_verification(record: &VerificationRecord) -> String {
-    let passed = match record.passed {
+/// Shared with the overview column's shorter form, so the two can never
+/// disagree about what `passed`/`failed`/`not run` means.
+const fn verification_result_label(passed: Option<bool>) -> &'static str {
+    match passed {
         Some(true) => "passed",
         Some(false) => "failed",
         None => "not run",
-    };
-    let source = match record.source {
+    }
+}
+
+const fn verification_source_label(source: VerificationSource) -> &'static str {
+    match source {
         VerificationSource::Mechanical => "mechanical",
         VerificationSource::Event => "event",
         VerificationSource::NotRun => "n/a",
-    };
-    let mut text = format!("verification: {passed} (source: {source})");
+    }
+}
+
+fn format_verification(record: &VerificationRecord) -> String {
+    let mut text = format!(
+        "verification: {} (source: {})",
+        verification_result_label(record.passed),
+        verification_source_label(record.source),
+    );
     if let Some(command) = &record.command {
         let _ = write!(text, "  cmd: {}", display_text(command, 60));
     }
@@ -619,23 +691,33 @@ fn harness_deck_note(job: Option<RunJob>) -> String {
     }
 }
 
-fn evidence_summary_line(snapshot: &DashboardSnapshot) -> String {
-    let afterfact = match snapshot.afterfact.as_ref() {
+fn afterfact_summary(snapshot: &DashboardSnapshot) -> String {
+    match snapshot.afterfact.as_ref() {
         SourceState::Fresh { value, .. } | SourceState::Stale { value, .. } => format!(
             "afterfact: {} correlated / {} uncorrelated",
             value.correlated_count, value.uncorrelated_count
         ),
         SourceState::Absent { .. } => "afterfact: not yet fetched".to_string(),
         SourceState::Deferred { .. } => "afterfact: deferred".to_string(),
-    };
-    let cautionlight = match snapshot.cautionlight.as_ref() {
+    }
+}
+
+fn cautionlight_summary(snapshot: &DashboardSnapshot) -> String {
+    match snapshot.cautionlight.as_ref() {
         SourceState::Deferred { .. } => "cautionlight: deferred".to_string(),
         SourceState::Fresh { value, .. } | SourceState::Stale { value, .. } => {
             format!("cautionlight: {} findings", value.findings.len())
         }
         SourceState::Absent { .. } => "cautionlight: not yet fetched".to_string(),
-    };
-    format!("{afterfact}   {cautionlight}")
+    }
+}
+
+fn evidence_summary_line(snapshot: &DashboardSnapshot) -> String {
+    format!(
+        "{}   {}",
+        afterfact_summary(snapshot),
+        cautionlight_summary(snapshot)
+    )
 }
 
 fn render_providers(frame: &mut Frame, area: Rect, snapshot: &DashboardSnapshot) {
@@ -841,6 +923,173 @@ fn recent_run_items<'a>(runs: &'a [RecentRun], ui: &UiState) -> Vec<ListItem<'a>
         .collect()
 }
 
+/// The three panels the overview column summarizes: every panel except the
+/// focused one, in [`Panel::ALL`] order, so the column's structure is a
+/// function of focus alone.
+fn overview_panels(focus: Panel) -> [Panel; 3] {
+    let mut panels = [Panel::ActiveRun; 3];
+    let mut next = 0;
+    for panel in Panel::ALL {
+        if panel != focus {
+            panels[next] = panel;
+            next += 1;
+        }
+    }
+    panels
+}
+
+/// The normal layout's overview column: the three unfocused panels, stacked
+/// and summarized, so a provider going `exhausted` or a run finishing stays
+/// visible without leaving the panel in focus. Deliberately unwrapped —
+/// each summary row is one item, and wrapping one would silently push the
+/// items below it off a fixed-height pane.
+fn render_overview_column(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &DashboardSnapshot,
+    ui: &UiState,
+    now: DateTime<Utc>,
+) {
+    let panes: [Rect; 3] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Fill(1),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    for (panel, pane) in overview_panels(ui.focus).into_iter().zip(panes) {
+        let block = Block::default().borders(Borders::ALL).title(panel.label());
+        let inner = block.inner(pane);
+        frame.render_widget(block, pane);
+        frame.render_widget(
+            Paragraph::new(overview_lines(panel, snapshot, ui, now)),
+            inner,
+        );
+    }
+}
+
+/// One unfocused panel's summary. Source-state distinctions survive it: an
+/// overview that collapsed `stale`, `absent`, and `deferred` into one blank
+/// pane would be worse than no overview at all.
+fn overview_lines(
+    panel: Panel,
+    snapshot: &DashboardSnapshot,
+    ui: &UiState,
+    now: DateTime<Utc>,
+) -> Vec<Line<'static>> {
+    match panel {
+        Panel::ActiveRun => active_run_overview_lines(snapshot, ui, now),
+        Panel::Providers => providers_overview_lines(snapshot),
+        Panel::Evidence => evidence_overview_lines(snapshot),
+        Panel::RecentRuns => recent_runs_overview_lines(snapshot),
+    }
+}
+
+fn active_run_overview_lines(
+    snapshot: &DashboardSnapshot,
+    ui: &UiState,
+    now: DateTime<Utc>,
+) -> Vec<Line<'static>> {
+    let value = match &snapshot.run {
+        SourceState::Fresh { value, .. } | SourceState::Stale { value, .. } => value,
+        SourceState::Absent { error, .. } => {
+            return vec![Line::from(display_text(
+                error.as_deref().unwrap_or("no run data"),
+                120,
+            ))];
+        }
+        SourceState::Deferred { .. } => return vec![Line::from("run source deferred")],
+    };
+    let identity = &value.identity;
+    let mut lines = vec![Line::from(Span::styled(
+        format!("liveness: {}", identity.liveness.label()),
+        liveness_style(identity.liveness, ui.color),
+    ))];
+    if let Some(stage) = &identity.stage {
+        lines.push(Line::from(format!("stage: {}", display_text(stage, 30))));
+    }
+    lines.push(Line::from(format!(
+        "elapsed: {}",
+        identity.created_at.map_or_else(
+            || "n/a".to_string(),
+            |created| format_duration_chrono(now.signed_duration_since(created)),
+        )
+    )));
+    lines.push(Line::from(format!(
+        "verification: {} ({})",
+        verification_result_label(value.verification.passed),
+        verification_source_label(value.verification.source),
+    )));
+    lines.push(Line::from(if identity.job == Some(RunJob::Plan) {
+        format!("plan stages: {}", value.stage_markers.len())
+    } else {
+        format!("attempts: {}", value.attempts.len())
+    }));
+    lines
+}
+
+fn providers_overview_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
+    match snapshot.musterroll.as_ref() {
+        SourceState::Fresh { value, .. } | SourceState::Stale { value, .. } => {
+            if value.providers.is_empty() {
+                return vec![Line::from("no providers reported")];
+            }
+            value
+                .providers
+                .iter()
+                .map(|(name, status)| {
+                    Line::from(format!(
+                        "{}  {}",
+                        display_text(name, 24),
+                        status.availability
+                    ))
+                })
+                .collect()
+        }
+        SourceState::Absent { error, .. } => vec![Line::from(display_text(
+            error.as_deref().unwrap_or("musterroll unavailable"),
+            120,
+        ))],
+        SourceState::Deferred { .. } => vec![Line::from("musterroll deferred")],
+    }
+}
+
+fn evidence_overview_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
+    vec![
+        Line::from(afterfact_summary(snapshot)),
+        Line::from(cautionlight_summary(snapshot)),
+    ]
+}
+
+fn recent_runs_overview_lines(snapshot: &DashboardSnapshot) -> Vec<Line<'static>> {
+    match &snapshot.recent {
+        SourceState::Fresh { value, .. } | SourceState::Stale { value, .. } => {
+            if value.is_empty() {
+                return vec![Line::from("no recent terminal runs")];
+            }
+            value
+                .iter()
+                .map(|run| {
+                    // Outcome first: the column clips from the right, and a
+                    // clipped run id still identifies the run while a
+                    // clipped-away outcome tells the reader nothing.
+                    Line::from(format!(
+                        "{}  {}",
+                        run.outcome
+                            .as_deref()
+                            .map_or_else(|| "n/a".to_string(), |outcome| display_text(outcome, 12)),
+                        display_text(&run.run_id, 60),
+                    ))
+                })
+                .collect()
+        }
+        SourceState::Absent { error, .. } => vec![Line::from(display_text(
+            error.as_deref().unwrap_or("recent runs unavailable"),
+            120,
+        ))],
+        SourceState::Deferred { .. } => vec![Line::from("recent runs deferred")],
+    }
+}
+
 fn render_help_overlay(frame: &mut Frame, area: Rect) {
     let width = area.width.min(72);
     let height = area.height.min(16);
@@ -860,8 +1109,8 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("j/k, ↑/↓        move selection"),
         Line::from("Tab / Shift-Tab  change focused panel"),
-        Line::from("Enter            open recent run  ·  toggle attempt log"),
-        Line::from("l                toggle log detail"),
+        Line::from("Enter            Recent Runs: open run  ·  Active Run: toggle log"),
+        Line::from("l                toggle the focused panel's log (Active Run only)"),
         Line::from("r                refresh Evidence (Afterfact) on demand"),
         Line::from("?                toggle this help"),
         Line::from("q, Ctrl-C        quit"),
@@ -1082,6 +1331,67 @@ mod tests {
         lines.iter().any(|line| line.contains(needle))
     }
 
+    /// ratatui draws a bordered block's title one cell right of its
+    /// top-left corner, so `┌<label>` identifies a real pane and can never
+    /// be confused with the tab strip's `[<label>]`.
+    const PANE_TITLE_PREFIX: char = '┌';
+
+    fn framed_panel_count(lines: &[String], panel: Panel) -> usize {
+        let needle = format!("{PANE_TITLE_PREFIX}{}", panel.label());
+        lines.iter().filter(|line| line.contains(&needle)).count()
+    }
+
+    /// The bordered panes actually drawn, in [`Panel::ALL`] order. Reads the
+    /// frame's *structure*, independent of what any panel contains.
+    fn framed_panels(lines: &[String]) -> Vec<&'static str> {
+        Panel::ALL
+            .iter()
+            .copied()
+            .filter(|panel| framed_panel_count(lines, *panel) > 0)
+            .map(Panel::label)
+            .collect()
+    }
+
+    /// `base_snapshot` with panel-distinct content: a provider name that
+    /// appears nowhere else on screen, so a test can tell "the Providers
+    /// panel rendered" apart from "the attempt's own provider id rendered".
+    fn overview_snapshot() -> DashboardSnapshot {
+        let at = now();
+        let mut status = base_provider(Availability::Exhausted);
+        status.reason = Some("weekly budget nearly spent".to_string());
+        let mut providers = BTreeMap::new();
+        providers.insert("neuralwatt".to_string(), status);
+        let mut snapshot = base_snapshot();
+        snapshot.musterroll = Arc::new(SourceState::Fresh {
+            value: MusterrollSnapshot {
+                schema: "musterroll/status@1".to_string(),
+                checked_at: "2026-07-25T18:40:00Z".to_string(),
+                providers,
+            },
+            last_ok: at,
+            last_attempt: at,
+            truncated: false,
+        });
+        snapshot
+    }
+
+    /// The plain text of one panel's overview form, spans joined.
+    fn overview_text(panel: Panel, snapshot: &DashboardSnapshot) -> Vec<String> {
+        overview_lines(panel, snapshot, &UiState::default(), now())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn has_row(rows: &[String], needle: &str) -> bool {
+        rows.iter().any(|row| row == needle)
+    }
+
     #[test]
     fn compact_layout_shows_active_run_identity() {
         let snapshot = base_snapshot();
@@ -1111,6 +1421,182 @@ mod tests {
         ] {
             assert!(contains(&lines, label), "missing tab label {label:?}");
         }
+    }
+
+    /// Spec §205 requires *both* a compact and a normal layout. Compact
+    /// cannot afford a sidebar and stays a single focused panel; normal must
+    /// put the other three panels on screen at the same time. If the two
+    /// ever collapse back into one structure, this fails.
+    #[test]
+    fn compact_and_normal_layouts_are_structurally_distinct() {
+        let snapshot = base_snapshot();
+        let ui = UiState::default();
+        assert_eq!(
+            framed_panels(&rendered_lines(COMPACT.0, COMPACT.1, &snapshot, &ui)),
+            vec![Panel::ActiveRun.label()],
+            "compact draws the focused panel and nothing else"
+        );
+        assert_eq!(
+            framed_panels(&rendered_lines(NORMAL.0, NORMAL.1, &snapshot, &ui)),
+            vec![
+                Panel::ActiveRun.label(),
+                Panel::Providers.label(),
+                Panel::Evidence.label(),
+                Panel::RecentRuns.label(),
+            ],
+            "normal adds an overview pane for every unfocused panel"
+        );
+    }
+
+    /// One deterministic threshold, and it is exactly the width at which
+    /// both panes become usable: one column narrower must fall back to
+    /// compact rather than render a useless sliver.
+    #[test]
+    fn the_layout_switches_at_one_deterministic_width() {
+        let snapshot = base_snapshot();
+        let ui = UiState::default();
+        assert_eq!(
+            LayoutMode::for_width(NORMAL_MIN_WIDTH - 1),
+            LayoutMode::Compact
+        );
+        assert_eq!(LayoutMode::for_width(NORMAL_MIN_WIDTH), LayoutMode::Normal);
+        let below = rendered_lines(NORMAL_MIN_WIDTH - 1, NORMAL.1, &snapshot, &ui);
+        let at_threshold = rendered_lines(NORMAL_MIN_WIDTH, NORMAL.1, &snapshot, &ui);
+        assert_eq!(
+            framed_panels(&below).len(),
+            1,
+            "one column below the threshold is still compact"
+        );
+        assert_eq!(
+            framed_panels(&at_threshold).len(),
+            4,
+            "the threshold itself already fits the overview column"
+        );
+    }
+
+    /// Compact is single-panel in content as well as chrome: nothing from an
+    /// unfocused panel leaks in.
+    #[test]
+    fn compact_layout_shows_no_unfocused_panel_content() {
+        let snapshot = overview_snapshot();
+        let lines = rendered_lines(COMPACT.0, COMPACT.1, &snapshot, &UiState::default());
+        assert!(
+            contains(&lines, "implementing"),
+            "the focused panel keeps its full detail"
+        );
+        assert!(
+            !contains(&lines, "neuralwatt"),
+            "a provider must not appear while Providers is unfocused"
+        );
+        assert!(
+            !contains(&lines, "run-work-20260724T100000"),
+            "a recent run must not appear while Recent Runs is unfocused"
+        );
+        assert!(
+            !contains(&lines, "attempts: 1"),
+            "the summary form of Active Run belongs to the overview column only"
+        );
+    }
+
+    /// Normal is a genuine multi-pane overview: the focused panel keeps its
+    /// full detail and the other three are summarized beside it.
+    #[test]
+    fn normal_layout_summarizes_unfocused_panels_beside_the_focused_detail() {
+        let snapshot = overview_snapshot();
+        let lines = rendered_lines(NORMAL.0, NORMAL.1, &snapshot, &UiState::default());
+        assert!(
+            contains(&lines, "#01 openai-codex/codex/gpt-5.6-luna"),
+            "the focused detail pane is unchanged by the split"
+        );
+        assert!(
+            contains(&lines, "neuralwatt  exhausted"),
+            "the Providers summary carries its availability"
+        );
+        assert!(
+            contains(&lines, "run-work-20260724T100000"),
+            "the Recent Runs summary carries its run"
+        );
+    }
+
+    /// Every overview pane must carry its own panel's state: a column of
+    /// empty boxes is not an overview.
+    #[test]
+    fn every_overview_pane_summarizes_its_own_panels_state() {
+        let snapshot = overview_snapshot();
+        assert!(has_row(
+            &overview_text(Panel::ActiveRun, &snapshot),
+            "attempts: 1"
+        ));
+        assert!(has_row(
+            &overview_text(Panel::Providers, &snapshot),
+            "neuralwatt  exhausted"
+        ));
+        assert!(has_row(
+            &overview_text(Panel::Evidence, &snapshot),
+            "cautionlight: deferred"
+        ));
+        assert!(
+            overview_text(Panel::RecentRuns, &snapshot)
+                .iter()
+                .any(|row| row.contains("run-work-20260724T100000"))
+        );
+    }
+
+    /// A summarized panel must not launder its source state: `absent` and
+    /// `deferred` stay as distinguishable in the overview column as they are
+    /// in the full panel.
+    #[test]
+    fn overview_summaries_preserve_source_state_distinctions() {
+        let mut snapshot = overview_snapshot();
+        snapshot.musterroll = Arc::new(SourceState::Absent {
+            last_attempt: Some(now()),
+            error: Some("musterroll status exited 1".to_string()),
+        });
+        assert!(has_row(
+            &overview_text(Panel::Providers, &snapshot),
+            "musterroll status exited 1"
+        ));
+        assert!(
+            has_row(
+                &overview_text(Panel::Evidence, &snapshot),
+                "cautionlight: deferred"
+            ),
+            "a deferred service must not read like a missing one"
+        );
+        snapshot.afterfact = Arc::new(SourceState::never_read());
+        assert!(has_row(
+            &overview_text(Panel::Evidence, &snapshot),
+            "afterfact: not yet fetched"
+        ));
+    }
+
+    /// Focus still decides which panel gets the detail pane, and the panel
+    /// that has it is never repeated in the overview column.
+    #[test]
+    fn focus_moves_the_detail_pane_without_duplicating_it() {
+        let snapshot = overview_snapshot();
+        let ui = UiState {
+            focus: Panel::Providers,
+            ..UiState::default()
+        };
+        let lines = rendered_lines(NORMAL.0, NORMAL.1, &snapshot, &ui);
+        assert!(
+            contains(&lines, "weekly budget nearly spent"),
+            "the focused panel shows detail its summary omits"
+        );
+        assert!(
+            contains(&lines, "attempts: 1"),
+            "the now-unfocused Active Run is summarized in the overview column"
+        );
+        assert!(
+            !contains(&lines, "Harness Deck"),
+            "a summary is a summary, not the whole panel"
+        );
+        assert_eq!(
+            framed_panel_count(&lines, Panel::Providers),
+            1,
+            "the focused panel must not also appear in the overview column"
+        );
     }
 
     #[test]

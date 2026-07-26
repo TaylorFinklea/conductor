@@ -52,11 +52,13 @@ pub(crate) mod state {
         FocusPrevious,
         SelectionUp,
         SelectionDown,
-        /// Enter: switches to the highlighted recent run, or — on the Active
-        /// Run panel — toggles the highlighted attempt's log (same handling
-        /// as [`DashboardIntent::ToggleLogDetail`]).
+        /// Enter: on Recent Runs switches to the highlighted run; on Active
+        /// Run toggles the highlighted attempt's log (same handling as
+        /// [`DashboardIntent::ToggleLogDetail`]). Providers and Evidence
+        /// have neither a run nor a log, so it is inert there.
         Activate,
-        /// `l`: toggles the highlighted attempt's log.
+        /// `l`: toggles the *focused* panel's log detail. Only Active Run
+        /// owns a log, so the key is inert on every other panel.
         ToggleLogDetail,
         /// `r`: immediate Evidence refresh, subject to focus/cadence/in-flight
         /// eligibility.
@@ -202,7 +204,7 @@ pub(crate) mod state {
                     Vec::new()
                 }
                 DashboardIntent::Activate => self.activate(ctx),
-                DashboardIntent::ToggleLogDetail => self.toggle_attempt_log(ctx),
+                DashboardIntent::ToggleLogDetail => self.toggle_focused_log(ctx),
                 DashboardIntent::RequestRefresh => self.request_evidence_refresh(now),
             }
         }
@@ -237,9 +239,11 @@ pub(crate) mod state {
                     };
                     self.select_run(run_id.clone())
                 }
-                Panel::ActiveRun | Panel::Providers | Panel::Evidence => {
-                    self.toggle_attempt_log(ctx)
-                }
+                Panel::ActiveRun => self.toggle_focused_log(ctx),
+                // Neither panel has a selected attempt or run to open, and
+                // reaching across to the Active Run's log is precisely what
+                // `l` must not do either.
+                Panel::Providers | Panel::Evidence => Vec::new(),
             }
         }
 
@@ -255,7 +259,15 @@ pub(crate) mod state {
             vec![RuntimeAction::SelectRun(run_id)]
         }
 
-        fn toggle_attempt_log(&mut self, ctx: &KeyContext<'_>) -> Vec<RuntimeAction> {
+        /// `l`, and `Enter` on Active Run: toggles the *focused* panel's
+        /// log detail (spec §200). Only Active Run owns a log — Providers,
+        /// Evidence, and Recent Runs have none — so the key is inert there
+        /// rather than silently reaching across panels to open, or worse
+        /// close, a log belonging to a panel the user is not looking at.
+        fn toggle_focused_log(&mut self, ctx: &KeyContext<'_>) -> Vec<RuntimeAction> {
+            if self.ui.focus != Panel::ActiveRun {
+                return Vec::new();
+            }
             if self.log_open {
                 self.log_open = false;
                 return vec![RuntimeAction::CloseLog];
@@ -565,6 +577,86 @@ pub(crate) mod state {
                 app.on_key(DashboardIntent::ToggleLogDetail, now, &empty_ctx()),
                 Vec::new()
             );
+        }
+
+        /// Spec §200: `l` toggles the *focused* panel's log detail. Only
+        /// Active Run has one, so `l` elsewhere must not reach across and
+        /// open the Active Run's attempt log — a bounded file read the user
+        /// never asked for, of a panel they are not looking at.
+        #[test]
+        fn l_is_inert_on_every_panel_that_owns_no_log() {
+            let now = ts("2026-01-01T00:00:00Z");
+            let ctx = KeyContext {
+                attempt_dirs: &[Some("001-attempt".to_string())],
+                recent_run_ids: &["run-a".to_string()],
+            };
+            for focus in [Panel::Providers, Panel::Evidence, Panel::RecentRuns] {
+                let mut app = app();
+                app.ui.focus = focus;
+                assert_eq!(
+                    app.on_key(DashboardIntent::ToggleLogDetail, now, &ctx),
+                    Vec::new(),
+                    "`l` must not open a log while {focus:?} is focused"
+                );
+            }
+            // A focus gate, not a blanket refusal.
+            let mut app = app();
+            assert_eq!(
+                app.on_key(DashboardIntent::ToggleLogDetail, now, &ctx),
+                vec![RuntimeAction::ReadLog(LogSelector::WorkerStdout(
+                    "001-attempt".to_string()
+                ))],
+                "`l` still works on the panel that owns the log"
+            );
+        }
+
+        /// The destructive half of the same defect: with a log already open
+        /// on Active Run, `l` from another panel used to emit `CloseLog` and
+        /// clear `log_open`, so the log vanished off a screen the user was
+        /// not even looking at and the *next* `l` back on Active Run
+        /// reopened it instead of closing it.
+        #[test]
+        fn l_from_another_panel_leaves_an_open_log_open() {
+            let mut app = app();
+            let now = ts("2026-01-01T00:00:00Z");
+            let ctx = KeyContext {
+                attempt_dirs: &[Some("001-attempt".to_string())],
+                recent_run_ids: &["run-a".to_string()],
+            };
+            app.on_key(DashboardIntent::ToggleLogDetail, now, &ctx);
+            app.ui.focus = Panel::RecentRuns;
+            assert_eq!(
+                app.on_key(DashboardIntent::ToggleLogDetail, now, &ctx),
+                Vec::new(),
+                "an open log must not be closed from a panel that cannot show it"
+            );
+            app.ui.focus = Panel::ActiveRun;
+            assert_eq!(
+                app.on_key(DashboardIntent::ToggleLogDetail, now, &ctx),
+                vec![RuntimeAction::CloseLog],
+                "returning to Active Run must close the still-open log, not reopen it"
+            );
+        }
+
+        /// `Enter` resolves to "selected attempt or run detail" (spec §199).
+        /// Providers and Evidence have neither, and both routed through the
+        /// same toggle as `l`, so the gate has to hold for both keys.
+        #[test]
+        fn enter_is_inert_on_providers_and_evidence() {
+            let now = ts("2026-01-01T00:00:00Z");
+            let ctx = KeyContext {
+                attempt_dirs: &[Some("001-attempt".to_string())],
+                recent_run_ids: &["run-a".to_string()],
+            };
+            for focus in [Panel::Providers, Panel::Evidence] {
+                let mut app = app();
+                app.ui.focus = focus;
+                assert_eq!(
+                    app.on_key(DashboardIntent::Activate, now, &ctx),
+                    Vec::new(),
+                    "Enter has no attempt or run to open while {focus:?} is focused"
+                );
+            }
         }
 
         #[test]
