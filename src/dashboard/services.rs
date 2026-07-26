@@ -7,7 +7,7 @@
 //! run directory for write.
 //!
 //! Every string an adapter parses out of a service is untrusted: it passes
-//! through [`crate::dashboard::sanitize`] before it can reach a snapshot, and
+//! through [`crate::sanitize`] before it can reach a snapshot, and
 //! no parsed path is ever opened or canonicalized.
 
 use std::collections::BTreeMap;
@@ -19,9 +19,9 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::dashboard::model::SourceState;
-use crate::dashboard::sanitize::{sanitize_single_line, sanitize_text};
 use crate::musterroll::{Availability, MusterrollClient, StatusReport, Window};
 use crate::process::BoundedCommand;
+use crate::sanitize::{sanitize_single_line, sanitize_text};
 
 /// Degrades a source after a failed attempt: retain the last valid value as
 /// [`SourceState::Stale`], or stay [`SourceState::Absent`] when nothing has
@@ -250,7 +250,7 @@ impl AfterfactDashboardSource {
             Err(error) => return degrade(previous, now, format!("run afterfact events: {error}")),
         };
 
-        if outcome.timed_out {
+        if outcome.timed_out() {
             return degrade(previous, now, "afterfact events timed out".to_string());
         }
         match outcome.exit_code {
@@ -499,7 +499,7 @@ impl CautionlightDashboardSource {
             }
         };
 
-        if outcome.timed_out {
+        if outcome.timed_out() {
             return degrade(previous, now, "cautionlight inspect timed out".to_string());
         }
         match outcome.exit_code {

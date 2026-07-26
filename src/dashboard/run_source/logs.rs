@@ -2,7 +2,7 @@
 //!
 //! Covers canonical containment, fixed relative patterns, newline alignment,
 //! lossy decoding, and control-character sanitization (which subsumes
-//! leading partial-escape removal — see `dashboard::sanitize`).
+//! leading partial-escape removal — see `crate::sanitize`).
 //! Absolute and traversal attempt-directory components are proven to never
 //! be opened.
 

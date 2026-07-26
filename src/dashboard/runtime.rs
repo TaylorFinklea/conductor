@@ -1408,6 +1408,18 @@ pub(crate) mod terminal {
             let first_update = "2026-07-25T18:43:44.617226+00:00";
             let second_update = "2026-07-25T18:59:59.123456+00:00";
 
+            // Force the release build *before* the fixture is written.
+            // `release_binary` is a no-op once built, but the first cold run
+            // pays the crate's full LTO/codegen-units=1 cost — and this
+            // fixture's heartbeat is written `now`, so a build that lands
+            // between the write and the spawn makes the run older than the
+            // 60-second stale threshold before the dashboard ever reads it.
+            // The opening screen would then render `silent`, and the `live`
+            // assertion below could never come true. Every other test in
+            // this suite builds inside `PtySession::spawn` because none of
+            // them depends on fixture freshness.
+            let dashboard = release_binary();
+
             let temp = TempState::new();
             // An *active* run: a heartbeat written now is younger than the
             // 60-second stale threshold, so liveness reads `live` — the
@@ -1430,7 +1442,7 @@ pub(crate) mod terminal {
 
             let before = tree_fingerprint(temp.root());
 
-            let mut cmd = CommandBuilder::new(release_binary());
+            let mut cmd = CommandBuilder::new(dashboard);
             cmd.args([
                 "dashboard",
                 "--run",
@@ -1632,11 +1644,24 @@ struct AfterfactReply {
 /// Spawns the Musterroll worker thread. Musterroll is global, not per-run,
 /// so — unlike Afterfact — tracking `previous` inside the worker's own loop
 /// is correct: nothing about a run switch invalidates provider availability.
-fn spawn_musterroll_worker() -> (SyncSender<()>, Receiver<SourceState<MusterrollSnapshot>>) {
+///
+/// `cancel` is shared with every command the worker's `CommandMusterrollClient`
+/// runs (see `CommandMusterrollClient::with_cancel`): setting it lets a
+/// blocked in-flight command terminate immediately instead of running to
+/// its full timeout. The returned `JoinHandle` lets the caller prove the
+/// thread actually exited rather than merely closing its channel — see
+/// `EvidenceWorkers::shutdown`.
+fn spawn_musterroll_worker(
+    cancel: Arc<AtomicBool>,
+) -> (
+    SyncSender<()>,
+    Receiver<SourceState<MusterrollSnapshot>>,
+    thread::JoinHandle<()>,
+) {
     let (request_tx, request_rx) = mpsc::sync_channel::<()>(1);
     let (reply_tx, reply_rx) = mpsc::channel();
-    thread::spawn(move || {
-        let client = CommandMusterrollClient::new();
+    let handle = thread::spawn(move || {
+        let client = CommandMusterrollClient::with_cancel(cancel);
         let mut previous: Option<SourceState<MusterrollSnapshot>> = None;
         while request_rx.recv().is_ok() {
             let now = Utc::now();
@@ -1647,16 +1672,30 @@ fn spawn_musterroll_worker() -> (SyncSender<()>, Receiver<SourceState<Musterroll
             }
         }
     });
-    (request_tx, reply_rx)
+    (request_tx, reply_rx, handle)
 }
 
 /// Spawns the Afterfact worker thread. Stateless per request — see
 /// [`AfterfactRequest`] for why `previous` travels with the request instead
 /// of living in the worker.
-fn spawn_afterfact_worker() -> (SyncSender<AfterfactRequest>, Receiver<AfterfactReply>) {
+///
+/// `cancel` mirrors [`spawn_musterroll_worker`]'s flag, attached to every
+/// command the worker builds. `command_template` is `None` in production
+/// (the worker uses [`AfterfactDashboardSource::default_command`]); tests
+/// substitute a controllable command so the cancel-and-join mechanism can
+/// be proven against a real, deliberately slow child process rather than
+/// the real `afterfact` binary's own (usually fast) exit.
+fn spawn_afterfact_worker(
+    cancel: Arc<AtomicBool>,
+    command_template: Option<crate::process::BoundedCommand>,
+) -> (
+    SyncSender<AfterfactRequest>,
+    Receiver<AfterfactReply>,
+    thread::JoinHandle<()>,
+) {
     let (request_tx, request_rx) = mpsc::sync_channel::<AfterfactRequest>(1);
     let (reply_tx, reply_rx) = mpsc::channel();
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         while let Ok(request) = request_rx.recv() {
             let now = Utc::now();
             // `worker_commits` stays empty, and that is Task 4's decision,
@@ -1671,8 +1710,12 @@ fn spawn_afterfact_worker() -> (SyncSender<AfterfactRequest>, Receiver<Afterfact
             // here would be inventing a typed fact the manifest does not
             // carry. Correlation therefore stays cwd-prefix only, and
             // remains labeled heuristic.
+            let command = command_template
+                .clone()
+                .unwrap_or_else(AfterfactDashboardSource::default_command)
+                .cancel_flag(Arc::clone(&cancel));
             let state = AfterfactDashboardSource::read(
-                None,
+                Some(&command),
                 request.run_dir.as_deref(),
                 &[],
                 Some(&request.previous),
@@ -1689,7 +1732,40 @@ fn spawn_afterfact_worker() -> (SyncSender<AfterfactRequest>, Receiver<Afterfact
             }
         }
     });
-    (request_tx, reply_rx)
+    (request_tx, reply_rx, handle)
+}
+
+/// The dashboard's two long-lived service worker threads, plus everything
+/// needed to shut them down deterministically. `run_dashboard` calls
+/// [`Self::shutdown`] exactly once, after the event loop exits and before
+/// the terminal is restored, so no worker thread — and no subprocess a
+/// worker has in flight — survives past the dashboard's own process exit.
+/// Without this, `q` immediately after an `r` (Afterfact) or Musterroll
+/// refresh could leave the parent process exiting while a worker thread was
+/// still blocked inside `BoundedCommand::run`, orphaning that command's
+/// process group.
+struct EvidenceWorkers {
+    musterroll_handle: thread::JoinHandle<()>,
+    afterfact_handle: thread::JoinHandle<()>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl EvidenceWorkers {
+    /// Signals cancellation to any in-flight bounded command and joins both
+    /// worker threads. Must be called only after every sender into their
+    /// request channels has already been dropped (`run_dashboard` drops
+    /// `LoopState` — the sole owner of both senders — immediately before
+    /// calling this), so each worker's blocking `recv()` observes a closed
+    /// channel and returns instead of waiting forever. A worker thread
+    /// panicking is already surfaced by the panic hook, which
+    /// `run_dashboard` installs before it spawns anything; a `join` error
+    /// here is not actionable and must not stop shutdown from completing
+    /// for the other worker.
+    fn shutdown(self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        let _ = self.musterroll_handle.join();
+        let _ = self.afterfact_handle.join();
+    }
 }
 
 /// Renders the fixed-allowlist relative path a [`LogSelector`] names, for
@@ -1932,10 +2008,23 @@ pub(crate) fn run_dashboard(config: RunSourceConfig, selection: RunSelection) ->
     let run_source = DashboardRunSource::new(config);
     let initial_snapshot = run_source.snapshot(None, &selection, Utc::now());
 
-    let (musterroll_tx, musterroll_rx) = spawn_musterroll_worker();
-    let (afterfact_tx, afterfact_rx) = spawn_afterfact_worker();
-
+    // The terminal is entered before any worker exists: `enter`'s `?` is the
+    // only early return left in this function, so spawning after it means no
+    // exit path can reach the end without joining (see
+    // `EvidenceWorkers::shutdown`). `install_panic_hook` still precedes both,
+    // so a worker panic restores the terminal either way.
     let mut guard = TerminalGuard::enter()?;
+
+    let evidence_cancel = Arc::new(AtomicBool::new(false));
+    let (musterroll_tx, musterroll_rx, musterroll_handle) =
+        spawn_musterroll_worker(Arc::clone(&evidence_cancel));
+    let (afterfact_tx, afterfact_rx, afterfact_handle) =
+        spawn_afterfact_worker(Arc::clone(&evidence_cancel), None);
+    let workers = EvidenceWorkers {
+        musterroll_handle,
+        afterfact_handle,
+        cancel: evidence_cancel,
+    };
 
     let mut loop_state = LoopState::new(
         run_source,
@@ -1946,6 +2035,40 @@ pub(crate) fn run_dashboard(config: RunSourceConfig, selection: RunSelection) ->
         afterfact_tx,
     );
 
+    let result = event_loop(
+        &mut guard,
+        &mut loop_state,
+        &shutdown,
+        &musterroll_rx,
+        &afterfact_rx,
+    );
+
+    // Release every request-channel sender (both held by `loop_state`,
+    // which is the sole owner — `EvidenceWorkers` never clones them)
+    // before signalling cancellation and joining, so each worker's
+    // blocking `recv()` observes a closed channel and its loop exits. Runs
+    // on every exit path — the clean quit above and a mid-loop input/render
+    // I/O error alike, since `event_loop`'s `?`s return into `result`
+    // rather than out of this function directly — and strictly before
+    // `guard` restores the terminal on drop: `result` is propagated only
+    // after shutdown has already completed.
+    drop(loop_state);
+    workers.shutdown();
+
+    result
+}
+
+/// The dashboard's main input/render loop, extracted so [`run_dashboard`]
+/// can guarantee worker shutdown runs on every exit path — including a
+/// mid-loop input or render I/O error — rather than only after a normal
+/// fall-through past a bare `while` loop.
+fn event_loop(
+    guard: &mut TerminalGuard,
+    loop_state: &mut LoopState,
+    shutdown: &AtomicBool,
+    musterroll_rx: &Receiver<SourceState<MusterrollSnapshot>>,
+    afterfact_rx: &Receiver<AfterfactReply>,
+) -> io::Result<()> {
     while !loop_state.quit && !shutdown.load(Ordering::SeqCst) {
         if event::poll(INPUT_POLL_INTERVAL)? {
             if let Event::Key(key) = event::read()? {
@@ -2184,5 +2307,86 @@ mod tests {
             "expected an explicit failure line, got {:?}",
             logs[0]
         );
+    }
+
+    /// Finding 3 (final adversarial review): a worker thread blocked inside
+    /// `BoundedCommand::run` must not survive shutdown. Proves the whole
+    /// mechanism end to end: a real child process, in its own process
+    /// group, mid-flight inside the Afterfact worker's blocking read; the
+    /// exact shutdown sequence `run_dashboard` performs (cancel the flag,
+    /// close the request channel, join) must return promptly and leave the
+    /// process group provably dead, not merely have the *thread* exit
+    /// while its child keeps running.
+    #[test]
+    fn shutting_down_the_afterfact_worker_cancels_and_reaps_an_in_flight_command() {
+        let marker = std::env::temp_dir().join(format!(
+            "undertake-dashboard-afterfact-shutdown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script = format!(
+            "import os, sys\nopen({marker:?}, 'w').write(str(os.getpgrp()))\nimport time\ntime.sleep(600)\n"
+        );
+        let slow_command = crate::process::BoundedCommand::new("python3")
+            .args(["-c", &script])
+            .timeout(StdDuration::from_secs(600));
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (request_tx, _reply_rx, handle) =
+            spawn_afterfact_worker(Arc::clone(&cancel), Some(slow_command));
+
+        request_tx
+            .send(AfterfactRequest {
+                generation: 1,
+                run_dir: None,
+                previous: SourceState::never_read(),
+            })
+            .expect("dispatch one request into the worker");
+
+        // Wait for the child to actually report its process group before
+        // trying to cancel it — otherwise cancellation could race a
+        // command that has not even spawned yet, which would not exercise
+        // the in-flight case the finding calls out.
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(10);
+        let pgid = loop {
+            if let Ok(text) = std::fs::read_to_string(&marker) {
+                if let Ok(pgid) = text.trim().parse::<u32>() {
+                    break pgid;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the slow command never reported its process group"
+            );
+            thread::sleep(StdDuration::from_millis(20));
+        };
+        assert!(
+            crate::quarantine::process_group_alive(pgid),
+            "precondition: the slow command's group must be alive before shutdown"
+        );
+
+        // The shutdown sequence `run_dashboard` performs: release the
+        // sender, then cancel, then join. No reply receiver is drained —
+        // exactly like a real quit, where nothing reads `afterfact_rx`
+        // again.
+        let started = std::time::Instant::now();
+        drop(request_tx);
+        cancel.store(true, Ordering::SeqCst);
+        handle.join().expect("worker thread must not panic");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < StdDuration::from_secs(10),
+            "shutdown must not wait out the command's 600-second timeout, took {elapsed:?}"
+        );
+        assert!(
+            !crate::quarantine::process_group_alive(pgid),
+            "the in-flight command's process group must be provably dead after shutdown, not orphaned"
+        );
+
+        let _ = std::fs::remove_file(&marker);
     }
 }

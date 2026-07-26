@@ -229,6 +229,90 @@ fn malformed_newest_candidate_is_selected_with_error() {
     );
 }
 
+/// Sets a directory's mtime explicitly (rather than relying on write-order
+/// timing) so the malformed-vs-valid ordering tests below are deterministic
+/// regardless of filesystem mtime resolution.
+fn set_dir_mtime(dir: &std::path::Path, seconds_ago: u64) {
+    let file = fs::File::open(dir).expect("open dir for mtime set");
+    let target = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds_ago);
+    let times = std::fs::FileTimes::new().set_modified(target);
+    file.set_times(times).expect("set dir mtime");
+}
+
+/// The discriminating regression for the sort-order fix: an *older*
+/// malformed run must lose to a *newer* valid nonterminal run, even though
+/// the malformed candidate's parsed `created_at` is `None` (which the
+/// pre-fix comparison treated as unconditionally "greatest" against every
+/// real timestamp). Both directory mtimes are set explicitly so the
+/// outcome does not depend on filesystem mtime resolution or write-order
+/// timing.
+#[test]
+fn an_older_malformed_run_loses_to_a_newer_valid_nonterminal_run() {
+    let temp = TempState::new();
+
+    // A malformed run, touched an hour ago.
+    let malformed_dir = temp
+        .runs_dir()
+        .join("run-work-20260725T100000.000000000-p1-000000");
+    fs::create_dir_all(&malformed_dir).unwrap();
+    fs::write(malformed_dir.join("manifest.json"), b"{ not valid json").unwrap();
+    set_dir_mtime(&malformed_dir, 3600);
+
+    // A valid nonterminal run, touched just now — newer than the malformed
+    // run's directory, even though its own `created_at` predates the
+    // malformed run's directory name by a wide margin. That mismatch is
+    // the point: valid candidates rank by `created_at`, malformed ones by
+    // mtime, and the cross-group decision is mtime vs mtime, never
+    // `created_at` vs mtime.
+    let valid_id = "run-work-20260101T000000.000000000-p2-000000";
+    let valid_dir = temp.write_run(
+        valid_id,
+        &temp.work_manifest(valid_id, "2026-01-01T00:00:00Z", "running"),
+    );
+    set_dir_mtime(&valid_dir, 0);
+
+    let source = temp.source();
+    let run = source.select(&RunSelection::Newest).expect("select");
+    assert_eq!(
+        run.identity.run_id, valid_id,
+        "an older malformed run must lose to a newer valid nonterminal run"
+    );
+    assert_eq!(
+        run.selection_error, None,
+        "the winning valid run must carry no selection error"
+    );
+}
+
+/// The mirror case: when the malformed run's directory genuinely is the
+/// most recently touched thing on disk, it must stay visible (with its
+/// error) rather than being unconditionally demoted beneath every valid
+/// run — the other half of the fix, so neither direction regresses.
+#[test]
+fn a_newer_malformed_run_still_beats_an_older_valid_nonterminal_run() {
+    let temp = TempState::new();
+
+    let valid_id = "run-work-20260101T000000.000000000-p2-000000";
+    let valid_dir = temp.write_run(
+        valid_id,
+        &temp.work_manifest(valid_id, "2026-01-01T00:00:00Z", "running"),
+    );
+    set_dir_mtime(&valid_dir, 3600);
+
+    let malformed_id = "run-work-20260725T100000.000000000-p1-000000";
+    let malformed_dir = temp.runs_dir().join(malformed_id);
+    fs::create_dir_all(&malformed_dir).unwrap();
+    fs::write(malformed_dir.join("manifest.json"), b"{ not valid json").unwrap();
+    set_dir_mtime(&malformed_dir, 0);
+
+    let source = temp.source();
+    let run = source.select(&RunSelection::Newest).expect("select");
+    assert_eq!(
+        run.identity.run_id, malformed_id,
+        "a genuinely newest malformed candidate must stay visible"
+    );
+    assert!(run.selection_error.is_some());
+}
+
 /// Forward compatibility: unknown extra manifest fields are tolerated.
 #[test]
 fn unknown_manifest_fields_are_tolerated() {

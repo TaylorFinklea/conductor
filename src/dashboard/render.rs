@@ -3,12 +3,17 @@
 //! The renderer consumes only a [`DashboardSnapshot`] plus UI-only selection
 //! state ([`UiState`]); it never opens a file, runs a command, or receives a
 //! mutable run handle. Every externally-sourced string (Bead text, model
-//! output, log bytes, event outcomes, provider extras, coverage summaries)
-//! passes through [`display_text`] or [`display_block`] — the render
-//! boundary's one sanitization/length-cap function, exposed as two thin call
+//! output, event outcomes, provider extras, coverage summaries) passes
+//! through [`display_text`] or [`display_block`] — the render boundary's
+//! shared sanitization/length-cap function, exposed as two thin call
 //! shapes for single-line versus multi-line text — before it reaches a
-//! widget. Color is supplemental only: every state distinction is also
-//! carried in text or symbols, proven by rendering with `color: false`.
+//! widget. An open log tail is the one exception to the *length-cap*
+//! shape, not the sanitization: [`render_log_tail`] shares the same
+//! `sanitize_text` primitive but hard-wraps and tail-anchors instead of
+//! head-truncating, so the final rows of a long tail stay reachable
+//! (`display_block`'s character cap alone would show only the start).
+//! Color is supplemental only: every state distinction is also carried in
+//! text or symbols, proven by rendering with `color: false`.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -21,13 +26,13 @@ use chrono::{DateTime, Utc};
 use std::fmt::Write as _;
 
 use super::model::{
-    AttemptRecord, DashboardSnapshot, HarnessDeckState, RecentRun, RunLiveness, RunSnapshot,
-    SourceState, StageMarker, VerificationRecord, VerificationSource,
+    AttemptRecord, DashboardSnapshot, HarnessDeckState, LogTail, RecentRun, RunLiveness,
+    RunSnapshot, SourceState, StageMarker, VerificationRecord, VerificationSource,
 };
-use super::sanitize::{sanitize_single_line, sanitize_text};
 use super::services::ProviderStatusSnapshot;
 use crate::musterroll::Window;
 use crate::run::{RunJob, RunLifecycle};
+use crate::sanitize::{sanitize_single_line, sanitize_text};
 
 /// Below this width or height the layout cannot stay legible; render a
 /// resize message instead of a cramped or garbled screen.
@@ -462,11 +467,126 @@ fn render_active_run(
     lines.push(Line::from(String::new()));
     lines.push(Line::from(harness_deck_line(&value.harness_deck)));
     lines.extend(active_run_diagnostics_lines(value, ui));
-    lines.extend(active_run_log_lines(value));
     lines.push(Line::from(String::new()));
     lines.push(Line::from(evidence_summary_line(snapshot)));
 
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    // An open log gets its own fixed bottom region (see `log_split`) so its
+    // *final* rows are always reachable — sharing one unscrollable
+    // `Paragraph` with the detail content above clipped a long tail's end
+    // (and its earlier rows silently pushed `evidence_summary_line` off
+    // screen too). No log open: unchanged single full-height paragraph.
+    let Some(tail) = value.logs.first() else {
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        return;
+    };
+    let [detail_area, log_area] = log_split(inner);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        detail_area,
+    );
+    render_log_tail(frame, log_area, tail);
+}
+
+/// Splits the Active Run panel's inner area into the (unscrolled) detail
+/// region above and a fixed bottom region for an open log tail. Roughly a
+/// third of the panel, clamped so a very short panel still leaves the
+/// detail region usable and a very tall one does not hand the log more
+/// than it needs.
+fn log_split(inner: Rect) -> [Rect; 2] {
+    let log_height = (inner.height / 3).clamp(4, 12).min(inner.height);
+    Layout::vertical([Constraint::Min(0), Constraint::Length(log_height)]).areas(inner)
+}
+
+/// Renders an open log tail bottom-anchored in its own fixed region: a
+/// header (path, truncation marker) reserved just enough rows to
+/// word-wrap safely, plus the *final* rows the remaining body can hold,
+/// hard-wrapped at the region's width so a single oversized line cannot
+/// hide the rows after it. Never the *first* N characters of the tail —
+/// the failure a human opened this log to see is almost always at the
+/// end, not the start.
+fn render_log_tail(frame: &mut Frame, area: Rect, tail: &LogTail) {
+    let block = Block::default().borders(Borders::TOP);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    let width = usize::from(inner.width).max(1);
+    let header = format!(
+        "log: {}{}",
+        display_text(&tail.path, 80),
+        if tail.truncated { " (truncated)" } else { "" }
+    );
+    // A safe upper bound on how many rows word-wrap could need: word-wrap
+    // can never take more rows than character-wrap would for the same
+    // length (it only ever wastes trailing space on a row, never adds
+    // one), so this reservation is never too small. Reserving rather than
+    // pinning the header to one row is what keeps the region honest at
+    // narrow widths: the header wraps into the rows it needs instead of
+    // being clipped mid-path, and the body keeps whatever is left.
+    let header_rows = header.chars().count().div_ceil(width).max(1);
+    let header_height = u16::try_from(header_rows)
+        .unwrap_or(u16::MAX)
+        .min(inner.height);
+    let [header_area, body_area] =
+        Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)]).areas(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            header,
+            Style::default().add_modifier(Modifier::BOLD),
+        )))
+        .wrap(Wrap { trim: false }),
+        header_area,
+    );
+
+    if body_area.height == 0 {
+        return;
+    }
+    let body_budget = usize::from(body_area.height);
+    let all_rows = tail_display_rows(&tail.text, width);
+    let elided = all_rows.len() > body_budget;
+    let rows_to_show = if elided {
+        body_budget.saturating_sub(1)
+    } else {
+        body_budget
+    };
+    let start = all_rows.len().saturating_sub(rows_to_show);
+
+    let mut lines = Vec::new();
+    if elided {
+        lines.push(Line::from(Span::styled(
+            "\u{2026} earlier lines omitted",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+    lines.extend(all_rows[start..].iter().cloned().map(Line::from));
+    frame.render_widget(Paragraph::new(lines), body_area);
+}
+
+/// Hard-wraps sanitized log text into fixed-`width` display rows (character
+/// count, matching this module's other length caps). Wrapping — rather
+/// than taking the tail's first N characters — is what makes the *end* of
+/// a long tail reachable: a single unwrapped multi-KiB line and many short
+/// lines both reduce to one flat row sequence whose *tail* the caller can
+/// slice, which is what a human opening a failed run's log wants to see.
+/// Bounded implicitly by the log tail's own 64 KiB read cap, so
+/// materializing every row once is cheap.
+fn tail_display_rows(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    for line in sanitize_text(text).split('\n') {
+        if line.is_empty() {
+            rows.push(String::new());
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        for chunk in chars.chunks(width) {
+            rows.push(chunk.iter().collect());
+        }
+    }
+    rows
 }
 
 /// Target, Bead, elapsed time, last update, and current stage.
@@ -553,28 +673,6 @@ fn active_run_diagnostics_lines(value: &RunSnapshot, ui: &UiState) -> Vec<Line<'
             display_text(&format!("roster error: {error}"), 200),
             error_style(ui.color),
         )));
-    }
-    lines
-}
-
-/// The on-demand log tail the runtime routed into `value.logs` (see
-/// `runtime::LoopState::read_log`); empty until `l`/Enter opens one.
-fn active_run_log_lines(value: &RunSnapshot) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let Some(tail) = value.logs.first() else {
-        return lines;
-    };
-    lines.push(Line::from(String::new()));
-    lines.push(Line::from(Span::styled(
-        format!(
-            "log: {}{}",
-            display_text(&tail.path, 80),
-            if tail.truncated { " (truncated)" } else { "" }
-        ),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    for line in display_block(&tail.text, 4000).lines() {
-        lines.push(Line::from(display_text(line, 200)));
     }
     lines
 }
@@ -2195,6 +2293,129 @@ mod tests {
         assert!(
             !lines.iter().any(|line| line.contains('\u{1b}')),
             "a log tail must never emit terminal control bytes"
+        );
+    }
+
+    /// Builds a snapshot whose Active Run has exactly one open log tail.
+    fn snapshot_with_log(text: &str) -> DashboardSnapshot {
+        snapshot_with_log_at("attempts/001/worker.stdout.log", text)
+    }
+
+    fn snapshot_with_log_at(path: &str, text: &str) -> DashboardSnapshot {
+        let mut snapshot = base_snapshot();
+        if let SourceState::Fresh { value, .. } = &mut snapshot.run {
+            value.logs = vec![LogTail {
+                path: path.to_string(),
+                text: text.to_string(),
+                truncated: false,
+            }];
+        }
+        snapshot
+    }
+
+    /// Finding 5 (final adversarial review): a log tail longer than the
+    /// visible region must show its FINAL lines, not the first N
+    /// characters of the tail. Five hundred numbered lines plus a distinct
+    /// final line exceed the log region's body-row budget at the widest
+    /// layout and at the narrowest supported one alike, so at both sizes
+    /// the earliest lines must be elided while the failure line at the
+    /// very end stays reachable. `COMPACT` is the discriminating size: the
+    /// region is smallest there, so a head-anchored renderer is furthest
+    /// from the end.
+    #[test]
+    fn a_long_log_tail_shows_its_final_lines_not_its_first_characters() {
+        let mut text = String::new();
+        for i in 0..500 {
+            let _ = writeln!(text, "line {i:04}");
+        }
+        text.push_str("FINAL FAILURE LINE");
+        let snapshot = snapshot_with_log(&text);
+
+        for (width, height) in [WIDE, COMPACT] {
+            let lines = rendered_lines(width, height, &snapshot, &UiState::default());
+            assert!(
+                contains(&lines, "FINAL FAILURE LINE"),
+                "the tail's last line must be reachable on screen at {width}x{height}"
+            );
+            assert!(
+                !contains(&lines, "line 0000") && !contains(&lines, "line 0100"),
+                "the earliest lines must be omitted at {width}x{height}"
+            );
+            assert!(
+                contains(&lines, "earlier lines omitted"),
+                "an elided tail must say so at {width}x{height}"
+            );
+        }
+    }
+
+    /// The character-level half of the same finding: one enormous line
+    /// with no newline in it, followed by the line that actually matters.
+    /// The removed `display_block(&tail.text, 4000)` cap cut the tail at
+    /// 4,000 characters, so everything after a line that long — here the
+    /// last line of the file — could never reach the screen at all.
+    /// Hard-wrapping reduces the oversized line to rows the tail slice can
+    /// skip past.
+    #[test]
+    fn a_single_oversized_log_line_does_not_hide_the_rows_after_it() {
+        let text = format!("HEAD-OF-LOG{}\nFINAL FAILURE LINE", "x".repeat(20_000));
+        let lines = rendered_lines(WIDE.0, WIDE.1, &snapshot_with_log(&text), &UiState::default());
+        assert!(
+            contains(&lines, "FINAL FAILURE LINE"),
+            "a line after a 20,000-character line must still be reachable"
+        );
+        assert!(
+            !contains(&lines, "HEAD-OF-LOG"),
+            "the oversized line's start must be elided, not anchor the view"
+        );
+    }
+
+    /// The mirror case: a log tail that already fits its region renders in
+    /// full, with no elision marker — the fix must not manufacture
+    /// truncation that was not there.
+    #[test]
+    fn a_short_log_tail_renders_in_full_without_an_elision_marker() {
+        let snapshot = snapshot_with_log("line one\nline two\nline three");
+        let lines = rendered_lines(WIDE.0, WIDE.1, &snapshot, &UiState::default());
+        assert!(contains(&lines, "line one"));
+        assert!(contains(&lines, "line two"));
+        assert!(contains(&lines, "line three"));
+        assert!(
+            !contains(&lines, "earlier lines omitted"),
+            "a tail that fits its region must not claim elision"
+        );
+    }
+
+    /// Giving an open log its own fixed bottom region takes rows away from
+    /// the detail content above it, and that content is unscrolled — so the
+    /// split must leave the attempt list reachable while a log is open.
+    /// Pinned at 120x40 with a real attempt-directory log path: the geometry
+    /// and fixture shape
+    /// `dashboard_cli_session_navigates_reads_evidence_and_leaves_state_untouched`
+    /// drives, which opens a log and then keeps asserting on attempt
+    /// content. A split that evicted it would surface there only as a
+    /// 15-second pty timeout, and only in a `tui` build.
+    #[test]
+    fn opening_a_log_keeps_the_attempt_list_in_the_detail_region() {
+        let mut text = String::new();
+        for i in 0..500 {
+            let _ = writeln!(text, "line {i:04}");
+        }
+        let snapshot = snapshot_with_log_at(
+            "attempts/001-openai-codex--codex--gpt-5.6-luna--high/worker.stdout.log",
+            &text,
+        );
+        let lines = rendered_lines(120, 40, &snapshot, &UiState::default());
+        assert!(
+            contains(&lines, "#01 openai-codex/codex/gpt-5.6-luna"),
+            "an open log must not push the attempt list out of the detail region"
+        );
+        assert!(
+            contains(&lines, "worker.stdout.log"),
+            "the log header must reach the screen alongside it"
+        );
+        assert!(
+            contains(&lines, "line 0499"),
+            "and the tail's final line must still be the anchored end"
         );
     }
 }

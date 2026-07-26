@@ -31,7 +31,6 @@ pub(crate) mod model;
 pub(crate) mod render;
 pub(crate) mod run_source;
 pub(crate) mod runtime;
-pub(crate) mod sanitize;
 pub(crate) mod services;
 
 // Re-exported for the renderer (Task 3), the service adapters (Task 2), and

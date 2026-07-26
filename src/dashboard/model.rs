@@ -169,12 +169,18 @@ impl<T> SourceState<T> {
 /// collapse:
 /// - [`RunLiveness::Live`]: nonterminal and heartbeat younger than the
 ///   60-second stale threshold.
-/// - [`RunLiveness::Silent`]: heartbeat stale but a recorded PID currently
-///   exists (PID reuse makes this evidence, not proof).
-/// - [`RunLiveness::Abandoned`]: heartbeat stale, no recorded PID exists, and
-///   no `run_finished` event exists.
+/// - [`RunLiveness::Silent`]: heartbeat stale but the recorded owner pid or
+///   the recorded worker process group currently exists (PID/PGID reuse
+///   makes this evidence, not proof). The two are probed separately and
+///   with different checks — a single process for the owner, a whole group
+///   for the worker — because a worker's process group can outlive the
+///   worker's own leader process.
+/// - [`RunLiveness::Abandoned`]: heartbeat stale, neither the owner pid nor
+///   the worker process group exists, and no `run_finished` event exists.
 /// - [`RunLiveness::Unknown`]: no usable heartbeat or recorded-PID evidence.
-/// - [`RunLiveness::Finished`]: terminal lifecycle.
+/// - [`RunLiveness::Finished`]: terminal lifecycle, or a nonterminal
+///   lifecycle whose event log nonetheless retains a `run_finished` event
+///   (the manifest can lag the event that proves the run actually ended).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RunLiveness {
     Live,

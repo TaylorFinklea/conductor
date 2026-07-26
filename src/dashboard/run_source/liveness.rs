@@ -123,8 +123,27 @@ fn stale_heartbeat_dead_pids_no_finish_is_abandoned() {
 
 /// A stale heartbeat with a dead owner pid but a *live* worker process
 /// group renders `Silent` (an orphaned worker survives its parent).
+/// `worker_pgid` must be a real process-group id — probed with
+/// `process_group_alive`, not `process_alive` — so a real child leading
+/// its own group stands in for it rather than the test process's own pid,
+/// which is not guaranteed to be a process-group leader in every
+/// environment this suite runs under.
 #[test]
+#[cfg(unix)]
 fn stale_heartbeat_dead_owner_live_worker_is_silent() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut worker = Command::new("sleep")
+        .arg("30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn worker in its own process group");
+    let worker_pgid = worker.id();
+
     let temp = TempState::new();
     let run_id = "run-work-20260725T183920.469500000-p1-000000";
     let run_dir = temp.write_run(
@@ -133,13 +152,140 @@ fn stale_heartbeat_dead_owner_live_worker_is_silent() {
             run_id,
             "2026-07-25T18:00:00Z",
             Some(dead_pid()),
-            Some(live_pid()),
+            Some(worker_pgid),
         ),
     );
     write_heartbeat(&run_dir, "2026-07-25T18:00:00Z");
     let now: DateTime<Utc> = "2026-07-25T18:39:20Z".parse().expect("now");
     let run = select_with_now(&temp, run_id, now);
+
+    let _ = worker.kill();
+    let _ = worker.wait();
+
     assert_eq!(run.identity.liveness, RunLiveness::Silent);
+}
+
+/// The discriminating case the split owner/group probes exist for: the
+/// worker process-group *leader* has fully exited and been reaped (so
+/// `process_alive(pgid)` reads false — this is what the pre-fix code
+/// probed, since it folded `worker_pgid` into the same `process_alive`
+/// sweep as `owner_pid`), but a descendant the leader spawned is still
+/// alive *in that same process group* (so `process_group_alive(pgid)`
+/// reads true). Liveness must read `Silent`, never `Abandoned`. Mirrors
+/// `quarantine::process_group_alive_tracks_an_orphaned_worker_group_across_its_death`'s
+/// and `process::tests::descendant_outliving_a_clean_leader_exit_is_terminated`'s
+/// spawn technique: a real leader process, in its own process group, forks
+/// a descendant into that group and then exits cleanly.
+#[test]
+#[cfg(unix)]
+fn stale_heartbeat_dead_leader_live_group_descendant_is_silent() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    // The leader spawns one descendant into its own (fresh) process group,
+    // then exits immediately without waiting on it. `subprocess.Popen`
+    // forks+execs synchronously, so by the time the leader exits the
+    // descendant already exists and already shares the leader's group.
+    let script = "import subprocess, sys\n\
+         subprocess.Popen(['sleep', '30'])\n\
+         sys.exit(0)\n";
+    let mut leader = Command::new("python3")
+        .args(["-c", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn leader");
+    let pgid = leader.id();
+    leader.wait().expect("reap leader");
+
+    // Precondition: the leader itself now reads dead (reaped, not merely a
+    // zombie), while the group as a whole is still alive because of the
+    // surviving descendant. If this precondition ever fails the test is
+    // not exercising the case it claims to.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !crate::quarantine::process_group_alive(pgid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        !crate::quarantine::process_alive(pgid),
+        "precondition: the reaped leader pid must read as dead"
+    );
+    assert!(
+        crate::quarantine::process_group_alive(pgid),
+        "precondition: the group must still be alive via the surviving descendant"
+    );
+
+    let temp = TempState::new();
+    let run_id = "run-work-20260725T183920.469500000-p4-000000";
+    let run_dir = temp.write_run(
+        run_id,
+        &work_manifest_with_pids(run_id, "2026-07-25T18:00:00Z", Some(dead_pid()), Some(pgid)),
+    );
+    write_heartbeat(&run_dir, "2026-07-25T18:00:00Z");
+    let now: DateTime<Utc> = "2026-07-25T18:39:20Z".parse().expect("now");
+    let run = select_with_now(&temp, run_id, now);
+
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{pgid}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    assert_eq!(
+        run.identity.liveness,
+        RunLiveness::Silent,
+        "leader (owner) dead but a live descendant in the worker's process group \
+         must read Silent, not Abandoned"
+    );
+}
+
+/// A retained `run_finished` event outruns a manifest whose `lifecycle`
+/// never caught up (e.g. a crash between the finish event and the manifest
+/// rewrite): liveness must read `Finished`, not `Abandoned`, even though
+/// the heartbeat is stale and every recorded pid is dead.
+#[test]
+fn retained_run_finished_event_is_finished_despite_nonterminal_manifest() {
+    let temp = TempState::new();
+    let run_id = "run-work-20260725T183920.469500000-p5-000000";
+    let run_dir = temp.write_run(
+        run_id,
+        &work_manifest_with_pids(run_id, "2026-07-25T18:00:00Z", Some(dead_pid()), None),
+    );
+    write_heartbeat(&run_dir, "2026-07-25T18:00:00Z");
+    let target = serde_json::json!({"repo": "/repo/patchstand", "bead": "patchstand-1"});
+    let event = serde_json::json!({
+        "schema": "undertake/event@2",
+        "event_id": format!("{run_id}-000001"),
+        "run_id": run_id,
+        "seq": 1,
+        "ts": "2026-07-25T18:30:00Z",
+        "kind": "run_finished",
+        "job": "work",
+        "profile_id": null,
+        "target": target,
+        "artifact_refs": [],
+        "outcome": "success",
+    });
+    std::fs::write(
+        run_dir.join("events.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::to_string(&event).expect("serialize event")
+        ),
+    )
+    .expect("write events");
+
+    let now: DateTime<Utc> = "2026-07-25T19:39:20Z".parse().expect("now");
+    let run = select_with_now(&temp, run_id, now);
+    assert_eq!(
+        run.identity.liveness,
+        RunLiveness::Finished,
+        "a retained run_finished event must win over a stale heartbeat and dead pids"
+    );
 }
 
 /// Missing heartbeat with an unparseable `updated_at` (no usable evidence)

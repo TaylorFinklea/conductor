@@ -18,7 +18,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
@@ -27,12 +27,12 @@ use crate::dashboard::model::{
     AttemptRecord, DashboardSnapshot, HarnessDeckState, LogTail, RecentRun, RunIdentity,
     RunLiveness, RunSnapshot, SourceState, StageMarker, VerificationRecord, VerificationSource,
 };
-use crate::dashboard::sanitize::sanitize_text;
 use crate::dashboard::services::{
     AfterfactSnapshot, CautionlightDashboardSource, CautionlightSnapshot, MusterrollSnapshot,
 };
 use crate::musterroll::{self, RosterSnapshot};
 use crate::run::{RunJob, RunLifecycle};
+use crate::sanitize::sanitize_text;
 
 /// Bounded read configuration for the run source. The state root is the
 /// configured Undertake state directory (containing `runs-v2/`); the report
@@ -508,11 +508,18 @@ impl Default for EventTailState {
 /// `undertake/event@2`).
 const EXPECTED_EVENT_SCHEMA: &str = "undertake/event@2";
 /// A discovery candidate: the parsed manifest (or a parse/schema error) plus
-/// the directory name and the parsed `created_at` for ordering.
+/// the directory name, its filesystem mtime, and the parsed `created_at`
+/// for ordering. `created_at` orders *valid* candidates against each other
+/// (the spec's "greatest parsed RFC3339 `created_at`"); `mtime` — from the
+/// same scan pass that caps candidates by recency — is the only recency
+/// signal a malformed candidate has, and is also what decides a
+/// malformed-vs-valid tie in [`newest_run_id`], so that decision never
+/// mixes a manifest-declared timestamp with a filesystem one.
 #[derive(Debug, Clone)]
 struct DiscoveryCandidate {
     run_id: String,
     dir_name: String,
+    mtime: SystemTime,
     created_at: Option<DateTime<Utc>>,
     manifest: Result<DashboardManifest, DashboardError>,
 }
@@ -661,37 +668,85 @@ pub(crate) fn preflight_run_selection(
     }
 }
 
-/// Picks the newest run from one already-scanned candidate set: the newest
-/// nonterminal run, falling back to the newest candidate when every run has
-/// finished.
+/// Picks the newest run from one already-scanned candidate set.
 ///
-/// Ordering is by parsed `created_at`, tie-broken by directory name
-/// descending. A candidate whose manifest failed to parse has no parsed
-/// `created_at` and sorts as potentially-newest, so a malformed newest run
-/// stays visible (with its error) instead of being silently demoted below
-/// older, valid runs.
+/// Valid candidates are ranked against each other by parsed `created_at`
+/// (see [`newest_valid_candidate`]) — the spec's "greatest parsed RFC3339
+/// `created_at`". Malformed candidates have no `created_at` to rank by, so
+/// they are ranked — against each other, and against the chosen valid
+/// candidate — by the scan's own directory mtime instead (see
+/// [`newest_malformed_candidate`]). The final malformed-vs-valid decision
+/// always compares mtime to mtime, never a manifest-declared timestamp to a
+/// filesystem one: that keeps a genuinely newest malformed candidate
+/// visible (with its error), while an *older* malformed run — one whose
+/// directory was touched before a valid nonterminal run's — loses to that
+/// valid run instead of silently hiding it. The pre-fix code compared
+/// `created_at` directly across every candidate: a malformed candidate's
+/// unconditional `None` sorted as "greatest" against every real timestamp,
+/// so any malformed manifest beat every valid run regardless of actual
+/// recency.
 fn newest_run_id(candidates: &[DiscoveryCandidate]) -> Result<String, DashboardError> {
-    let mut ordered: Vec<&DiscoveryCandidate> = candidates.iter().collect();
-    ordered.sort_by(|a, b| {
-        compare_created_at(a.created_at, b.created_at).then_with(|| a.dir_name.cmp(&b.dir_name))
-    });
-    // Prefer the newest nonterminal run even when its liveness is abandoned;
-    // an unparseable manifest counts as nonterminal so it is never hidden.
-    // Falling back to the newest candidate covers the all-finished case.
-    let chosen = ordered
-        .iter()
-        .rev()
-        .find(|candidate| {
-            !candidate
-                .manifest
-                .as_ref()
-                .is_ok_and(|manifest| manifest.lifecycle == DashboardLifecycle::Finished)
-        })
-        .or_else(|| ordered.last());
+    let valid = newest_valid_candidate(candidates);
+    let malformed = newest_malformed_candidate(candidates);
+    let chosen = match (valid, malformed) {
+        (None, None) => None,
+        (Some(candidate), None) | (None, Some(candidate)) => Some(candidate),
+        (Some(valid), Some(malformed)) => Some(if malformed.mtime > valid.mtime {
+            malformed
+        } else {
+            valid
+        }),
+    };
     let Some(candidate) = chosen else {
         return Err(DashboardError::new("no runs found"));
     };
     Ok(candidate.run_id.clone())
+}
+
+/// The newest *valid* (parseable) candidate: the newest nonterminal run by
+/// `created_at`, tie-broken by directory name descending, falling back to
+/// the newest terminal run when every valid run has finished. `None` when
+/// no candidate parsed. Malformed candidates never enter this comparison —
+/// see [`newest_malformed_candidate`].
+fn newest_valid_candidate(candidates: &[DiscoveryCandidate]) -> Option<&DiscoveryCandidate> {
+    let mut ordered: Vec<&DiscoveryCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.manifest.is_ok())
+        .collect();
+    ordered.sort_by(|a, b| {
+        compare_created_at(a.created_at, b.created_at).then_with(|| a.dir_name.cmp(&b.dir_name))
+    });
+    // Prefer the newest nonterminal run even when its liveness is
+    // abandoned; falling back to the newest candidate covers the
+    // all-finished case. Every candidate here already parsed (filtered
+    // above), so the `is_ok_and` below is purely a lifecycle test, never a
+    // fallback for an unparseable manifest — those rank separately.
+    ordered
+        .iter()
+        .rev()
+        .find(|candidate| {
+            candidate
+                .manifest
+                .as_ref()
+                .is_ok_and(|manifest| manifest.lifecycle != DashboardLifecycle::Finished)
+        })
+        .or_else(|| ordered.last())
+        .copied()
+}
+
+/// The newest *malformed* (unparseable) candidate by the discovery scan's
+/// own directory mtime — the only recency signal a manifest that failed to
+/// parse has — tie-broken by directory name descending. `None` when every
+/// candidate parsed.
+fn newest_malformed_candidate(candidates: &[DiscoveryCandidate]) -> Option<&DiscoveryCandidate> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.manifest.is_err())
+        .max_by(|a, b| {
+            a.mtime
+                .cmp(&b.mtime)
+                .then_with(|| a.dir_name.cmp(&b.dir_name))
+        })
 }
 
 /// Reduces scanned candidates to the terminal runs shown in the secondary
@@ -794,11 +849,14 @@ impl DashboardRunSource {
             if !path.is_file() {
                 continue;
             }
-            // An unreadable mtime degrades only the candidate *cap* ordering
-            // — selection and the recent panel order by the manifest's
-            // `created_at` — so the entry is kept (sorting oldest) with the
-            // degradation recorded, rather than dropped over a fact discovery
-            // does not actually need.
+            // An unreadable mtime degrades ordering only: the candidate
+            // *cap* (below), and — for a candidate whose manifest turns out
+            // to be malformed — its rank in `newest_malformed_candidate`,
+            // which has no `created_at` to use instead. A valid candidate is
+            // still ordered by its manifest's `created_at`. Sorting oldest is
+            // the safe degradation in both, so the entry is kept with the
+            // degradation recorded rather than dropped over a fact discovery
+            // can survive without.
             let mtime = match entry.metadata().and_then(|metadata| metadata.modified()) {
                 Ok(mtime) => mtime,
                 Err(error) => {
@@ -817,7 +875,7 @@ impl DashboardRunSource {
         dir_entries.truncate(DISCOVERY_CANDIDATE_CAP);
 
         let mut candidates = Vec::with_capacity(dir_entries.len());
-        for (_, dir_name, manifest_path) in dir_entries {
+        for (mtime, dir_name, manifest_path) in dir_entries {
             let manifest_result = read_dashboard_manifest(&manifest_path);
             let (manifest, created_at) = match manifest_result {
                 Ok((m, _truncated)) => {
@@ -834,6 +892,7 @@ impl DashboardRunSource {
             candidates.push(DiscoveryCandidate {
                 run_id,
                 dir_name,
+                mtime,
                 created_at,
                 manifest,
             });
@@ -899,7 +958,12 @@ impl DashboardRunSource {
         let created_at = parse_rfc3339(&manifest.created_at);
         let job: RunJob = manifest.job.into();
         let lifecycle: RunLifecycle = manifest.lifecycle.into();
-        let liveness = derive_liveness(run_dir, manifest, now);
+        // Read before deriving liveness: a retained `run_finished` event
+        // can outrun the manifest's own lifecycle field (see
+        // `derive_liveness`), so liveness needs the event tail already in
+        // hand rather than reading it a second time.
+        let event_tail = self.read_event_tail(run_id, run_dir);
+        let liveness = derive_liveness(run_dir, manifest, &event_tail.events, now);
         let stage = derive_stage(&manifest.details, job);
         let identity = RunIdentity {
             run_id: run_id.to_string(),
@@ -923,7 +987,6 @@ impl DashboardRunSource {
                 .as_ref()
                 .map(|a| (a.path.clone(), a.sha256.clone())),
         };
-        let event_tail = self.read_event_tail(run_id, run_dir);
         let event_count = event_tail.events.len();
         let events_truncated = event_tail.truncated;
         let events_error = event_tail.error.clone();
@@ -1154,25 +1217,39 @@ fn read_heartbeat_file(run_dir: &Path) -> Option<DateTime<Utc>> {
     parse_rfc3339(contents.trim())
 }
 
-/// Extracts recorded process ids from the manifest's job-tagged details. For
-/// work runs, the owner pid and optional worker process-group id. Other jobs
-/// record no pids in v1.
-fn recorded_pids(details: &serde_json::Value) -> Vec<u32> {
-    let mut pids = Vec::new();
+/// Recorded owner pid and worker process-group id from the manifest's
+/// job-tagged details, kept separate because each needs a different
+/// liveness probe: [`crate::quarantine::process_alive`] for the owner (a
+/// single process), [`crate::quarantine::process_group_alive`] for the
+/// worker (a whole group, which can outlive the leader a manifest recorded
+/// as `worker_pgid` — the group id equals the leader's pid at spawn time,
+/// but a descendant can survive the leader's own exit). Folding both into
+/// one `process_alive` sweep — the prior bug — misses exactly that case:
+/// the leader is gone, `process_alive(pgid)` reads false, and a live
+/// descendant in the group goes unseen.
+struct RecordedProcessIdentity {
+    owner_pid: Option<u32>,
+    worker_pgid: Option<u32>,
+}
+
+fn recorded_process_identity(details: &serde_json::Value) -> RecordedProcessIdentity {
     let Some(state) = details.get("state") else {
-        return pids;
+        return RecordedProcessIdentity {
+            owner_pid: None,
+            worker_pgid: None,
+        };
     };
-    if let Some(owner) = state.get("owner_pid").and_then(serde_json::Value::as_u64) {
-        if let Ok(pid) = u32::try_from(owner) {
-            pids.push(pid);
-        }
+    let as_pid = |key: &str| {
+        state
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|&pid| pid > 0)
+    };
+    RecordedProcessIdentity {
+        owner_pid: as_pid("owner_pid"),
+        worker_pgid: as_pid("worker_pgid"),
     }
-    if let Some(worker) = state.get("worker_pgid").and_then(serde_json::Value::as_u64) {
-        if let Ok(pid) = u32::try_from(worker) {
-            pids.push(pid);
-        }
-    }
-    pids
 }
 
 /// Derives the current stage label from the manifest's job-tagged details.
@@ -1250,18 +1327,29 @@ fn derive_harness_deck(
 }
 
 /// Derives liveness from heartbeat/`updated_at`, the configured 60-second
-/// stale threshold, and nonmutating recorded-PID probes. Lifecycle and
-/// liveness are distinct: a `Finished` lifecycle is `Finished` liveness;
-/// a nonterminal run is `Live` (fresh heartbeat), `Silent` (stale
-/// heartbeat but a recorded PID exists), `Abandoned` (stale, no recorded
-/// PID exists, nonterminal), or `Unknown` (no usable heartbeat/PID
-/// evidence).
+/// stale threshold, a retained `run_finished` event, and nonmutating
+/// owner-pid/worker-group probes. Lifecycle and liveness are distinct: a
+/// `Finished` lifecycle is `Finished` liveness; a nonterminal run is `Live`
+/// (fresh heartbeat), `Silent` (stale heartbeat but the owner pid or the
+/// worker process group is still alive), `Abandoned` (stale, neither is
+/// alive), or `Unknown` (no usable heartbeat/`updated_at` evidence).
 fn derive_liveness(
     run_dir: &Path,
     manifest: &DashboardManifest,
+    events: &[DashboardEvent],
     now: DateTime<Utc>,
 ) -> RunLiveness {
     if manifest.lifecycle == DashboardLifecycle::Finished {
+        return RunLiveness::Finished;
+    }
+    // A retained `run_finished` event outruns the manifest: the run's own
+    // event log proves it reached a terminal outcome even when `lifecycle`
+    // has not (yet, or ever will) catch up — e.g. a crash between the
+    // finish event and the manifest rewrite that would have recorded it.
+    // Checked before heartbeat freshness so a run that just finished is
+    // never reported `Live` off a heartbeat tick that predates its own
+    // completion.
+    if events.iter().any(|event| event.kind == "run_finished") {
         return RunLiveness::Finished;
     }
     // `last_seen` mirrors the operational `RunHandle::last_seen`:
@@ -1279,15 +1367,19 @@ fn derive_liveness(
     if fresh {
         return RunLiveness::Live;
     }
-    // Stale: probe recorded PIDs nonmutatingly. A work run records an
-    // owner pid and optionally a worker process-group id; any recorded
-    // pid currently existing is `Silent` (PID reuse is evidence, not
-    // proof). No recorded pid existing and nonterminal is `Abandoned`.
-    let pids = recorded_pids(&manifest.details);
-    let any_live = pids
-        .iter()
-        .any(|&pid| pid > 0 && crate::quarantine::process_alive(pid));
-    if any_live {
+    // Stale: probe the recorded owner pid and worker process group
+    // separately and nonmutatingly, each with the probe that matches what
+    // it names (see `RecordedProcessIdentity`). `Silent` when either reads
+    // alive — PID/PGID reuse makes this evidence, not proof. `Abandoned`
+    // when neither does.
+    let identity = recorded_process_identity(&manifest.details);
+    let owner_live = identity
+        .owner_pid
+        .is_some_and(crate::quarantine::process_alive);
+    let worker_live = identity
+        .worker_pgid
+        .is_some_and(crate::quarantine::process_group_alive);
+    if owner_live || worker_live {
         RunLiveness::Silent
     } else {
         RunLiveness::Abandoned

@@ -1,9 +1,15 @@
-//! The dashboard's single control-character sanitization pass.
+//! The crate's single control-character sanitization pass.
 //!
-//! Every string the dashboard renders ultimately comes from somewhere it does
-//! not control — worker log tails, run event JSON, service stdout and stderr —
-//! so untrusted bytes are stripped of terminal control sequences exactly once,
+//! Every string rendered ultimately comes from somewhere the process does not
+//! control — worker log tails, run event JSON, service stdout and stderr — so
+//! untrusted bytes are stripped of terminal control sequences exactly once,
 //! here, rather than re-implemented per adapter.
+//!
+//! Feature-independent by design (matches `crate::process`'s own doc note):
+//! `CommandMusterrollClient` in `musterroll.rs` needs sanitized failure
+//! detail in a `--no-default-features` build, so this cannot live under the
+//! `tui`-gated `dashboard` subtree even though the dashboard is its heaviest
+//! user.
 //!
 //! Stripping every control character subsumes leading partial escape removal:
 //! a tail that starts mid-sequence loses its `ESC`, so the remainder renders as
@@ -19,7 +25,10 @@ pub(crate) fn sanitize_single_line(text: &str) -> String {
 
 /// Strips every control character except newline, which is preserved so
 /// multi-line text (log tails, stderr coverage summaries) keeps its line
-/// structure.
+/// structure. Used only by the `tui`-gated dashboard today (musterroll's
+/// own failure detail is single-line), hence the dead-code allow in a
+/// `--no-default-features` build.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn sanitize_text(text: &str) -> String {
     text.chars()
         .filter(|&character| character == '\n' || !character.is_control())

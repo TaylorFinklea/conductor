@@ -45,6 +45,32 @@ pub(crate) struct BoundedCommand {
     pub(crate) stdout_cap: usize,
     pub(crate) stderr_cap: usize,
     pub(crate) timeout: Duration,
+    /// Checked inside `run`'s wait loop alongside the timeout deadline and
+    /// the stdout-cap breach flag. Lets a caller with its own shutdown
+    /// signal (the dashboard's evidence workers) terminate an in-flight
+    /// command immediately instead of waiting out its full timeout — see
+    /// `cancel_flag`.
+    pub(crate) cancel: Option<Arc<AtomicBool>>,
+}
+
+/// Why `BoundedCommand::run`'s wait loop stopped waiting on the child
+/// before it exited on its own, if it did at all. Distinct from whether
+/// the child's own output was truncated (`CommandOutcome::stdout_truncated`/
+/// `stderr_truncated`, set independently by the reader threads based on
+/// byte counts, not on why the *process* stopped being waited on).
+/// Mutually exclusive by construction: the wait loop takes the first
+/// applicable condition and breaks immediately, so this is modeled as one
+/// enum rather than two independently-settable bools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopCondition {
+    /// The wait loop ended some other way — a clean exit, an output-cap
+    /// breach, or an unwaitable child — none of which are a timeout or a
+    /// cancellation.
+    None,
+    /// The configured timeout elapsed before the child exited.
+    TimedOut,
+    /// The `cancel` flag was observed before the child exited.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,11 +78,28 @@ pub(crate) struct CommandOutcome {
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
     /// The clean exit code, or `None` when the command never exited on its
-    /// own — it timed out, breached the stdout cap, or died by signal.
+    /// own — it timed out, was cancelled, breached the stdout cap, or died
+    /// by signal.
     pub(crate) exit_code: Option<i32>,
-    pub(crate) timed_out: bool,
+    pub(crate) stop_condition: StopCondition,
     pub(crate) stdout_truncated: bool,
     pub(crate) stderr_truncated: bool,
+}
+
+impl CommandOutcome {
+    /// The command never exited on its own because its configured timeout
+    /// elapsed first.
+    pub(crate) fn timed_out(&self) -> bool {
+        self.stop_condition == StopCondition::TimedOut
+    }
+
+    /// The command never exited on its own because its `cancel` flag was
+    /// observed first. Distinct from [`Self::timed_out`]: "the operator
+    /// quit while this was in flight" versus "the command itself ran too
+    /// long."
+    pub(crate) fn cancelled(&self) -> bool {
+        self.stop_condition == StopCondition::Cancelled
+    }
 }
 
 impl BoundedCommand {
@@ -68,6 +111,7 @@ impl BoundedCommand {
             stdout_cap: 4 * 1024 * 1024,
             stderr_cap: 256 * 1024,
             timeout: Duration::from_secs(60),
+            cancel: None,
         }
     }
 
@@ -107,6 +151,15 @@ impl BoundedCommand {
 
     pub(crate) fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Attaches a shared cancellation flag: `run` polls it inside its wait
+    /// loop and, once set, terminates the process group and returns
+    /// immediately rather than waiting for the configured timeout. See
+    /// `CommandOutcome::cancelled`.
+    pub(crate) fn cancel_flag(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
         self
     }
 
@@ -168,7 +221,7 @@ impl BoundedCommand {
             thread::spawn(move || read_stream(stderr_pipe, stderr_cap, &CapPolicy::Drain));
 
         let deadline = Instant::now() + self.timeout;
-        let mut timed_out = false;
+        let mut stop_condition = StopCondition::None;
         let mut exit_code = None;
         let mut leader_reaped = false;
 
@@ -183,10 +236,18 @@ impl BoundedCommand {
                 }
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        timed_out = true;
+                        stop_condition = StopCondition::TimedOut;
                         break;
                     }
                     if stdout_breached.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if self
+                        .cancel
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+                    {
+                        stop_condition = StopCondition::Cancelled;
                         break;
                     }
                     thread::sleep(WAIT_POLL);
@@ -210,7 +271,7 @@ impl BoundedCommand {
             stdout,
             stderr,
             exit_code,
-            timed_out,
+            stop_condition,
             stdout_truncated,
             stderr_truncated,
         })
@@ -432,7 +493,7 @@ pub(crate) mod tests {
         assert_eq!(outcome.stdout.len(), 64 * 1024, "cap must bound the buffer");
         assert!(outcome.stdout_truncated);
         assert!(
-            !outcome.timed_out,
+            !outcome.timed_out(),
             "cap breach must not be reported as a timeout"
         );
         assert_eq!(
@@ -463,7 +524,7 @@ pub(crate) mod tests {
         let outcome = cmd.run().expect("run command");
 
         assert_eq!(outcome.exit_code, Some(1), "partial success must survive");
-        assert!(!outcome.timed_out);
+        assert!(!outcome.timed_out());
         assert_eq!(outcome.stderr.len(), 1024);
         assert!(outcome.stderr_truncated);
         assert!(!outcome.stdout_truncated);
@@ -487,7 +548,7 @@ pub(crate) mod tests {
         let outcome = cmd.run().expect("run command");
         let elapsed = started.elapsed();
 
-        assert!(outcome.timed_out);
+        assert!(outcome.timed_out());
         assert_eq!(outcome.exit_code, None);
         assert!(
             elapsed < Duration::from_secs(10),
@@ -496,6 +557,67 @@ pub(crate) mod tests {
         assert!(!crate::quarantine::process_group_alive(read_pid(
             &pgid_file
         )));
+        let _ = std::fs::remove_file(&pgid_file);
+    }
+
+    /// A command cancelled mid-flight (long before its own timeout) is
+    /// classified as `cancelled`, not `timed_out`, returns promptly rather
+    /// than waiting out its 600-second deadline, and leaves no group —
+    /// exactly the mechanism `EvidenceWorkers::shutdown`
+    /// (`dashboard::runtime`) relies on to join a worker blocked inside
+    /// `run` without orphaning its subprocess.
+    #[test]
+    fn cancel_flag_terminates_an_in_flight_command_and_group_is_proven_dead() {
+        let pgid_file = scratch("cancel-pgid");
+        let script = format!("{REPORT_PGID}\nimport time\ntime.sleep(600)\n");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cmd = BoundedCommand::new("python3")
+            .args(["-c", &script, pgid_file.to_str().unwrap()])
+            .timeout(Duration::from_secs(600))
+            .cancel_flag(Arc::clone(&cancel));
+
+        // Cancel only once the child has actually reported its process
+        // group. A fixed sleep races python3's startup: under load the flag
+        // could be set before the child ever wrote its pid file, so `run`
+        // would tear down a group this test then cannot read back — a flake,
+        // not a stronger test. Waiting for a *parseable* pid (not merely an
+        // existing file) also rules out catching the write half-done.
+        let flag = Arc::clone(&cancel);
+        let marker = pgid_file.clone();
+        let canceller = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline {
+                if std::fs::read_to_string(&marker)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                    .is_some()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let outcome = cmd.run().expect("run command");
+        let elapsed = started.elapsed();
+        canceller.join().expect("canceller thread must not panic");
+
+        assert!(outcome.cancelled(), "must be reported as cancelled");
+        assert!(
+            !outcome.timed_out(),
+            "cancellation must not be reported as a timeout"
+        );
+        assert_eq!(outcome.exit_code, None);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "must return promptly on cancellation, not wait out the 600s timeout, took {elapsed:?}"
+        );
+        assert!(
+            !crate::quarantine::process_group_alive(read_pid(&pgid_file)),
+            "the cancelled command's process group must be provably dead, not orphaned"
+        );
         let _ = std::fs::remove_file(&pgid_file);
     }
 
@@ -520,7 +642,7 @@ pub(crate) mod tests {
         let elapsed = started.elapsed();
 
         assert_eq!(outcome.exit_code, Some(0), "the leader exited cleanly");
-        assert!(!outcome.timed_out);
+        assert!(!outcome.timed_out());
         assert!(
             elapsed < Duration::from_secs(20),
             "the orphan must be reaped instead of holding the pipes open, took {elapsed:?}"
@@ -549,7 +671,7 @@ pub(crate) mod tests {
 
         let outcome = cmd.run().expect("run command");
 
-        assert!(outcome.timed_out);
+        assert!(outcome.timed_out());
         let descendant = read_pid(&pid_file);
         assert!(
             !crate::quarantine::process_alive(descendant),
@@ -570,7 +692,7 @@ pub(crate) mod tests {
         let outcome = cmd.run().expect("run command");
 
         assert_eq!(outcome.exit_code, Some(1));
-        assert!(!outcome.timed_out);
+        assert!(!outcome.timed_out());
         assert!(!outcome.stdout_truncated);
         assert_eq!(
             String::from_utf8_lossy(&outcome.stdout).trim(),
@@ -587,7 +709,7 @@ pub(crate) mod tests {
         let outcome = cmd.run().expect("run command");
 
         assert_eq!(outcome.exit_code, Some(2));
-        assert!(!outcome.timed_out);
+        assert!(!outcome.timed_out());
     }
 
     /// Stdin is closed unless explicitly supplied, so an evidence command that
