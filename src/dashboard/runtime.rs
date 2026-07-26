@@ -1637,11 +1637,10 @@ fn spawn_musterroll_worker() -> (SyncSender<()>, Receiver<SourceState<Musterroll
     let (reply_tx, reply_rx) = mpsc::channel();
     thread::spawn(move || {
         let client = CommandMusterrollClient::new();
-        let source = MusterrollDashboardSource::new();
         let mut previous: Option<SourceState<MusterrollSnapshot>> = None;
         while request_rx.recv().is_ok() {
             let now = Utc::now();
-            let state = source.read(&client, previous.as_ref(), now);
+            let state = MusterrollDashboardSource::read(&client, previous.as_ref(), now);
             previous = Some(state.clone());
             if reply_tx.send(state).is_err() {
                 break;
@@ -1658,7 +1657,6 @@ fn spawn_afterfact_worker() -> (SyncSender<AfterfactRequest>, Receiver<Afterfact
     let (request_tx, request_rx) = mpsc::sync_channel::<AfterfactRequest>(1);
     let (reply_tx, reply_rx) = mpsc::channel();
     thread::spawn(move || {
-        let source = AfterfactDashboardSource::new();
         while let Ok(request) = request_rx.recv() {
             let now = Utc::now();
             // `worker_commits` stays empty, and that is Task 4's decision,
@@ -1673,7 +1671,7 @@ fn spawn_afterfact_worker() -> (SyncSender<AfterfactRequest>, Receiver<Afterfact
             // here would be inventing a typed fact the manifest does not
             // carry. Correlation therefore stays cwd-prefix only, and
             // remains labeled heuristic.
-            let state = source.read(
+            let state = AfterfactDashboardSource::read(
                 None,
                 request.run_dir.as_deref(),
                 &[],

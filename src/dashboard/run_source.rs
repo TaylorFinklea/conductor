@@ -989,9 +989,8 @@ impl DashboardRunSource {
         state.error = None;
         // Bounded seek + read: never load more than EVENT_TAIL_MAX_BYTES into
         // memory in one tick, regardless of total file size.
-        let window = match read_bounded_from(&path, state.offset, EVENT_TAIL_MAX_BYTES) {
-            Ok(window) => window,
-            Err(_) => return state,
+        let Ok(window) = read_bounded_from(&path, state.offset, EVENT_TAIL_MAX_BYTES) else {
+            return state;
         };
         // Split on newlines; the last fragment (no trailing newline) is a
         // partial line retained for the next tick.
@@ -1353,11 +1352,10 @@ fn derive_verification(
 /// an unresolved opaque profile.
 fn read_run_roster(run_dir: &Path) -> (Option<RosterSnapshot>, Option<String>) {
     let path = run_dir.join("roster.json");
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        // No run-local roster at all: nothing to report beyond the
-        // per-attempt unresolved marker.
-        Err(_) => return (None, None),
+    // No run-local roster at all: nothing to report beyond the
+    // per-attempt unresolved marker.
+    let Ok(bytes) = std::fs::read(&path) else {
+        return (None, None);
     };
     match musterroll::parse_roster_snapshot(&bytes) {
         Ok(roster) => (Some(roster), None),

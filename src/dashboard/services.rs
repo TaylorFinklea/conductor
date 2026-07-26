@@ -93,16 +93,11 @@ pub(crate) struct MusterrollSnapshot {
 pub(crate) struct MusterrollDashboardSource;
 
 impl MusterrollDashboardSource {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
     /// Reads provider availability through the existing typed
     /// [`MusterrollClient`] seam rather than a second JSON parser, so the
     /// dashboard and the dispatcher can never disagree about what a provider
     /// status means.
     pub(crate) fn read<C: MusterrollClient + ?Sized>(
-        &self,
         client: &C,
         previous: Option<&SourceState<MusterrollSnapshot>>,
         now: DateTime<Utc>,
@@ -218,10 +213,6 @@ pub(crate) struct AfterfactSnapshot {
 pub(crate) struct AfterfactDashboardSource;
 
 impl AfterfactDashboardSource {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
     /// The exact command this adapter runs: `afterfact events --since 1h`
     /// with stdin closed, 4 MiB of stdout, 256 KiB of stderr, and a 60-second
     /// deadline.
@@ -238,7 +229,6 @@ impl AfterfactDashboardSource {
     /// `command_override` exists for fixtures; `run_dir` and `worker_commits`
     /// are the typed run facts correlation is allowed to match against.
     pub(crate) fn read(
-        &self,
         command_override: Option<&BoundedCommand>,
         run_dir: Option<&Path>,
         worker_commits: &[String],
@@ -463,10 +453,6 @@ pub(crate) struct CautionlightSnapshot {
 pub(crate) struct CautionlightDashboardSource;
 
 impl CautionlightDashboardSource {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
     /// Cautionlight is roadmap-deferred in v1: the parser and the bounded
     /// adapter ship, but nothing runs the pipeline automatically. The panel
     /// says so explicitly rather than rendering an empty success.
@@ -493,7 +479,6 @@ impl CautionlightDashboardSource {
     /// Runs one on-demand Cautionlight pass. Never called by a refresh tick in
     /// v1 — [`Self::default_state`] is what the panel shows.
     pub(crate) fn read(
-        &self,
         command_override: Option<&BoundedCommand>,
         afterfact_bytes: &Arc<Vec<u8>>,
         previous: Option<&SourceState<CautionlightSnapshot>>,
@@ -700,7 +685,7 @@ pub(crate) mod tests {
             })
         }
 
-        fn report(providers: serde_json::Value) -> StatusReport {
+        fn report(providers: &serde_json::Value) -> StatusReport {
             serde_json::from_value(json!({
                 "schema": "musterroll/status@2",
                 "checked_at": "2026-07-25T12:00:00Z",
@@ -713,7 +698,7 @@ pub(crate) mod tests {
         /// into a single "unhealthy".
         #[test]
         fn typed_availability_distinctions() {
-            let report = report(json!({
+            let report = report(&json!({
                 "anthropic": provider("healthy", None),
                 "codex": provider("caution", Some("near limit")),
                 "opencode": provider("exhausted", Some("rate limited")),
@@ -721,7 +706,7 @@ pub(crate) mod tests {
             }));
             let client = MockMusterrollClient { report: Ok(report) };
 
-            let state = MusterrollDashboardSource::new().read(&client, None, now());
+            let state = MusterrollDashboardSource::read(&client, None, now());
 
             let value = state.value().expect("fresh value");
             let availability =
@@ -753,10 +738,10 @@ pub(crate) mod tests {
                 "arbitrary_key": "drop_me",
             });
             let client = MockMusterrollClient {
-                report: Ok(report(json!({ "anthropic": anthropic }))),
+                report: Ok(report(&json!({ "anthropic": anthropic }))),
             };
 
-            let state = MusterrollDashboardSource::new().read(&client, None, now());
+            let state = MusterrollDashboardSource::read(&client, None, now());
 
             let extra = &state.value().expect("fresh value").providers["anthropic"].extra;
             assert_eq!(
@@ -784,7 +769,7 @@ pub(crate) mod tests {
             .expect("valid status report");
             let client = MockMusterrollClient { report: Ok(report) };
 
-            let state = MusterrollDashboardSource::new().read(&client, None, now());
+            let state = MusterrollDashboardSource::read(&client, None, now());
 
             let value = state.value().expect("fresh value");
             assert_eq!(value.schema, "musterroll/status@2");
@@ -804,17 +789,16 @@ pub(crate) mod tests {
         #[test]
         fn failure_retains_last_value_and_never_fabricates_last_ok() {
             let ok = MockMusterrollClient {
-                report: Ok(report(json!({ "anthropic": provider("healthy", None) }))),
+                report: Ok(report(&json!({ "anthropic": provider("healthy", None) }))),
             };
             let broken = MockMusterrollClient {
                 report: Err(MusterrollError::command("musterroll exploded")),
             };
-            let source = MusterrollDashboardSource::new();
-            let first = source.read(&ok, None, now());
+            let first = MusterrollDashboardSource::read(&ok, None, now());
             let later = now() + chrono::Duration::seconds(30);
 
-            let degraded = source.read(&broken, Some(&first), later);
-            let cold = source.read(&broken, None, later);
+            let degraded = MusterrollDashboardSource::read(&broken, Some(&first), later);
+            let cold = MusterrollDashboardSource::read(&broken, None, later);
 
             match degraded {
                 SourceState::Stale {
@@ -882,16 +866,14 @@ pub(crate) mod tests {
         /// summary, exit 2 is an error that never becomes a snapshot.
         #[test]
         fn exit_code_semantics() {
-            let source = AfterfactDashboardSource::new();
-
-            let complete = source.read(
+            let complete = AfterfactDashboardSource::read(
                 Some(&fixture(&event_line("e1"), "", 0)),
                 None,
                 &[],
                 None,
                 now(),
             );
-            let partial = source.read(
+            let partial = AfterfactDashboardSource::read(
                 Some(&fixture(
                     &event_line("e2"),
                     "coverage gap: 3 repos unscanned\n",
@@ -902,7 +884,13 @@ pub(crate) mod tests {
                 None,
                 now(),
             );
-            let failed = source.read(Some(&fixture("", "boom\n", 2)), None, &[], None, now());
+            let failed = AfterfactDashboardSource::read(
+                Some(&fixture("", "boom\n", 2)),
+                None,
+                &[],
+                None,
+                now(),
+            );
 
             let complete = complete.value().expect("exit 0 is fresh");
             assert_eq!(complete.events.len(), 1);
@@ -929,8 +917,7 @@ pub(crate) mod tests {
         fn clipped_coverage_summary_keeps_events_and_marks_truncated() {
             let command = fixture(&event_line("e1"), &"g".repeat(4096), 1).stderr_cap(64);
 
-            let state =
-                AfterfactDashboardSource::new().read(Some(&command), None, &[], None, now());
+            let state = AfterfactDashboardSource::read(Some(&command), None, &[], None, now());
 
             match state {
                 SourceState::Fresh {
@@ -960,8 +947,7 @@ pub(crate) mod tests {
                 .args(["-c", &script])
                 .timeout(Duration::from_secs(30));
 
-            let state =
-                AfterfactDashboardSource::new().read(Some(&command), None, &[], None, now());
+            let state = AfterfactDashboardSource::read(Some(&command), None, &[], None, now());
 
             match state {
                 SourceState::Fresh {
@@ -1065,7 +1051,7 @@ pub(crate) mod tests {
                 serde_json::to_string(&smuggled).expect("json string")
             );
 
-            let state = AfterfactDashboardSource::new().read(
+            let state = AfterfactDashboardSource::read(
                 Some(&fixture(&line, "", 0)),
                 Some(&run_dir),
                 &[],
@@ -1143,8 +1129,7 @@ pub(crate) mod tests {
             let bytes = Arc::new(b"unused".to_vec());
             let command = fixture(&finding_line("f1"), "", 0);
 
-            let state =
-                CautionlightDashboardSource::new().read(Some(&command), &bytes, None, now());
+            let state = CautionlightDashboardSource::read(Some(&command), &bytes, None, now());
 
             assert!(state.value().is_some());
             assert_eq!(
@@ -1161,8 +1146,7 @@ pub(crate) mod tests {
             let bytes = Arc::new(Vec::new());
             let command = fixture(&finding_line("f1"), "warning: 2 rules skipped\n", 1);
 
-            let state =
-                CautionlightDashboardSource::new().read(Some(&command), &bytes, None, now());
+            let state = CautionlightDashboardSource::read(Some(&command), &bytes, None, now());
 
             let value = state.value().expect("exit 1 is partial success");
             assert_eq!(value.findings.len(), 1);
@@ -1187,7 +1171,7 @@ pub(crate) mod tests {
                 "not json at all\n",
             );
 
-            let state = CautionlightDashboardSource::new().read(
+            let state = CautionlightDashboardSource::read(
                 Some(&fixture(stdout, "", 0)),
                 &bytes,
                 None,
