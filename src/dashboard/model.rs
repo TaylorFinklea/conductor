@@ -381,6 +381,30 @@ pub(crate) struct LogTail {
     pub(crate) truncated: bool,
 }
 
+/// The Harness Deck report join for one run.
+///
+/// The join key is job-specific: a work run's `details.state.cycle_id`, a
+/// plan run's own `run_id`, and consult/review have no report at all. Every
+/// variant is a fact the dashboard can prove rather than a link it invented
+/// — the directory is produced only by [`crate::deck::report_run_dir`], the
+/// same validated report-root helper the report *writer* uses, and presence
+/// is a plain stat of `report.json`. Nothing here opens a report or renders
+/// its contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HarnessDeckState {
+    /// Consult and review publish no report. The spec defines the absence,
+    /// so this is a static job fact, not a lookup that failed.
+    NoReportForJob,
+    /// The join could not be attempted: the manifest is unreadable, carries
+    /// no join key, or the key failed report-run-id validation. The reason
+    /// is display-only payload.
+    Unresolved { reason: String },
+    /// The join resolved to a report directory. `present` separates a report
+    /// that exists on disk from one that does not: a run can legitimately be
+    /// joined to a directory no reporter ever wrote.
+    Resolved { report_dir: String, present: bool },
+}
+
 /// A recent terminal run for the secondary "Recent runs" panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecentRun {
@@ -410,6 +434,8 @@ pub(crate) struct RunSnapshot {
     pub(crate) verification: VerificationRecord,
     /// Bounded sanitized log tails, keyed by fixed-allowlist relative path.
     pub(crate) logs: Vec<LogTail>,
+    /// The Harness Deck report join for this run's job.
+    pub(crate) harness_deck: HarnessDeckState,
     /// The count of events retained in the snapshot (bounded at 5,000).
     pub(crate) event_count: usize,
     /// Whether the event tail was truncated at the 8 MiB / 5,000-event caps.

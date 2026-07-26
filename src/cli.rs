@@ -7,6 +7,16 @@ use crate::config;
 
 const USAGE: &str = "usage: undertake [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [plan prepare --repo <path> (--bead <id>|--artifact <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL>) --output-kind <spec|implementation-plan> [--max-plan-revisions <0..3>] [--require-second-opinion] [--config <path>]] [plan dispatch <run-id> [--config <path>]] [plan status <run-id> [--config <path>]] [plan cancel <run-id> [--config <path>]] [migrate state --from <legacy-root> --to <undertake-root> [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]]";
 
+/// The dashboard segment of the usage line. Empty in a
+/// `--no-default-features` build, where the command does not exist at all;
+/// kept separate from [`USAGE`] so that build's usage text stays
+/// byte-identical to what it has always printed.
+#[cfg(feature = "tui")]
+const DASHBOARD_USAGE: &str =
+    " [dashboard [--run <run-id>] [--refresh-ms <milliseconds>] [--config <path>]]";
+#[cfg(not(feature = "tui"))]
+const DASHBOARD_USAGE: &str = "";
+
 const DEFAULT_ADVERSARIAL_QUESTION: &str =
     "What are the highest-risk flaws in this artifact, and what must change before proceeding?";
 
@@ -27,6 +37,8 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
         }
         Some("adversarial-review") => run_adversarial(&mut it),
         Some("config") => run_config(&mut it),
+        #[cfg(feature = "tui")]
+        Some("dashboard") => run_dashboard_command(&mut it),
         Some("cycle") => run_cycle(&mut it),
         Some("dispatch") => run_dispatch(&mut it),
         Some("plan") => run_plan(&mut it),
@@ -1560,6 +1572,156 @@ fn ledger_path() -> PathBuf {
     )
 }
 
+/// Local artifact polling defaults (spec § Command contract). `--refresh-ms`
+/// governs local polling only; Musterroll's 30-second and Evidence's
+/// 300-second floors are the runtime's, not the CLI's.
+#[cfg(feature = "tui")]
+const DASHBOARD_DEFAULT_REFRESH_MS: u64 = 1000;
+#[cfg(feature = "tui")]
+const DASHBOARD_MIN_REFRESH_MS: u64 = 250;
+#[cfg(feature = "tui")]
+const DASHBOARD_MAX_REFRESH_MS: u64 = 60_000;
+
+#[cfg(feature = "tui")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DashboardOptions {
+    run: Option<String>,
+    refresh_ms: u64,
+    config: PathBuf,
+}
+
+/// Parses `dashboard [--run <run-id>] [--refresh-ms <ms>] [--config <path>]`.
+/// Duplicate, unknown, valueless, and positional arguments are all errors;
+/// the caller turns any error into exit 2.
+#[cfg(feature = "tui")]
+fn parse_dashboard_options(args: &[String]) -> Result<DashboardOptions, String> {
+    let mut run = None;
+    let mut refresh_ms = None;
+    let mut config = PathBuf::from("undertake.toml");
+    let mut config_seen = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--run" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--run requires a run id".to_string())?;
+                // The dashboard's own single-normal-component validation, not
+                // a second copy of it living in the CLI.
+                crate::dashboard::validate_run_id(value).map_err(|error| error.to_string())?;
+                if run.replace(value.clone()).is_some() {
+                    return Err("--run may only be supplied once".to_string());
+                }
+            }
+            "--refresh-ms" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--refresh-ms requires a millisecond count".to_string())?;
+                let parsed = value.parse::<u64>().map_err(|_| {
+                    format!(
+                        "--refresh-ms must be an integer between {DASHBOARD_MIN_REFRESH_MS} and {DASHBOARD_MAX_REFRESH_MS}"
+                    )
+                })?;
+                if !(DASHBOARD_MIN_REFRESH_MS..=DASHBOARD_MAX_REFRESH_MS).contains(&parsed) {
+                    return Err(format!(
+                        "--refresh-ms {parsed} is outside {DASHBOARD_MIN_REFRESH_MS}..={DASHBOARD_MAX_REFRESH_MS}"
+                    ));
+                }
+                if refresh_ms.replace(parsed).is_some() {
+                    return Err("--refresh-ms may only be supplied once".to_string());
+                }
+            }
+            "--config" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--config requires a path argument".to_string())?;
+                if config_seen {
+                    return Err("--config may only be supplied once".to_string());
+                }
+                config_seen = true;
+                config = PathBuf::from(value);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(DashboardOptions {
+        run,
+        refresh_ms: refresh_ms.unwrap_or(DASHBOARD_DEFAULT_REFRESH_MS),
+        config,
+    })
+}
+
+/// Turns a validated `--run` id into a selection, or reports why it cannot
+/// be one. Delegates to the run source's own preflight so the CLI and a
+/// refresh tick agree on what "unknown run id" means.
+#[cfg(feature = "tui")]
+fn dashboard_selection(
+    run: Option<&str>,
+    config: &crate::dashboard::RunSourceConfig,
+) -> Result<crate::dashboard::RunSelection, String> {
+    let selection = run.map_or(crate::dashboard::RunSelection::Newest, |run_id| {
+        crate::dashboard::RunSelection::Explicit(run_id.to_string())
+    });
+    crate::dashboard::preflight_run_selection(config, &selection)
+        .map_err(|error| error.to_string())?;
+    Ok(selection)
+}
+
+/// `q` (and SIGTERM/SIGHUP, which quit through the same path) exits 0;
+/// terminal setup failure exits 1.
+#[cfg(feature = "tui")]
+fn dashboard_exit_code(result: &std::io::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::from(1),
+    }
+}
+
+/// Runs the read-only dashboard.
+///
+/// Everything this constructs is a reader: a validated config, the two
+/// existing root resolvers (`state_dir`/`reports_home`, including
+/// `UNDERTAKE_STATE_DIR`/`UNDERTAKE_REPORTS_HOME`), and a
+/// [`crate::dashboard::RunSourceConfig`]. No bd client, no run handle, no
+/// lease, no cycle or recovery entry point is reachable from here — the
+/// command has no mutation-capable handle to pass on.
+#[cfg(feature = "tui")]
+fn run_dashboard_command(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let args: Vec<String> = it.by_ref().collect();
+    let options = match parse_dashboard_options(&args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("dashboard: {error}");
+            print_usage();
+            return ExitCode::from(2);
+        }
+    };
+
+    if let Err(error) = config::load(&options.config) {
+        eprintln!("config: invalid — {error}");
+        return ExitCode::from(2);
+    }
+
+    let source_config = crate::dashboard::RunSourceConfig {
+        state_root: state_dir(),
+        reports_home: reports_home(),
+        refresh_interval: std::time::Duration::from_millis(options.refresh_ms),
+    };
+    let selection = match dashboard_selection(options.run.as_deref(), &source_config) {
+        Ok(selection) => selection,
+        Err(error) => {
+            eprintln!("dashboard: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let result = crate::dashboard::run_dashboard(source_config, selection);
+    if let Err(error) = &result {
+        eprintln!("dashboard: {error}");
+    }
+    dashboard_exit_code(&result)
+}
+
 fn run_roster(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     match it.next().as_deref() {
         None => {
@@ -2050,15 +2212,17 @@ fn run_migrate(it: &mut std::vec::IntoIter<String>) -> ExitCode {
 }
 
 fn print_usage() {
-    eprintln!("{USAGE}");
+    eprintln!("{USAGE}{DASHBOARD_USAGE}");
 }
 
 fn print_help() {
-    println!("{USAGE}");
+    println!("{USAGE}{DASHBOARD_USAGE}");
     println!();
     println!("Commands:");
     println!("  adversarial-review  Plan or dispatch an approval-gated read-only design review");
     println!("  config check   Validate undertake.toml and run preflight checks");
+    #[cfg(feature = "tui")]
+    println!("  dashboard      Read-only TUI over one Undertake run and its bounded evidence");
     println!("  plan           Prepare, inspect, dispatch, or cancel a bounded native plan");
     println!("  migrate state  Copy quiescent legacy state into a new Undertake root");
     println!(
@@ -2071,6 +2235,8 @@ fn print_help() {
     println!();
     println!("Notes:");
     println!("  adversarial-review dispatch exits 0 only for complete validated synthesis.");
+    #[cfg(feature = "tui")]
+    println!("  dashboard reads only; it never approves, dispatches, retries, or writes state.");
     println!("  cycle --dry-run still writes a report file even though it makes no bd writes.");
     println!(
         "  dispatch --resume reclaims a bd claim stranded by a crashed undertake process (e.g."
@@ -3332,4 +3498,220 @@ provider = "codex"
         assert!(parse_migrate_state_options(&["state".to_string()]).is_err());
     }
 
+    /// Without `tui` the dashboard command must not exist at all: the usage
+    /// line never advertises it and `undertake dashboard` is an ordinary
+    /// unknown subcommand. Deliberately ungated so the no-default-features
+    /// build is the one that actually runs the negative half.
+    #[test]
+    fn dashboard_cli_exists_only_in_a_tui_build() {
+        assert!(
+            !USAGE.contains("dashboard"),
+            "the shared usage line must stay feature-independent"
+        );
+        if cfg!(feature = "tui") {
+            assert_eq!(
+                DASHBOARD_USAGE,
+                " [dashboard [--run <run-id>] [--refresh-ms <milliseconds>] [--config <path>]]"
+            );
+        } else {
+            assert_eq!(DASHBOARD_USAGE, "");
+            assert_eq!(run(vec!["dashboard".to_string()]), ExitCode::from(2));
+        }
+    }
+
+    /// The `undertake dashboard` command contract (spec § Command contract).
+    /// Named so the plan's `cargo test dashboard_cli` selects exactly this
+    /// module plus the two PTY tests that drive the shipped binary.
+    #[cfg(feature = "tui")]
+    mod dashboard_cli {
+        use super::*;
+        use crate::dashboard::{RunSelection, RunSourceConfig};
+
+        const PILOT: &str = "run-work-20260725T183920.469500000-p45813-000000";
+
+        fn args(list: &[&str]) -> Vec<String> {
+            list.iter().map(|arg| (*arg).to_string()).collect()
+        }
+
+        fn parse(list: &[&str]) -> Result<DashboardOptions, String> {
+            parse_dashboard_options(&args(list))
+        }
+
+        #[test]
+        fn defaults_select_the_newest_run_at_the_one_second_local_cadence() {
+            assert_eq!(
+                parse(&[]).expect("no arguments is the documented default"),
+                DashboardOptions {
+                    run: None,
+                    refresh_ms: DASHBOARD_DEFAULT_REFRESH_MS,
+                    config: PathBuf::from("undertake.toml"),
+                }
+            );
+            assert_eq!(DASHBOARD_DEFAULT_REFRESH_MS, 1000);
+        }
+
+        #[test]
+        fn an_explicit_run_refresh_and_config_are_carried_through() {
+            let parsed = parse(&[
+                "--run",
+                PILOT,
+                "--refresh-ms",
+                "500",
+                "--config",
+                "/tmp/other.toml",
+            ])
+            .expect("the full grammar");
+            assert_eq!(parsed.run.as_deref(), Some(PILOT));
+            assert_eq!(parsed.refresh_ms, 500);
+            assert_eq!(parsed.config, PathBuf::from("/tmp/other.toml"));
+        }
+
+        /// 250–60000 inclusive. The boundaries themselves are the test: an
+        /// off-by-one here either spins the local reader four times faster
+        /// than the floor allows or accepts a refresh slower than a minute.
+        #[test]
+        fn refresh_bounds_are_inclusive_and_closed_outside() {
+            for accepted in ["250", "1000", "60000"] {
+                let parsed = parse(&["--refresh-ms", accepted])
+                    .unwrap_or_else(|error| panic!("{accepted} ms must be accepted: {error}"));
+                assert_eq!(parsed.refresh_ms.to_string(), accepted);
+            }
+            for rejected in ["249", "60001", "0", "-1", "1.5", "", " 500", "1_000", "abc"] {
+                assert!(
+                    parse(&["--refresh-ms", rejected]).is_err(),
+                    "{rejected:?} must not be accepted as a refresh interval"
+                );
+            }
+        }
+
+        #[test]
+        fn duplicate_and_unknown_arguments_are_rejected() {
+            assert!(parse(&["--run", PILOT, "--run", PILOT]).is_err());
+            assert!(parse(&["--refresh-ms", "500", "--refresh-ms", "500"]).is_err());
+            assert!(
+                parse(&["--config", "a.toml", "--config", "a.toml"]).is_err(),
+                "a duplicate --config must exit 2 even when both spellings agree"
+            );
+            assert!(parse(&["--wide"]).is_err());
+            assert!(parse(&[PILOT]).is_err(), "the run id is not positional");
+            assert!(parse(&["--run"]).is_err());
+            assert!(parse(&["--refresh-ms"]).is_err());
+            assert!(parse(&["--config"]).is_err());
+        }
+
+        /// The run id goes through the dashboard's own single-normal-component
+        /// validation, not a second copy of it living in the CLI.
+        #[test]
+        fn the_run_id_passes_single_normal_component_validation() {
+            for rejected in [
+                "",
+                ".",
+                "..",
+                "../escape",
+                "a/b",
+                "/abs",
+                "./x",
+                "runs/../x",
+            ] {
+                assert!(
+                    parse(&["--run", rejected]).is_err(),
+                    "{rejected:?} must not survive run-id validation"
+                );
+            }
+            assert!(parse(&["--run", PILOT]).is_ok());
+        }
+
+        /// An unknown `--run` id exits 2, and it is refused from the plain
+        /// terminal — before raw mode, the alternate screen, or any worker.
+        #[test]
+        fn an_unknown_run_id_is_refused_before_the_terminal_is_touched() {
+            let temp = CliTempDir::new("dashboard-selection");
+            let config = RunSourceConfig {
+                state_root: temp.path().to_path_buf(),
+                reports_home: temp.path().join("reports-home"),
+                refresh_interval: std::time::Duration::from_secs(1),
+            };
+            assert!(dashboard_selection(Some("run-work-absent"), &config).is_err());
+
+            std::fs::create_dir_all(config.runs_dir().join("run-work-present")).unwrap();
+            assert_eq!(
+                dashboard_selection(Some("run-work-present"), &config).unwrap(),
+                RunSelection::Explicit("run-work-present".to_string())
+            );
+            assert_eq!(
+                dashboard_selection(None, &config).unwrap(),
+                RunSelection::Newest,
+                "an empty runs directory is a state the dashboard renders, not a launch failure"
+            );
+        }
+
+        /// Every exit-2 path reachable without a terminal, driven through the
+        /// real `run()` entry point. None of these may reach raw mode, so the
+        /// test process's own terminal is never touched.
+        #[test]
+        fn argument_and_config_errors_exit_two() {
+            for rejected in [
+                args(&["dashboard", "--wide"]),
+                args(&["dashboard", "--run"]),
+                args(&["dashboard", "--run", "../escape"]),
+                args(&["dashboard", "--refresh-ms", "10"]),
+                args(&["dashboard", "--refresh-ms", "60001"]),
+                args(&["dashboard", "--config", "a.toml", "--config", "a.toml"]),
+                args(&[
+                    "dashboard",
+                    "--config",
+                    "/nonexistent/undertake-dashboard-test.toml",
+                ]),
+            ] {
+                assert_eq!(
+                    run(rejected.clone()),
+                    ExitCode::from(2),
+                    "{rejected:?} must exit 2"
+                );
+            }
+        }
+
+        /// `q` exits 0; a terminal setup failure exits 1. The end-to-end
+        /// proof of both lives in the PTY suite (`dashboard_cli_*` in
+        /// `dashboard::runtime::terminal`), which can own a real terminal —
+        /// and take one away. This pins the mapping itself.
+        #[test]
+        fn a_clean_exit_maps_to_zero_and_a_terminal_failure_to_one() {
+            assert_eq!(dashboard_exit_code(&Ok(())), ExitCode::SUCCESS);
+            assert_eq!(
+                dashboard_exit_code(&Err(std::io::Error::other("no controlling terminal"))),
+                ExitCode::from(1)
+            );
+        }
+
+        /// The command constructs a read-only source and nothing else: no bd
+        /// client, no dispatch or recovery entry point, no run handle, no
+        /// lease, no write.
+        #[test]
+        fn construction_reaches_no_dispatch_or_recovery_mutation_handle() {
+            let source = include_str!("cli.rs");
+            let body = source
+                .split("fn run_dashboard_command")
+                .nth(1)
+                .expect("the dashboard command exists")
+                .split("\nfn ")
+                .next()
+                .expect("the dashboard command has a body");
+            for forbidden in [
+                "RunHandle",
+                "CommandBdClient",
+                "dispatch",
+                "recovery",
+                "claim",
+                "lease",
+                "heartbeat",
+                "write",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "the dashboard command body must not mention {forbidden}"
+                );
+            }
+        }
+    }
 }

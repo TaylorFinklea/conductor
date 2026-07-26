@@ -1,6 +1,6 @@
 # current-state.md — undertake
 
-Branch: `main` — fast-forwarded from `feat/four-tool-clean-rename` (`c9d3ab6`); pushed, in sync with `origin/main`. Rename cutover complete; `conductor-043` cross-repo gate fixed at this commit and closed 2026-07-25 (guildhall `decisions.md` [2026-07-25]).
+Branch: `feat/undertake-dashboard` (worktree `.worktrees/undertake-dashboard`), off `main` at `c9d3ab6`; not pushed. `main` is in sync with `origin/main`; rename cutover complete and `conductor-043` closed 2026-07-25 (guildhall `decisions.md` [2026-07-25]).
 
 Strict Undertake v2 cutover COMPLETE (2026-07-22): active runs now use only
 `musterroll/roster@2`, `undertake/run@2`, and `undertake/event@2`; each prepared
@@ -38,7 +38,34 @@ Clippy, release build, Undertake help/version, isolated no-model configuration
 activation against release Musterroll with bounded fake allowances, and the
 migration/reconciliation/capacity filters.
 
+Undertake dashboard SHIPPED (2026-07-25): `undertake dashboard [--run <run-id>]
+[--refresh-ms <250..60000>] [--config <path>]`, behind the default-on `tui`
+feature; a `--no-default-features` build keeps the non-TUI CLI and rejects the
+subcommand. Read-only by construction: no lease, heartbeat, `RunHandle`, or
+service write is reachable from the command. Live acceptance against the real
+state root, pinned to `run-work-20260725T183920.469500000-p45813-000000`:
+22/22 checks — work job, `abandoned` liveness against a `running` lifecycle,
+`implementing` stage, `openai-codex--codex--gpt-5.6-luna--high` resolved
+through the run-local roster, the canonical `pnpm check` failure, on-demand
+Afterfact 0 correlated / 233 uncorrelated with its coverage-gap summary,
+deferred Cautionlight, and the Harness Deck report joined through
+`details.state.cycle_id`; `q` exits 0, the terminal is restored, and the
+state root, report directory, and Patchstand repo are byte-identical after.
+Stripped release binary 1.55 MiB → 1.79 MiB (+245 KiB, +15.5%).
+
+That pilot's underlying defect is still open: bd P0 `conductor-pux`
+(verification environment parity across isolated promotion). The dashboard
+makes the failure legible; it does not fix it.
+
+V1 ships read-only intents only. The later OMP-powered action phase
+(approve/dispatch/cancel/resume/retry/routing) must reach them through a
+separate authorized executor calling public CLIs — never by moving mutation
+authority into the readers or the renderer.
+
 ## Plan
+
+- [ ] Orchestrator project verification for the dashboard branch.
+      Verify: `cargo test && cargo clippy --all-targets --all-features -- -D warnings && cargo check --no-default-features && cargo build --release`
 
 ## Blockers
 

@@ -14,19 +14,17 @@
 //! (`render`), the read-only intent/state layer and terminal-safe event
 //! loop (`runtime`), and the crate's only mutation-free dashboard entry
 //! point, `run_dashboard`. Task 4 wires the `undertake dashboard` CLI
-//! command to it.
+//! command to it and resolves the Harness Deck report join.
 
-// `run_dashboard` (this task) is reachable from `main.rs` via the PTY
-// test-harness dispatch, so Task 3's own code is no longer dead by itself —
-// but plenty of Task 1/2 surface still is: `DashboardRunSource::select`/
-// `recent_runs` (the runtime drives everything through `snapshot()`
-// instead, per Task 1's own concern about the discovery warning living only
-// there), three of the four `LogSelector` variants (only `WorkerStdout` is
-// wired to a key), and the whole Cautionlight adapter (deliberately never
-// invoked — see `runtime`'s module doc). These are real, intentional gaps
-// for *this* task, not bugs; Task 4's CLI wiring is expected to close some
-// of them. Lint levels are lexically scoped, so this one allow covers the
-// whole subtree.
+// The CLI now reaches `run_dashboard`, `RunSourceConfig`, `RunSelection`,
+// `preflight_run_selection`, and `validate_run_id`, so the bulk of this
+// subtree is live. What remains unreferenced is deliberate, not forgotten:
+// `DashboardRunSource::select`/`recent_runs` (the runtime drives everything
+// through `snapshot()` instead, per Task 1's concern about the discovery
+// warning living only there), three of the four `LogSelector` variants
+// (only `WorkerStdout` is wired to a key), and the whole Cautionlight
+// adapter (v1 never invokes it — see `runtime`'s module doc). Lint levels
+// are lexically scoped, so this one allow covers the whole subtree.
 #![allow(dead_code)]
 
 pub(crate) mod model;
@@ -36,17 +34,20 @@ pub(crate) mod runtime;
 pub(crate) mod sanitize;
 pub(crate) mod services;
 
-// Re-exported for later tasks: the renderer (Task 3), service adapters
-// (Task 2), and CLI wiring (Task 4) consume these; nothing in-tree uses the
-// full set yet.
+// Re-exported for the renderer (Task 3), the service adapters (Task 2), and
+// the CLI (Task 4). The CLI consumes exactly `RunSourceConfig`,
+// `RunSelection`, `preflight_run_selection`, `validate_run_id`, and
+// `run_dashboard` — a reader, a selection, two validators, and an event
+// loop. There is nothing mutation-capable in this list to hand it.
 #[allow(unused_imports)]
 pub(crate) use model::{
-    AttemptRecord, DashboardSnapshot, LogTail, RecentRun, RunIdentity, RunLiveness, RunSnapshot,
-    SourceState, StageMarker, VerificationRecord, VerificationSource,
+    AttemptRecord, DashboardSnapshot, HarnessDeckState, LogTail, RecentRun, RunIdentity,
+    RunLiveness, RunSnapshot, SourceState, StageMarker, VerificationRecord, VerificationSource,
 };
 #[allow(unused_imports)]
 pub(crate) use run_source::{
     DashboardError, DashboardRunSource, LogSelector, RunSelection, RunSourceConfig,
+    preflight_run_selection, validate_run_id,
 };
 // Bounded subprocess execution lives at the crate root, not under this
 // `tui`-gated module: `CommandMusterrollClient` needs it in a

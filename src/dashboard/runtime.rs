@@ -1008,22 +1008,15 @@ pub(crate) mod terminal {
             master: Box<dyn MasterPty + Send>,
             child: Box<dyn Child + Send + Sync>,
             output: Arc<Mutex<Vec<u8>>>,
+            /// Taken once at spawn: a pty master hands out its writer
+            /// exactly one time, so a session that drives several keystrokes
+            /// has to keep it.
+            writer: Mutex<Box<dyn std::io::Write + Send>>,
             termios_before_spawn: Option<PtyTermios>,
         }
 
         impl PtySession {
             fn spawn(state_root: &std::path::Path, induce_panic: bool) -> Self {
-                let pty_system = native_pty_system();
-                let pair = pty_system
-                    .openpty(PtySize {
-                        rows: 24,
-                        cols: 80,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })
-                    .expect("open pty");
-                let termios_before_spawn = pair.master.get_termios();
-
                 let mut cmd = CommandBuilder::new(release_binary());
                 cmd.arg("__dashboard_pty_test_harness");
                 cmd.env(
@@ -1033,6 +1026,24 @@ pub(crate) mod terminal {
                 if induce_panic {
                     cmd.env("UNDERTAKE_PTY_TEST_INDUCE_PANIC", "1");
                 }
+                Self::spawn_command(cmd, 24, 80)
+            }
+
+            /// Spawns an arbitrary already-configured command on a fresh pty
+            /// slave. Split out so the same session plumbing drives both the
+            /// sentinel harness (which the induced-panic scenario needs) and
+            /// the real `undertake dashboard` command Task 4 ships.
+            fn spawn_command(cmd: CommandBuilder, rows: u16, cols: u16) -> Self {
+                let pty_system = native_pty_system();
+                let pair = pty_system
+                    .openpty(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .expect("open pty");
+                let termios_before_spawn = pair.master.get_termios();
 
                 let child = pair
                     .slave
@@ -1057,10 +1068,13 @@ pub(crate) mod terminal {
                     }
                 });
 
+                let writer = Mutex::new(pair.master.take_writer().expect("pty writer"));
+
                 Self {
                     master: pair.master,
                     child,
                     output,
+                    writer,
                     termios_before_spawn,
                 }
             }
@@ -1085,8 +1099,9 @@ pub(crate) mod terminal {
             }
 
             fn send_text(&self, text: &str) {
-                let mut writer = self.master.take_writer().expect("pty writer");
+                let mut writer = self.writer.lock();
                 writer.write_all(text.as_bytes()).expect("write to pty");
+                writer.flush().expect("flush pty writer");
             }
 
             fn send_signal(&self, signal: Signal) {
@@ -1197,6 +1212,378 @@ pub(crate) mod terminal {
             let output = session.output_snapshot();
             assert_terminal_restored(&session, &output);
         }
+
+        // -------------------------------------------------------------
+        // The shipped `undertake dashboard` command (Task 4)
+        // -------------------------------------------------------------
+
+        /// A minimal terminal replay: enough of the CSI grammar to turn the
+        /// pty byte stream back into the screen the operator would have
+        /// seen. Ratatui addresses cells with absolute cursor moves and
+        /// interleaves styling, so a raw substring search over the stream
+        /// answers "were these bytes written" rather than "was this on the
+        /// screen" — and only the second question is worth asserting.
+        struct Screen {
+            rows: Vec<Vec<char>>,
+            row: usize,
+            col: usize,
+        }
+
+        impl Screen {
+            fn replay(bytes: &[u8], rows: usize, cols: usize) -> Self {
+                let mut screen = Self {
+                    rows: vec![vec![' '; cols]; rows],
+                    row: 0,
+                    col: 0,
+                };
+                let text = String::from_utf8_lossy(bytes).into_owned();
+                let mut chars = text.chars().peekable();
+                while let Some(ch) = chars.next() {
+                    match ch {
+                        '\x1b' => screen.escape(&mut chars),
+                        '\r' => screen.col = 0,
+                        '\n' => {
+                            screen.row = screen.row.saturating_add(1);
+                            screen.col = 0;
+                        }
+                        ch if (ch as u32) < 0x20 => {}
+                        ch => screen.put(ch),
+                    }
+                }
+                screen
+            }
+
+            fn put(&mut self, ch: char) {
+                let cols = self.rows[0].len();
+                if self.col >= cols {
+                    self.col = 0;
+                    self.row = self.row.saturating_add(1);
+                }
+                if let Some(row) = self.rows.get_mut(self.row) {
+                    row[self.col] = ch;
+                }
+                self.col += 1;
+            }
+
+            /// Consumes one escape sequence and applies the few that move or
+            /// erase. Everything else (SGR, alternate screen, cursor
+            /// visibility, OSC) only changes appearance, so it is skipped.
+            fn escape<I: Iterator<Item = char>>(&mut self, chars: &mut std::iter::Peekable<I>) {
+                if chars.peek() != Some(&'[') {
+                    chars.next();
+                    return;
+                }
+                chars.next();
+                let mut params = String::new();
+                let mut final_byte = ' ';
+                for ch in chars.by_ref() {
+                    if ch.is_ascii_alphabetic() || ch == '@' {
+                        final_byte = ch;
+                        break;
+                    }
+                    params.push(ch);
+                }
+                let numbers: Vec<usize> = params
+                    .trim_start_matches('?')
+                    .split(';')
+                    .map(|part| part.parse::<usize>().unwrap_or(0))
+                    .collect();
+                let first = numbers.first().copied().unwrap_or(0);
+                match final_byte {
+                    'H' | 'f' => {
+                        self.row = first.saturating_sub(1);
+                        self.col = numbers.get(1).copied().unwrap_or(1).saturating_sub(1);
+                    }
+                    'A' => self.row = self.row.saturating_sub(first.max(1)),
+                    'B' => self.row = self.row.saturating_add(first.max(1)),
+                    'C' => self.col = self.col.saturating_add(first.max(1)),
+                    'D' => self.col = self.col.saturating_sub(first.max(1)),
+                    'J' => {
+                        for row in &mut self.rows {
+                            row.fill(' ');
+                        }
+                        self.row = 0;
+                        self.col = 0;
+                    }
+                    'K' => {
+                        if let Some(row) = self.rows.get_mut(self.row) {
+                            for cell in row.iter_mut().skip(self.col) {
+                                *cell = ' ';
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            fn text(&self) -> String {
+                self.rows
+                    .iter()
+                    .map(|row| row.iter().collect::<String>().trim_end().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+
+        /// Every file under `root`, mapped to its length, modification time,
+        /// and content digest. Comparing two of these is the read-only
+        /// proof: a dashboard that opened anything for write, rewrote a
+        /// heartbeat, or dropped a lock file changes at least one entry.
+        fn tree_fingerprint(root: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+            use sha2::{Digest as _, Sha256};
+            let mut fingerprint = std::collections::BTreeMap::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(metadata) = entry.metadata() else {
+                        continue;
+                    };
+                    if metadata.is_dir() {
+                        stack.push(path);
+                        continue;
+                    }
+                    let digest = std::fs::read(&path).map_or_else(
+                        |error| format!("unreadable: {error}"),
+                        |bytes| format!("{:x}", Sha256::digest(&bytes)),
+                    );
+                    let mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or_else(|| "?".to_string(), |since| since.as_nanos().to_string());
+                    fingerprint.insert(
+                        path.display().to_string(),
+                        format!("{} {mtime} {digest}", metadata.len()),
+                    );
+                }
+            }
+            fingerprint
+        }
+
+        /// Polls the replayed screen until `predicate` holds, so an
+        /// assertion never races the 250 ms refresh or the render that
+        /// follows a keystroke.
+        fn wait_for_screen(
+            session: &PtySession,
+            rows: usize,
+            cols: usize,
+            what: &str,
+            predicate: impl Fn(&str) -> bool,
+        ) -> String {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut last = String::new();
+            while Instant::now() < deadline {
+                last = Screen::replay(&session.output_snapshot(), rows, cols).text();
+                if predicate(&last) {
+                    return last;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("never saw {what} on screen. Last frame:\n{last}");
+        }
+
+        /// Task 4 Step 3: the shipped command, end to end, against a
+        /// synthetic *active* run — launch, observe a local refresh pick up
+        /// a concurrent manifest write, navigate, open a log, open help,
+        /// trigger on-demand Evidence, quit clean, and mutate nothing.
+        ///
+        /// Deliberately drives `undertake dashboard --run … --refresh-ms …
+        /// --config …` rather than the sentinel harness the restoration
+        /// scenarios above use: this is the surface an operator gets, so it
+        /// is the surface the read-only and restoration contracts have to
+        /// hold on.
+        #[test]
+        fn dashboard_cli_session_navigates_reads_evidence_and_leaves_state_untouched() {
+            use crate::dashboard::run_source::test_support::{
+                PATCHSTAND_ATTEMPT_DIR, PATCHSTAND_PROFILE_ID, PATCHSTAND_RUN_ID, TempState,
+            };
+
+            const ROWS: u16 = 40;
+            const COLS: u16 = 120;
+            let created = "2026-07-25T18:39:20.469500+00:00";
+            let first_update = "2026-07-25T18:43:44.617226+00:00";
+            let second_update = "2026-07-25T18:59:59.123456+00:00";
+
+            let temp = TempState::new();
+            // An *active* run: a heartbeat written now is younger than the
+            // 60-second stale threshold, so liveness reads `live` — the
+            // opposite of the pinned abandoned pilot fixture, and the state
+            // a refresh actually has to keep up with.
+            temp.write_patchstand_run(
+                PATCHSTAND_RUN_ID,
+                created,
+                first_update,
+                &chrono::Utc::now().to_rfc3339(),
+                std::process::id(),
+                std::process::id(),
+            );
+            // The run's Harness Deck report, where the join must find it.
+            let reports_home = temp.root().join("reports-home");
+            let report_dir =
+                crate::deck::report_run_dir(&reports_home, "cycle-20260725-183823").unwrap();
+            std::fs::create_dir_all(&report_dir).unwrap();
+            std::fs::write(report_dir.join("report.json"), b"{}\n").unwrap();
+
+            let before = tree_fingerprint(temp.root());
+
+            let mut cmd = CommandBuilder::new(release_binary());
+            cmd.args([
+                "dashboard",
+                "--run",
+                PATCHSTAND_RUN_ID,
+                "--refresh-ms",
+                "250",
+                "--config",
+                &format!("{}/undertake.toml", env!("CARGO_MANIFEST_DIR")),
+            ]);
+            cmd.env("UNDERTAKE_STATE_DIR", temp.root().display().to_string());
+            cmd.env("UNDERTAKE_REPORTS_HOME", reports_home.display().to_string());
+            let mut session = PtySession::spawn_command(cmd, ROWS, COLS);
+            let rows = ROWS as usize;
+            let cols = COLS as usize;
+
+            // The opening screen: the pinned run, live, with the resolved
+            // report and the roster-resolved attempt.
+            let opening = wait_for_screen(&session, rows, cols, "the opening screen", |screen| {
+                screen.contains("liveness: live") && screen.contains(first_update)
+            });
+            assert!(opening.contains(PATCHSTAND_RUN_ID), "{opening}");
+            assert!(opening.contains("stage: implementing"), "{opening}");
+            assert!(opening.contains("Harness Deck: "), "{opening}");
+            assert!(!opening.contains("no report at"), "{opening}");
+
+            // A local refresh: a concurrent writer advances `updated_at`,
+            // and the screen follows it. Only a re-read of the manifest can
+            // change this field — a redraw of the retained snapshot cannot.
+            temp.write_run(
+                PATCHSTAND_RUN_ID,
+                &temp.patchstand_manifest(
+                    PATCHSTAND_RUN_ID,
+                    created,
+                    second_update,
+                    std::process::id(),
+                    std::process::id(),
+                ),
+            );
+            let after_write = tree_fingerprint(temp.root());
+            assert_ne!(
+                before, after_write,
+                "the fingerprint must notice the manifest rewrite, or it can never notice anything"
+            );
+            wait_for_screen(&session, rows, cols, "the refreshed manifest", |screen| {
+                screen.contains(second_update)
+            });
+
+            // Navigate: `j` moves the attempt cursor, `l` opens that
+            // attempt's bounded worker log.
+            session.send_text("jl");
+            let with_log = wait_for_screen(&session, rows, cols, "the opened log", |screen| {
+                screen.contains("worker.stdout.log")
+            });
+            assert!(with_log.contains(PATCHSTAND_ATTEMPT_DIR), "{with_log}");
+
+            // Help, then dismiss it.
+            session.send_text("?");
+            wait_for_screen(&session, rows, cols, "the help overlay", |screen| {
+                screen.contains("read-only")
+            });
+            session.send_text("?");
+            wait_for_screen(&session, rows, cols, "help dismissed", |screen| {
+                !screen.contains("read-only") && screen.contains(PATCHSTAND_PROFILE_ID)
+            });
+
+            // Tab to Evidence and ask for it on demand. The reply may never
+            // arrive (Afterfact is a real subprocess and may not exist on
+            // this machine); what must hold is that the request never blocks
+            // the input loop.
+            session.send_text("\t\t");
+            wait_for_screen(&session, rows, cols, "the Evidence panel", |screen| {
+                screen.contains("cautionlight: deferred")
+            });
+            session.send_text("r");
+
+            session.send_text("q");
+            assert!(
+                session.wait_for_exit(Duration::from_secs(15)),
+                "the dashboard did not exit after q"
+            );
+            assert_eq!(
+                session.child.wait().ok().map(|status| status.exit_code()),
+                Some(0),
+                "q must exit 0"
+            );
+            assert_terminal_restored(&session, &session.output_snapshot());
+
+            assert_eq!(
+                tree_fingerprint(temp.root()),
+                after_write,
+                "the dashboard mutated state: nothing under the state root may change"
+            );
+        }
+
+        /// Task 4's exit-1 half: a terminal that cannot be set up. The child
+        /// runs in its own session (no controlling terminal) with stdin on
+        /// `/dev/null`, so crossterm can find no tty to put into raw mode.
+        /// `python3` is the session-detaching spawner — the same dependency
+        /// `crate::process`'s tests already take — because `std::process`
+        /// offers no safe `setsid` and this crate forbids `unsafe_code`.
+        #[test]
+        fn dashboard_cli_without_a_controlling_terminal_exits_one() {
+            use crate::dashboard::run_source::test_support::{PATCHSTAND_RUN_ID, TempState};
+
+            let temp = TempState::new();
+            temp.write_patchstand_run(
+                PATCHSTAND_RUN_ID,
+                "2026-07-25T18:39:20.469500+00:00",
+                "2026-07-25T18:43:44.617226+00:00",
+                "2026-07-25T18:43:44.617226+00:00",
+                std::process::id(),
+                std::process::id(),
+            );
+            let before = tree_fingerprint(temp.root());
+
+            let script = "import subprocess, sys\n\
+                 done = subprocess.run(sys.argv[1:], stdin=subprocess.DEVNULL,\n\
+                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,\n\
+                 timeout=60)\n\
+                 sys.stderr.write(done.stderr.decode('utf-8', 'replace'))\n\
+                 sys.exit(done.returncode)\n";
+            let outcome = std::process::Command::new("python3")
+                .arg("-c")
+                .arg(script)
+                .arg(release_binary())
+                .args([
+                    "dashboard",
+                    "--run",
+                    PATCHSTAND_RUN_ID,
+                    "--config",
+                    &format!("{}/undertake.toml", env!("CARGO_MANIFEST_DIR")),
+                ])
+                .env("UNDERTAKE_STATE_DIR", temp.root())
+                .env("UNDERTAKE_REPORTS_HOME", temp.root().join("reports-home"))
+                .output()
+                .expect("spawn a session-detached dashboard");
+
+            assert_eq!(
+                outcome.status.code(),
+                Some(1),
+                "a terminal that cannot be set up must exit 1, stderr: {}",
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&outcome.stderr).contains("dashboard:"),
+                "the failure must be reported, not silent"
+            );
+            assert_eq!(
+                tree_fingerprint(temp.root()),
+                before,
+                "a failed launch must still mutate nothing"
+            );
+        }
     }
 }
 
@@ -1274,6 +1661,18 @@ fn spawn_afterfact_worker() -> (SyncSender<AfterfactRequest>, Receiver<Afterfact
         let source = AfterfactDashboardSource::new();
         while let Ok(request) = request_rx.recv() {
             let now = Utc::now();
+            // `worker_commits` stays empty, and that is Task 4's decision,
+            // not an unfinished edge. Spec §131 allows commit correlation
+            // against "a typed worker commit **when present**", and
+            // `undertake/run@2` records no such commit: the only commit in a
+            // work manifest is `details.state.before_head`, the repository
+            // HEAD *before* the worker ran. Correlating on it would match
+            // observations made prior to this run's work — including other
+            // runs sitting at the same parent commit — which is strictly
+            // worse than the cwd-prefix rule already in force. Passing it
+            // here would be inventing a typed fact the manifest does not
+            // carry. Correlation therefore stays cwd-prefix only, and
+            // remains labeled heuristic.
             let state = source.read(
                 None,
                 request.run_dir.as_deref(),
@@ -1608,7 +2007,11 @@ pub(crate) fn dashboard_pty_test_harness(args: &[String]) -> Option<std::process
     let state_root = std::env::var("UNDERTAKE_PTY_TEST_STATE_ROOT")
         .expect("UNDERTAKE_PTY_TEST_STATE_ROOT must be set for the PTY test harness");
     let config = RunSourceConfig {
-        state_root: std::path::PathBuf::from(state_root),
+        state_root: std::path::PathBuf::from(&state_root),
+        // This suite tests terminal behavior, not the report join; keeping
+        // the reports home inside the scratch state root means it can never
+        // stat anything under the real `$HOME`.
+        reports_home: std::path::PathBuf::from(state_root).join("reports-home"),
         refresh_interval: StdDuration::from_millis(250),
     };
 

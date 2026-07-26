@@ -24,8 +24,8 @@ use chrono::{DateTime, Utc};
 
 use super::STALE_HEARTBEAT_THRESHOLD;
 use crate::dashboard::model::{
-    AttemptRecord, DashboardSnapshot, LogTail, RecentRun, RunIdentity, RunLiveness, RunSnapshot,
-    SourceState, StageMarker, VerificationRecord, VerificationSource,
+    AttemptRecord, DashboardSnapshot, HarnessDeckState, LogTail, RecentRun, RunIdentity,
+    RunLiveness, RunSnapshot, SourceState, StageMarker, VerificationRecord, VerificationSource,
 };
 use crate::dashboard::sanitize::sanitize_text;
 use crate::dashboard::services::{
@@ -35,11 +35,17 @@ use crate::musterroll::{self, RosterSnapshot};
 use crate::run::{RunJob, RunLifecycle};
 
 /// Bounded read configuration for the run source. The state root is the
-/// configured Undertake state directory (containing `runs-v2/`); the refresh
-/// interval governs local artifact polling only.
+/// configured Undertake state directory (containing `runs-v2/`); the report
+/// root is the Harness Deck reports home the run/report join resolves
+/// through; the refresh interval governs local artifact polling only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunSourceConfig {
     pub(crate) state_root: PathBuf,
+    /// The Harness Deck reports home (`UNDERTAKE_REPORTS_HOME`, else
+    /// `$HOME`), resolved by the CLI through the same helper every other
+    /// report-writing command uses. Only ever joined through
+    /// [`crate::deck::report_run_dir`], never by hand.
+    pub(crate) reports_home: PathBuf,
     pub(crate) refresh_interval: Duration,
 }
 
@@ -184,13 +190,13 @@ impl DashboardRunSource {
     /// Deliberately independent of [`DISCOVERY_CANDIDATE_CAP`]: the cap
     /// bounds how much work *discovery* does, and pinning the dashboard to a
     /// named run must keep working for a run older than the newest 200.
+    ///
+    /// Shares its whole body with [`preflight_run_selection`], which the CLI
+    /// calls before entering raw mode: `--run <unknown>` must exit 2 from a
+    /// plain terminal, and it must fail for exactly the reasons a refresh
+    /// tick would fail — one implementation, not two that can drift.
     fn validated_explicit_run_id(&self, run_id: &str) -> Result<String, DashboardError> {
-        validate_run_id(run_id)?;
-        if self.config.runs_dir().join(run_id).is_dir() {
-            Ok(run_id.to_string())
-        } else {
-            Err(DashboardError::new(format!("unknown run id {run_id:?}")))
-        }
+        validated_explicit_run_id(&self.config, run_id)
     }
 
     /// Reads the recent terminal runs (bounded) for the secondary panel.
@@ -608,8 +614,9 @@ fn read_dashboard_manifest(path: &Path) -> Result<(DashboardManifest, bool), Das
 }
 
 /// Validates a run id is a single normal path component, reusing the
-/// operational convention. Rejects traversal and multi-component ids.
-fn validate_run_id(run_id: &str) -> Result<(), DashboardError> {
+/// operational convention. Rejects traversal and multi-component ids. The
+/// CLI calls this directly for `--run` rather than reimplementing it.
+pub(crate) fn validate_run_id(run_id: &str) -> Result<(), DashboardError> {
     use std::path::Component;
     let mut components = Path::new(run_id).components();
     if run_id.is_empty()
@@ -619,6 +626,39 @@ fn validate_run_id(run_id: &str) -> Result<(), DashboardError> {
         return Err(DashboardError::new(format!("invalid run id {run_id:?}")));
     }
     Ok(())
+}
+
+/// Validates an explicit run id against a configured state root and confirms
+/// the run directory exists. The single implementation behind both
+/// [`DashboardRunSource::validated_explicit_run_id`] and
+/// [`preflight_run_selection`].
+fn validated_explicit_run_id(
+    config: &RunSourceConfig,
+    run_id: &str,
+) -> Result<String, DashboardError> {
+    validate_run_id(run_id)?;
+    if config.runs_dir().join(run_id).is_dir() {
+        Ok(run_id.to_string())
+    } else {
+        Err(DashboardError::new(format!("unknown run id {run_id:?}")))
+    }
+}
+
+/// Checks a selection is launchable *before* the dashboard enters raw mode,
+/// so a malformed or unknown `--run` id reports on the plain terminal and
+/// exits 2 instead of dropping the operator into an alternate screen whose
+/// only content is an error.
+///
+/// [`RunSelection::Newest`] needs no preflight: an empty runs directory is a
+/// legitimate state the dashboard renders, not a launch failure.
+pub(crate) fn preflight_run_selection(
+    config: &RunSourceConfig,
+    selection: &RunSelection,
+) -> Result<(), DashboardError> {
+    match selection {
+        RunSelection::Newest => Ok(()),
+        RunSelection::Explicit(run_id) => validated_explicit_run_id(config, run_id).map(|_| ()),
+    }
 }
 
 /// Picks the newest run from one already-scanned candidate set: the newest
@@ -831,6 +871,11 @@ impl DashboardRunSource {
                     disagreement: false,
                 },
                 logs: Vec::new(),
+                // An unreadable manifest carries no join key, so the join
+                // is genuinely unattemptable — not "absent report".
+                harness_deck: HarnessDeckState::Unresolved {
+                    reason: "run manifest unreadable".to_string(),
+                },
                 event_count: 0,
                 events_truncated: false,
                 selection_error: Some(error.message().to_string()),
@@ -902,6 +947,12 @@ impl DashboardRunSource {
             // Log tails are opened on demand (see [`Self::read_log`]); a
             // refresh tick never reads worker/verify logs speculatively.
             logs: Vec::new(),
+            harness_deck: derive_harness_deck(
+                &self.config.reports_home,
+                job,
+                run_id,
+                &manifest.details,
+            ),
             event_count,
             events_truncated,
             selection_error: None,
@@ -1141,6 +1192,61 @@ fn derive_stage(details: &serde_json::Value, job: RunJob) -> Option<String> {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
         RunJob::Review | RunJob::Consult => None,
+    }
+}
+
+/// Resolves the Harness Deck report join for a run (spec §105-110).
+///
+/// Work joins on `details.state.cycle_id`, plan on the run id itself, and
+/// consult/review have no report by definition. Presence is a stat of
+/// `report.json`; the report itself is never opened, so no report prose
+/// reaches the render path.
+///
+/// The join key is untrusted manifest content, so it clears **two**
+/// validators before a path exists: this module's own single-normal-
+/// component [`validate_run_id`], then [`crate::deck::report_run_dir`]'s
+/// charset rule. Both are needed and neither subsumes the other —
+/// `deck`'s rule permits `.` and `..` (legal in a report id's charset, and
+/// harmless for the writer, whose ids are self-generated), which would let a
+/// `cycle_id` of `".."` name the reports directory one level above the join
+/// root. A caller feeding it untrusted bytes owns that containment; a name
+/// like `"cycle id with spaces"` is the mirror case, a single normal
+/// component that only `deck`'s charset rule rejects.
+fn derive_harness_deck(
+    reports_home: &Path,
+    job: RunJob,
+    run_id: &str,
+    details: &serde_json::Value,
+) -> HarnessDeckState {
+    let report_run_id = match job {
+        RunJob::Consult | RunJob::Review => return HarnessDeckState::NoReportForJob,
+        RunJob::Work => match details
+            .get("state")
+            .and_then(|state| state.get("cycle_id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(cycle_id) => cycle_id,
+            None => {
+                return HarnessDeckState::Unresolved {
+                    reason: "run state records no cycle id".to_string(),
+                };
+            }
+        },
+        RunJob::Plan => run_id,
+    };
+    if let Err(error) = validate_run_id(report_run_id) {
+        return HarnessDeckState::Unresolved {
+            reason: error.to_string(),
+        };
+    }
+    match crate::deck::report_run_dir(reports_home, report_run_id) {
+        Ok(dir) => HarnessDeckState::Resolved {
+            present: dir.join("report.json").is_file(),
+            report_dir: dir.display().to_string(),
+        },
+        Err(error) => HarnessDeckState::Unresolved {
+            reason: error.to_string(),
+        },
     }
 }
 
@@ -1519,6 +1625,8 @@ mod attempts;
 mod discovery;
 #[cfg(test)]
 mod events;
+#[cfg(test)]
+mod harness_deck;
 #[cfg(test)]
 mod liveness;
 #[cfg(test)]

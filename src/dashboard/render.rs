@@ -21,8 +21,8 @@ use chrono::{DateTime, Utc};
 use std::fmt::Write as _;
 
 use super::model::{
-    AttemptRecord, DashboardSnapshot, RecentRun, RunLiveness, RunSnapshot, SourceState,
-    StageMarker, VerificationRecord, VerificationSource,
+    AttemptRecord, DashboardSnapshot, HarnessDeckState, RecentRun, RunLiveness, RunSnapshot,
+    SourceState, StageMarker, VerificationRecord, VerificationSource,
 };
 use super::sanitize::{sanitize_single_line, sanitize_text};
 use super::services::ProviderStatusSnapshot;
@@ -173,6 +173,27 @@ pub(crate) fn display_text(text: &str, max_chars: usize) -> String {
 /// [`super::sanitize`]'s own single-line/block split.
 pub(crate) fn display_block(text: &str, max_chars: usize) -> String {
     cap_chars(&sanitize_text(text), max_chars)
+}
+
+/// Flattens genuinely multi-line untrusted text (a service's stderr coverage
+/// summary) onto one bounded line.
+///
+/// [`display_text`] alone is wrong here and [`display_block`] alone is too:
+/// the first *drops* newlines, gluing the last word of one line to the first
+/// of the next ("…3275 dynamic gap(s) discoveredevents: gap code=…", seen in
+/// live acceptance), while the second keeps them in a string that a single
+/// [`Line`] renders as inert control characters. Joining with a visible
+/// separator keeps the line boundary readable and keeps a thousand-line
+/// stderr from becoming a thousand rendered rows — the length cap still
+/// bounds the result.
+fn display_joined(text: &str, max_chars: usize) -> String {
+    let joined = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ");
+    display_text(&joined, max_chars)
 }
 
 /// Draws one frame. Below the minimum size, only a resize message is drawn —
@@ -439,7 +460,7 @@ fn render_active_run(
     lines.push(Line::from(String::new()));
     lines.extend(active_run_attempts_or_stages_lines(value, ui));
     lines.push(Line::from(String::new()));
-    lines.push(Line::from(harness_deck_note(value.identity.job)));
+    lines.push(Line::from(harness_deck_line(&value.harness_deck)));
     lines.extend(active_run_diagnostics_lines(value, ui));
     lines.extend(active_run_log_lines(value));
     lines.push(Line::from(String::new()));
@@ -679,15 +700,28 @@ fn format_verification(record: &VerificationRecord) -> String {
     text
 }
 
-/// The Harness Deck join Task 1/2 never implemented (no report path exists
-/// on `RunSnapshot`/`RunIdentity`): for the two jobs the spec defines as
-/// having *no* join regardless of data availability, this is a static,
-/// job-only fact requiring no report data at all. For jobs the spec would
-/// join (Work/Plan), disclose the gap honestly rather than fabricate a link.
-fn harness_deck_note(job: Option<RunJob>) -> String {
-    match job {
-        Some(RunJob::Consult | RunJob::Review) => "no Harness Deck report for this job".to_string(),
-        _ => "Harness Deck: not available in this view".to_string(),
+/// The Harness Deck join, spelled from what the run source could actually
+/// prove (spec §105-110). Consult/review state the spec-defined absence;
+/// every other case names either the resolved report directory or the exact
+/// reason no directory could be resolved. Nothing here is a link the
+/// dashboard invented, and the report itself is never opened.
+fn harness_deck_line(state: &HarnessDeckState) -> String {
+    match state {
+        HarnessDeckState::NoReportForJob => "no Harness Deck report for this job".to_string(),
+        HarnessDeckState::Unresolved { reason } => {
+            format!("Harness Deck: unresolved — {}", display_text(reason, 160))
+        }
+        HarnessDeckState::Resolved {
+            report_dir,
+            present: true,
+        } => format!("Harness Deck: {}", display_text(report_dir, 160)),
+        HarnessDeckState::Resolved {
+            report_dir,
+            present: false,
+        } => format!(
+            "Harness Deck: no report at {}",
+            display_text(report_dir, 160)
+        ),
     }
 }
 
@@ -840,7 +874,7 @@ fn render_evidence(frame: &mut Frame, area: Rect, snapshot: &DashboardSnapshot) 
                 if *truncated { "   (truncated)" } else { "" },
             )));
             if let Some(summary) = &value.coverage_gap_summary {
-                lines.push(Line::from(display_text(
+                lines.push(Line::from(display_joined(
                     &format!("coverage gap: {summary}"),
                     200,
                 )));
@@ -864,7 +898,7 @@ fn render_evidence(frame: &mut Frame, area: Rect, snapshot: &DashboardSnapshot) 
         SourceState::Fresh { value, .. } | SourceState::Stale { value, .. } => {
             lines.push(Line::from(format!("{} findings", value.findings.len())));
             if let Some(warnings) = &value.coverage_warnings {
-                lines.push(Line::from(display_text(
+                lines.push(Line::from(display_joined(
                     &format!("coverage warning: {warnings}"),
                     200,
                 )));
@@ -1210,6 +1244,10 @@ mod tests {
             stage_markers: vec![],
             verification: base_verification(),
             logs: vec![],
+            harness_deck: HarnessDeckState::Resolved {
+                report_dir: "/home/u/.harness/reports/undertake/cycle-20260725-183823".to_string(),
+                present: true,
+            },
             event_count: 5,
             events_truncated: false,
             selection_error: None,
@@ -1760,6 +1798,54 @@ mod tests {
         assert!(contains(&lines, "truncated"));
     }
 
+    /// A real coverage summary is many stderr lines. Rendered through the
+    /// single-line sanitizer alone, the newline vanishes and the last word
+    /// of one line fuses to the first of the next — live acceptance showed
+    /// `…3275 dynamic gap(s) discoveredevents: gap code=ParseFailure…`.
+    /// The boundary has to survive flattening.
+    #[test]
+    fn a_multiline_coverage_summary_keeps_its_line_boundaries_visible() {
+        let at = now();
+        let mut snapshot = base_snapshot();
+        snapshot.afterfact = Arc::new(SourceState::Fresh {
+            value: AfterfactSnapshot {
+                events: vec![],
+                correlated_count: 0,
+                uncorrelated_count: 230,
+                coverage_gap_summary: Some(
+                    "incomplete coverage discovered\ngap code=ParseFailure\n\nlast line"
+                        .to_string(),
+                ),
+            },
+            last_ok: at,
+            last_attempt: at,
+            truncated: false,
+        });
+        let ui = UiState {
+            focus: Panel::Evidence,
+            ..UiState::default()
+        };
+        let lines = rendered_lines(NORMAL.0, NORMAL.1, &snapshot, &ui);
+        let screen = lines.join("\n");
+        assert!(
+            !screen.contains("discoveredgap"),
+            "adjacent lines must not fuse into one word: {screen}"
+        );
+        assert!(screen.contains("coverage gap:"), "{screen}");
+
+        // The panel wraps, so the joined form itself is asserted directly:
+        // the separator appears at every real boundary and a blank line
+        // never doubles it.
+        assert_eq!(
+            display_joined(
+                "incomplete coverage discovered\ngap code=ParseFailure\n\nlast line",
+                200
+            ),
+            "incomplete coverage discovered \u{b7} gap code=ParseFailure \u{b7} last line"
+        );
+        assert_eq!(display_joined("single line", 200), "single line");
+    }
+
     #[test]
     fn unresolved_profile_shows_marker_not_fabricated_identity() {
         let mut snapshot = base_snapshot();
@@ -1827,14 +1913,60 @@ mod tests {
         assert!(contains(&lines, "planner"));
     }
 
+    /// The four Harness Deck states must stay visibly distinct. "Here is
+    /// the report", "the report was never written", "the join key is
+    /// missing", and "this job never has one" are four different operational
+    /// facts, and collapsing any pair of them into one line would be exactly
+    /// the fabricated link this join exists to avoid.
     #[test]
-    fn consult_job_shows_no_harness_deck_report() {
+    fn every_harness_deck_state_renders_distinctly() {
+        let deck_line = |state: HarnessDeckState| {
+            let mut snapshot = base_snapshot();
+            if let SourceState::Fresh { value, .. } = &mut snapshot.run {
+                value.harness_deck = state;
+            }
+            let lines = rendered_lines(NORMAL.0, NORMAL.1, &snapshot, &UiState::default());
+            lines
+                .iter()
+                .find(|line| line.contains("Harness Deck"))
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        let present = deck_line(HarnessDeckState::Resolved {
+            report_dir: "/r/cycle-1".to_string(),
+            present: true,
+        });
+        let absent = deck_line(HarnessDeckState::Resolved {
+            report_dir: "/r/cycle-1".to_string(),
+            present: false,
+        });
+        let unresolved = deck_line(HarnessDeckState::Unresolved {
+            reason: "run state records no cycle id".to_string(),
+        });
+
+        assert!(present.contains("cycle-1") && !present.contains("no report"));
+        assert!(absent.contains("no report at") && absent.contains("cycle-1"));
+        assert!(unresolved.contains("unresolved") && unresolved.contains("no cycle id"));
+        assert_eq!(
+            [&present, &absent, &unresolved]
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3,
+            "the three resolvable states must not collapse into one line"
+        );
+
+        // Consult/review state the spec-defined absence, and say it without
+        // the word the other three share, so it can never read as a failed
+        // lookup.
         let mut snapshot = base_snapshot();
         if let SourceState::Fresh { value, .. } = &mut snapshot.run {
             value.identity.job = Some(RunJob::Consult);
+            value.harness_deck = HarnessDeckState::NoReportForJob;
         }
         let lines = rendered_lines(NORMAL.0, NORMAL.1, &snapshot, &UiState::default());
-        assert!(contains(&lines, "no Harness Deck report"));
+        assert!(contains(&lines, "no Harness Deck report for this job"));
     }
 
     /// Disabling color must not remove any information: every state

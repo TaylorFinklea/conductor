@@ -57,6 +57,10 @@ impl TempState {
     pub(crate) fn config(&self) -> RunSourceConfig {
         RunSourceConfig {
             state_root: self.root().to_path_buf(),
+            // A scratch reports home under the same temp root: the Harness
+            // Deck join resolves, finds no report, and never reaches the
+            // real `$HOME`.
+            reports_home: self.root().join("reports-home"),
             refresh_interval: Duration::from_secs(1),
         }
     }
