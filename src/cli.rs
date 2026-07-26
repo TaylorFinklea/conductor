@@ -1667,8 +1667,8 @@ fn dashboard_selection(
     Ok(selection)
 }
 
-/// `q` (and SIGTERM/SIGHUP, which quit through the same path) exits 0;
-/// terminal setup failure exits 1.
+/// `q`, SIGTERM/SIGHUP, and terminal loss after startup exit 0; terminal
+/// setup failure and unrelated runtime I/O failures exit 1.
 #[cfg(feature = "tui")]
 fn dashboard_exit_code(result: &std::io::Result<()>) -> ExitCode {
     match result {
@@ -3255,11 +3255,13 @@ provider = "codex"
                 ledger_path: temp.path().join("ledger").join("model-bench.jsonl"),
             };
             let musterroll =
-                crate::musterroll::test_support::FakeMusterrollClient::with_provider_availabilities(&[
-                    ("opencode-go", Availability::Healthy),
-                    ("agy", Availability::Healthy),
-                    ("codex", Availability::Healthy),
-                ]);
+                crate::musterroll::test_support::FakeMusterrollClient::with_provider_availabilities(
+                    &[
+                        ("opencode-go", Availability::Healthy),
+                        ("agy", Availability::Healthy),
+                        ("codex", Availability::Healthy),
+                    ],
+                );
             Self {
                 _temp: temp,
                 target_repo,
@@ -3477,7 +3479,9 @@ provider = "codex"
         assert!(USAGE.contains("[plan prepare --repo <path>"));
         assert!(!USAGE.contains("conductor"));
         assert_eq!(
-            parse_cycle_options(&["--dry-run".to_string()]).unwrap().config,
+            parse_cycle_options(&["--dry-run".to_string()])
+                .unwrap()
+                .config,
             PathBuf::from("undertake.toml")
         );
     }

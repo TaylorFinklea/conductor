@@ -944,15 +944,19 @@ pub(crate) mod terminal {
         //! ordinary `undertake dashboard` CLI (Task 4 owns that surface);
         //! the subprocess entry point is `dashboard_pty_test_harness`.
         use std::io::{Read, Write};
-        use std::path::PathBuf;
+        use std::path::{Path, PathBuf};
         use std::sync::{Arc, LazyLock};
+        use std::thread::JoinHandle;
         use std::time::{Duration, Instant};
 
+        use nix::errno::Errno;
         use nix::sys::signal::{self, Signal};
         use nix::unistd::Pid;
         use nix_pty_termios::sys::termios::Termios as PtyTermios;
         use parking_lot::Mutex;
-        use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+        use portable_pty::{
+            Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system,
+        };
 
         /// Builds (once per test-binary run, however many tests call this)
         /// the release `undertake` binary this suite spawns, and returns its
@@ -1000,23 +1004,76 @@ pub(crate) mod terminal {
             }
         }
 
-        /// One dashboard session spawned inside a real pseudo-terminal, with
-        /// its output continuously drained on a background thread — a pty's
-        /// output buffer is small, and an unread child would otherwise block
-        /// on write, wedging the very process this suite is trying to quit.
+        struct SpawnedPty {
+            master: Box<dyn MasterPty + Send>,
+            child: Box<dyn Child + Send + Sync>,
+            termios_before_spawn: Option<PtyTermios>,
+            process_group_leader: Option<i32>,
+        }
+
+        fn spawn_under_pty(mut command: CommandBuilder, rows: u16, cols: u16) -> SpawnedPty {
+            let pty_system = native_pty_system();
+            let pair = pty_system
+                .openpty(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect("open pty");
+            let termios_before_spawn = pair.master.get_termios();
+            let child = pair
+                .slave
+                .spawn_command(command)
+                .expect("spawn dashboard under pty");
+            drop(pair.slave);
+            let process_group_leader = pair.master.process_group_leader();
+
+            SpawnedPty {
+                master: pair.master,
+                child,
+                termios_before_spawn,
+                process_group_leader,
+            }
+        }
+
+        fn cleanup_pty_child(
+            child: &mut (dyn Child + Send + Sync),
+            process_group_leader: Option<i32>,
+            reader: Option<JoinHandle<()>>,
+        ) {
+            if matches!(child.try_wait(), Ok(None) | Err(_)) {
+                let pid = child
+                    .process_id()
+                    .and_then(|pid| i32::try_from(pid).ok())
+                    .map(Pid::from_raw);
+                let killed = process_group_leader
+                    .map(Pid::from_raw)
+                    .map(|pgid| signal::killpg(pgid, Signal::SIGKILL))
+                    .or_else(|| pid.map(|pid| signal::kill(pid, Signal::SIGKILL)));
+                if let Some(Err(error)) = killed {
+                    assert_eq!(error, Errno::ESRCH, "kill PTY child: {error}");
+                }
+                let _ = child.wait();
+            }
+            if let Some(reader) = reader {
+                let _ = reader.join();
+            }
+        }
+
+        /// One attached dashboard session with continuously drained output.
         struct PtySession {
             master: Box<dyn MasterPty + Send>,
             child: Box<dyn Child + Send + Sync>,
             output: Arc<Mutex<Vec<u8>>>,
-            /// Taken once at spawn: a pty master hands out its writer
-            /// exactly one time, so a session that drives several keystrokes
-            /// has to keep it.
             writer: Mutex<Box<dyn std::io::Write + Send>>,
             termios_before_spawn: Option<PtyTermios>,
+            process_group_leader: Option<i32>,
+            reader: Option<JoinHandle<()>>,
         }
 
         impl PtySession {
-            fn spawn(state_root: &std::path::Path, induce_panic: bool) -> Self {
+            fn spawn(state_root: &Path, induce_panic: bool) -> Self {
                 let mut cmd = CommandBuilder::new(release_binary());
                 cmd.arg("__dashboard_pty_test_harness");
                 cmd.env(
@@ -1029,53 +1086,30 @@ pub(crate) mod terminal {
                 Self::spawn_command(cmd, 24, 80)
             }
 
-            /// Spawns an arbitrary already-configured command on a fresh pty
-            /// slave. Split out so the same session plumbing drives both the
-            /// sentinel harness (which the induced-panic scenario needs) and
-            /// the real `undertake dashboard` command Task 4 ships.
             fn spawn_command(cmd: CommandBuilder, rows: u16, cols: u16) -> Self {
-                let pty_system = native_pty_system();
-                let pair = pty_system
-                    .openpty(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })
-                    .expect("open pty");
-                let termios_before_spawn = pair.master.get_termios();
-
-                let child = pair
-                    .slave
-                    .spawn_command(cmd)
-                    .expect("spawn dashboard under pty");
-                // The parent must not keep the slave's write end open: the
-                // master's reader only sees EOF once every slave-side file
-                // descriptor is closed, and this handle would wedge that
-                // forever if left open.
-                drop(pair.slave);
-
+                let spawned = spawn_under_pty(cmd, rows, cols);
                 let output = Arc::new(Mutex::new(Vec::new()));
-                let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
+                let mut pty_reader = spawned.master.try_clone_reader().expect("clone pty reader");
                 let output_writer = Arc::clone(&output);
-                std::thread::spawn(move || {
+                let reader = std::thread::spawn(move || {
                     let mut buffer = [0_u8; 4096];
                     loop {
-                        match reader.read(&mut buffer) {
+                        match pty_reader.read(&mut buffer) {
                             Ok(0) | Err(_) => break,
                             Ok(count) => output_writer.lock().extend_from_slice(&buffer[..count]),
                         }
                     }
                 });
-
-                let writer = Mutex::new(pair.master.take_writer().expect("pty writer"));
+                let writer = Mutex::new(spawned.master.take_writer().expect("pty writer"));
 
                 Self {
-                    master: pair.master,
-                    child,
+                    master: spawned.master,
+                    child: spawned.child,
                     output,
                     writer,
-                    termios_before_spawn,
+                    termios_before_spawn: spawned.termios_before_spawn,
+                    process_group_leader: spawned.process_group_leader,
+                    reader: Some(reader),
                 }
             }
 
@@ -1083,10 +1117,6 @@ pub(crate) mod terminal {
                 self.output.lock().clone()
             }
 
-            /// Blocks (bounded) until the dashboard has written *something* —
-            /// evidence it has entered raw mode/the alternate screen (the
-            /// first bytes `TerminalGuard::enter` writes, before the loop
-            /// even starts) or drawn a frame.
             fn wait_until_drawn(&self, timeout: Duration) {
                 let deadline = Instant::now() + timeout;
                 while Instant::now() < deadline {
@@ -1110,7 +1140,6 @@ pub(crate) mod terminal {
                 signal::kill(Pid::from_raw(pid), signal).expect("send signal");
             }
 
-            /// Blocks (bounded) for the child to exit; `true` iff it did.
             fn wait_for_exit(&mut self, timeout: Duration) -> bool {
                 let deadline = Instant::now() + timeout;
                 while Instant::now() < deadline {
@@ -1124,6 +1153,131 @@ pub(crate) mod terminal {
 
             fn termios_now(&self) -> Option<PtyTermios> {
                 self.master.get_termios()
+            }
+        }
+
+        impl Drop for PtySession {
+            fn drop(&mut self) {
+                cleanup_pty_child(
+                    self.child.as_mut(),
+                    self.process_group_leader,
+                    self.reader.take(),
+                );
+            }
+        }
+
+        struct DetachablePtySession {
+            master: Option<Box<dyn MasterPty + Send>>,
+            child: Box<dyn Child + Send + Sync>,
+            process_group_leader: Option<i32>,
+            reader: Option<JoinHandle<()>>,
+        }
+
+        impl DetachablePtySession {
+            fn spawn_dashboard(state_root: &Path, refresh_ms: u64) -> Self {
+                use crate::dashboard::run_source::test_support::PATCHSTAND_RUN_ID;
+
+                let mut cmd = CommandBuilder::new(release_binary());
+                cmd.args([
+                    "dashboard",
+                    "--run",
+                    PATCHSTAND_RUN_ID,
+                    "--refresh-ms",
+                    &refresh_ms.to_string(),
+                    "--config",
+                    &format!("{}/undertake.toml", env!("CARGO_MANIFEST_DIR")),
+                ]);
+                cmd.env("UNDERTAKE_STATE_DIR", state_root.display().to_string());
+                cmd.env(
+                    "UNDERTAKE_REPORTS_HOME",
+                    state_root.join("reports-home").display().to_string(),
+                );
+                cmd.env("PATH", "/nonexistent-undertake-dashboard-pty-path");
+
+                let spawned = spawn_under_pty(cmd, 40, 120);
+                let mut pty_reader = spawned.master.try_clone_reader().expect("clone pty reader");
+                let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+                let reader = std::thread::spawn(move || {
+                    const OUTPUT_CAP: usize = 64 * 1024;
+                    let mut output = Vec::new();
+                    let mut buffer = [0_u8; 4096];
+                    let result = loop {
+                        match pty_reader.read(&mut buffer) {
+                            Ok(0) => {
+                                break Err("PTY reached EOF before dashboard readiness".to_string());
+                            }
+                            Ok(count) if output.len() + count > OUTPUT_CAP => {
+                                break Err("dashboard readiness output exceeded 64 KiB".to_string());
+                            }
+                            Ok(count) => {
+                                output.extend_from_slice(&buffer[..count]);
+                                let screen = Screen::replay(&output, 40, 120).text();
+                                if screen.contains(PATCHSTAND_RUN_ID) {
+                                    break Ok(());
+                                }
+                            }
+                            Err(error) => {
+                                break Err(format!("read dashboard readiness output: {error}"));
+                            }
+                        }
+                    };
+                    let _ = ready_tx.send(result);
+                });
+                let mut session = Self {
+                    master: Some(spawned.master),
+                    child: spawned.child,
+                    process_group_leader: spawned.process_group_leader,
+                    reader: Some(reader),
+                };
+                match ready_rx.recv_timeout(Duration::from_secs(15)) {
+                    Ok(Ok(())) => {
+                        session
+                            .reader
+                            .take()
+                            .expect("readiness reader")
+                            .join()
+                            .expect("readiness reader panicked");
+                    }
+                    Ok(Err(error)) => panic!("{error}"),
+                    Err(error) => panic!("dashboard readiness timed out: {error}"),
+                }
+                session
+            }
+
+            fn close_terminal(&mut self) {
+                drop(self.master.take());
+            }
+
+            fn send_signal_if_alive(&mut self, signal_to_send: Signal) {
+                if matches!(self.child.try_wait(), Ok(None)) {
+                    let pid = self.child.process_id().expect("child pid");
+                    let pid = Pid::from_raw(i32::try_from(pid).expect("real pids fit in i32"));
+                    if let Err(error) = signal::kill(pid, signal_to_send) {
+                        assert_eq!(error, Errno::ESRCH, "send {signal_to_send:?}: {error}");
+                    }
+                }
+            }
+
+            fn wait_for_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+                let deadline = Instant::now() + timeout;
+                while Instant::now() < deadline {
+                    if let Ok(Some(status)) = self.child.try_wait() {
+                        return Some(status);
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                None
+            }
+        }
+
+        impl Drop for DetachablePtySession {
+            fn drop(&mut self) {
+                self.close_terminal();
+                cleanup_pty_child(
+                    self.child.as_mut(),
+                    self.process_group_leader,
+                    self.reader.take(),
+                );
             }
         }
 
@@ -1246,6 +1400,7 @@ pub(crate) mod terminal {
                             screen.row = screen.row.saturating_add(1);
                             screen.col = 0;
                         }
+
                         ch if (ch as u32) < 0x20 => {}
                         ch => screen.put(ch),
                     }
@@ -1323,6 +1478,60 @@ pub(crate) mod terminal {
                     .collect::<Vec<_>>()
                     .join("\n")
             }
+        }
+        fn detachable_dashboard_fixture() -> crate::dashboard::run_source::test_support::TempState {
+            use crate::dashboard::run_source::test_support::{PATCHSTAND_RUN_ID, TempState};
+
+            let temp = TempState::new();
+            temp.write_patchstand_run(
+                PATCHSTAND_RUN_ID,
+                "2026-07-25T18:39:20.469500+00:00",
+                "2026-07-25T18:43:44.617226+00:00",
+                "2026-07-25T18:43:44.617226+00:00",
+                std::process::id(),
+                std::process::id(),
+            );
+            temp
+        }
+
+        #[test]
+        fn closed_terminal_exits_at_both_refresh_extremes() {
+            for refresh_ms in [250, 60_000] {
+                let temp = detachable_dashboard_fixture();
+                let mut session = DetachablePtySession::spawn_dashboard(temp.root(), refresh_ms);
+                session.close_terminal();
+                let status = session.wait_for_exit(Duration::from_secs(2));
+                assert!(
+                    status.as_ref().is_some_and(ExitStatus::success),
+                    "dashboard remained alive or failed after terminal hangup at {refresh_ms} ms: {status:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn sigterm_after_terminal_hangup_cannot_be_starved() {
+            let temp = detachable_dashboard_fixture();
+            let mut session = DetachablePtySession::spawn_dashboard(temp.root(), 250);
+            session.close_terminal();
+            session.send_signal_if_alive(Signal::SIGTERM);
+            let status = session.wait_for_exit(Duration::from_secs(2));
+            assert!(
+                status.as_ref().is_some_and(ExitStatus::success),
+                "dashboard remained alive or failed after terminal hangup and SIGTERM: {status:?}"
+            );
+        }
+
+        #[test]
+        fn sighup_after_terminal_hangup_cannot_be_starved() {
+            let temp = detachable_dashboard_fixture();
+            let mut session = DetachablePtySession::spawn_dashboard(temp.root(), 250);
+            session.close_terminal();
+            session.send_signal_if_alive(Signal::SIGHUP);
+            let status = session.wait_for_exit(Duration::from_secs(2));
+            assert!(
+                status.as_ref().is_some_and(ExitStatus::success),
+                "dashboard remained alive or failed after terminal hangup and SIGHUP: {status:?}"
+            );
         }
 
         /// Every file under `root`, mapped to its length, modification time,
@@ -2058,6 +2267,32 @@ pub(crate) fn run_dashboard(config: RunSourceConfig, selection: RunSelection) ->
     result
 }
 
+fn is_terminal_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
+    ) || cfg!(unix) && error.raw_os_error() == Some(libc::EIO)
+}
+
+enum TerminalEvent {
+    Idle,
+    Closed,
+    Event(Event),
+}
+
+fn poll_terminal_event(timeout: StdDuration) -> io::Result<TerminalEvent> {
+    match event::poll(timeout) {
+        Ok(false) => Ok(TerminalEvent::Idle),
+        Ok(true) => match event::read() {
+            Ok(event) => Ok(TerminalEvent::Event(event)),
+            Err(error) if is_terminal_disconnect(&error) => Ok(TerminalEvent::Closed),
+            Err(error) => Err(error),
+        },
+        Err(error) if is_terminal_disconnect(&error) => Ok(TerminalEvent::Closed),
+        Err(error) => Err(error),
+    }
+}
+
 /// The dashboard's main input/render loop, extracted so [`run_dashboard`]
 /// can guarantee worker shutdown runs on every exit path — including a
 /// mid-loop input or render I/O error — rather than only after a normal
@@ -2069,19 +2304,26 @@ fn event_loop(
     musterroll_rx: &Receiver<SourceState<MusterrollSnapshot>>,
     afterfact_rx: &Receiver<AfterfactReply>,
 ) -> io::Result<()> {
-    while !loop_state.quit && !shutdown.load(Ordering::SeqCst) {
-        if event::poll(INPUT_POLL_INTERVAL)? {
-            if let Event::Key(key) = event::read()? {
-                if let Some(intent) = intent_for_key(key) {
-                    let now = Utc::now();
-                    let (attempt_dirs, recent_run_ids) = loop_state.key_context_parts();
-                    let ctx = KeyContext {
-                        attempt_dirs: &attempt_dirs,
-                        recent_run_ids: &recent_run_ids,
-                    };
-                    for action in loop_state.app.on_key(intent, now, &ctx) {
-                        loop_state.apply(action);
-                    }
+    while !loop_state.quit {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let terminal_event = poll_terminal_event(INPUT_POLL_INTERVAL)?;
+        if matches!(terminal_event, TerminalEvent::Closed) || shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        if let TerminalEvent::Event(Event::Key(key)) = terminal_event {
+            if let Some(intent) = intent_for_key(key) {
+                let now = Utc::now();
+                let (attempt_dirs, recent_run_ids) = loop_state.key_context_parts();
+                let ctx = KeyContext {
+                    attempt_dirs: &attempt_dirs,
+                    recent_run_ids: &recent_run_ids,
+                };
+                for action in loop_state.app.on_key(intent, now, &ctx) {
+                    loop_state.apply(action);
                 }
             }
         }
@@ -2102,9 +2344,14 @@ fn event_loop(
 
         let ui = loop_state.app.ui;
         let render_now = Utc::now();
-        guard
+        match guard
             .terminal
-            .draw(|frame| render::render(frame, &loop_state.snapshot, &ui, render_now))?;
+            .draw(|frame| render::render(frame, &loop_state.snapshot, &ui, render_now))
+        {
+            Ok(_) => {}
+            Err(error) if is_terminal_disconnect(&error) => break,
+            Err(error) => return Err(error),
+        }
     }
 
     Ok(())
@@ -2220,6 +2467,30 @@ mod tests {
         RuntimeAction::ReadLog(LogSelector::WorkerStdout(
             PATCHSTAND_ATTEMPT_DIR.to_string(),
         ))
+    }
+
+    #[test]
+    fn terminal_disconnect_classifier_is_narrow() {
+        assert!(is_terminal_disconnect(&io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "terminal closed",
+        )));
+        assert!(is_terminal_disconnect(&io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "output closed",
+        )));
+        #[cfg(unix)]
+        assert!(is_terminal_disconnect(&io::Error::from_raw_os_error(
+            libc::EIO
+        )));
+        assert!(!is_terminal_disconnect(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "denied",
+        )));
+        #[cfg(unix)]
+        assert!(!is_terminal_disconnect(&io::Error::from_raw_os_error(
+            libc::EINTR
+        )));
     }
 
     #[test]

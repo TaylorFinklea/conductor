@@ -46,6 +46,11 @@ nix-pty-termios = { package = "nix", version = "0.28", default-features = false,
 # Already resolved transitively via crossterm's own dependency graph.
 parking_lot = "0.12"
 
+# Temporary dead-TTY fix for crossterm issue #793 / PR #1067. Remove only
+# after a compatible release includes all three upstream fixes.
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm-0.28.1" }
+
 [profile.release]
 strip = true
 opt-level = "z"

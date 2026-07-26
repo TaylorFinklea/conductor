@@ -4,8 +4,7 @@ Branch: `feat/undertake-dashboard` (worktree `.worktrees/undertake-dashboard`), 
 
 ## Plan
 
-- [x] Ship read-only `undertake dashboard` TUI.
-  Verify: `cargo test && cargo clippy --all-targets --all-features -- -D warnings && cargo check --no-default-features && cargo build --release`
+- None.
 
 ## Blockers
 
