@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
-use std::process::Command;
+
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -56,13 +56,12 @@ impl MusterrollError {
         }
     }
 
-    fn command(message: impl Into<String>) -> Self {
+    pub(crate) fn command(message: impl Into<String>) -> Self {
         Self {
             kind: MusterrollErrorKind::Command,
             message: message.into(),
         }
     }
-
     fn json(message: impl Into<String>) -> Self {
         Self {
             kind: MusterrollErrorKind::Json,
@@ -676,66 +675,197 @@ impl ObservationRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct CommandMusterrollClient;
+/// The 512-character ceiling on a formatted command failure's stderr/stdout
+/// detail. `BoundedCommand` already caps raw stderr at 256 KiB; this is a
+/// second, much tighter cap purely for what a human-readable error string
+/// embeds, so one hostile or oversized line can never dominate an error
+/// surfaced up through `Result<_, MusterrollError>`.
+const FAILURE_DETAIL_CAP: usize = 512;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CommandMusterrollClient {
+    /// A shared shutdown signal every command this client runs checks
+    /// inside `BoundedCommand::run`'s wait loop, terminating promptly
+    /// instead of running to its full timeout. `None` for every ordinary
+    /// caller; set only by the dashboard's Musterroll worker thread (see
+    /// `dashboard::runtime::spawn_musterroll_worker`), so `run_dashboard`
+    /// can join that thread on shutdown without waiting out an in-flight
+    /// command's up-to-60-second deadline.
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
 
 impl CommandMusterrollClient {
     pub(crate) const fn new() -> Self {
-        Self
+        Self { cancel: None }
+    }
+
+    /// Attaches a shared cancellation flag; see the `cancel` field doc.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    pub(crate) fn with_cancel(cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            cancel: Some(cancel),
+        }
+    }
+
+    fn attach_cancel(
+        &self,
+        command: crate::process::BoundedCommand,
+    ) -> crate::process::BoundedCommand {
+        match &self.cancel {
+            Some(cancel) => command.cancel_flag(std::sync::Arc::clone(cancel)),
+            None => command,
+        }
     }
 }
 
 impl MusterrollClient for CommandMusterrollClient {
     fn status(&self) -> Result<StatusReport> {
-        let mut command = Command::new("musterroll");
-        command.args(["status", "--json"]);
-        let output = crate::dispatch::run_bounded_command(&mut command)
-            .map_err(|error| bounded_command_error("musterroll status --json", &error))?;
+        let outcome = self
+            .attach_cancel(
+                crate::process::BoundedCommand::new("musterroll")
+                    .args(["status", "--json"])
+                    .stdout_cap(4 * 1024 * 1024)
+                    .stderr_cap(256 * 1024)
+                    .timeout(std::time::Duration::from_secs(60)),
+            )
+            .run()
+            .map_err(|error| spawn_error("musterroll status --json", &error))?;
 
-        if !output.status.success() {
-            return Err(command_failure("musterroll status --json", &output));
+        if outcome.timed_out() || outcome.stdout_truncated {
+            return Err(MusterrollError::command(
+                "musterroll status --json timed out or exceeded output bounds",
+            ));
         }
 
-        serde_json::from_slice(&output.stdout).map_err(|error| {
+        if outcome.exit_code != Some(0) {
+            return Err(MusterrollError::command(command_failure_message(
+                "musterroll status --json",
+                &outcome,
+            )));
+        }
+
+        serde_json::from_slice(&outcome.stdout).map_err(|error| {
             MusterrollError::json(format!("failed to parse musterroll status --json: {error}"))
         })
     }
 
     fn roster_snapshot(&self) -> Result<RosterSnapshot> {
-        let mut command = Command::new("musterroll");
-        command.args(["roster", "snapshot", "--json"]);
-        let output = crate::dispatch::run_bounded_command(&mut command)
-            .map_err(|error| bounded_command_error("musterroll roster snapshot --json", &error))?;
+        let outcome = self
+            .attach_cancel(
+                crate::process::BoundedCommand::new("musterroll")
+                    .args(["roster", "snapshot", "--json"])
+                    .stdout_cap(4 * 1024 * 1024)
+                    .stderr_cap(256 * 1024)
+                    .timeout(std::time::Duration::from_secs(60)),
+            )
+            .run()
+            .map_err(|error| spawn_error("musterroll roster snapshot --json", &error))?;
 
-        if !output.status.success() {
-            return Err(command_failure("musterroll roster snapshot --json", &output));
+        if outcome.timed_out() || outcome.stdout_truncated {
+            return Err(MusterrollError::command(
+                "musterroll roster snapshot --json timed out or exceeded output bounds",
+            ));
         }
 
-        parse_roster_snapshot(&output.stdout)
+        if outcome.exit_code != Some(0) {
+            return Err(MusterrollError::command(command_failure_message(
+                "musterroll roster snapshot --json",
+                &outcome,
+            )));
+        }
+
+        parse_roster_snapshot(&outcome.stdout)
     }
 
     fn observe(&self, request: &ObservationRequest) -> Result<()> {
         let args = observation_args(request);
-        let mut command = Command::new("musterroll");
-        command.args(&args);
-        let output = crate::dispatch::run_bounded_command(&mut command)
-            .map_err(|error| bounded_command_error("musterroll observe", &error))?;
+        let outcome = self
+            .attach_cancel(
+                crate::process::BoundedCommand::new("musterroll")
+                    .args(&args)
+                    .stdout_cap(4 * 1024 * 1024)
+                    .stderr_cap(256 * 1024)
+                    .timeout(std::time::Duration::from_secs(60)),
+            )
+            .run()
+            .map_err(|error| spawn_error("musterroll observe", &error))?;
 
-        if !output.status.success() {
-            return Err(command_failure("musterroll observe", &output));
+        if outcome.timed_out() || outcome.stdout_truncated {
+            return Err(MusterrollError::command(
+                "musterroll observe timed out or exceeded output bounds",
+            ));
+        }
+
+        if outcome.exit_code != Some(0) {
+            return Err(MusterrollError::command(command_failure_message(
+                "musterroll observe",
+                &outcome,
+            )));
         }
         Ok(())
     }
 }
 
-fn bounded_command_error(
-    command: &str,
-    error: &crate::dispatch::BoundedCommandError,
-) -> MusterrollError {
-    error.spawn_source().map_or_else(
-        || MusterrollError::command(format!("{command}: {error}")),
-        |source| spawn_error(command, source),
-    )
+/// Formats a command's exit condition as `exit <code>`, `cancelled` (its
+/// `cancel` flag was observed before it exited — see
+/// [`crate::process::CommandOutcome::cancelled`]), or, for a process that
+/// never returned a code for any other reason — killed by signal, once
+/// timeout, cancellation, and output-cap breaches are excluded by the
+/// caller above — the literal word `signal`. Never the bare `Debug`
+/// rendering of the `Option<i32>` (`Some(2)`), which is not what an
+/// operator wants to read.
+fn exit_label(outcome: &crate::process::CommandOutcome) -> String {
+    if outcome.cancelled() {
+        return "cancelled".to_string();
+    }
+    match outcome.exit_code {
+        Some(code) => format!("exit {code}"),
+        None => "signal".to_string(),
+    }
+}
+
+/// Extracts a bounded, sanitized failure detail from a command's bounded
+/// output: stderr when it has content, else stdout — matching the
+/// pre-bounded-process `command_failure` helper (removed when
+/// `CommandMusterrollClient` moved to `BoundedCommand`) this restores.
+/// Control bytes are stripped and the result is capped at
+/// [`FAILURE_DETAIL_CAP`] characters with a trailing `…` marker, the same
+/// shape as the dashboard's own render-boundary length cap, applied here so
+/// a musterroll failure is legible outside the TUI too (this module has no
+/// `tui` dependency).
+fn command_failure_detail(outcome: &crate::process::CommandOutcome) -> String {
+    // Decode stderr first and only fall through to stdout when it has
+    // nothing: stdout is capped at 4 MiB against stderr's 256 KiB, and
+    // decoding a buffer that large only to discard it is pure waste on an
+    // error path.
+    let stderr = String::from_utf8_lossy(&outcome.stderr);
+    let detail = if stderr.trim().is_empty() {
+        String::from_utf8_lossy(&outcome.stdout)
+    } else {
+        stderr
+    };
+    let raw = detail.trim();
+    let sanitized = crate::sanitize::sanitize_single_line(raw);
+    if sanitized.chars().count() <= FAILURE_DETAIL_CAP {
+        return sanitized;
+    }
+    let mut capped: String = sanitized.chars().take(FAILURE_DETAIL_CAP).collect();
+    capped.push('\u{2026}');
+    capped
+}
+
+/// The full failure message for a command that spawned and ran to some
+/// conclusion but did not exit 0: `<command> <exit label>[: <detail>]`. The
+/// detail suffix is omitted entirely when both stdout and stderr are empty,
+/// rather than rendering a dangling `: `.
+fn command_failure_message(command: &str, outcome: &crate::process::CommandOutcome) -> String {
+    let label = exit_label(outcome);
+    let detail = command_failure_detail(outcome);
+    if detail.is_empty() {
+        format!("{command} {label}")
+    } else {
+        format!("{command} {label}: {detail}")
+    }
 }
 
 fn spawn_error(command: &str, error: &io::Error) -> MusterrollError {
@@ -743,21 +873,6 @@ fn spawn_error(command: &str, error: &io::Error) -> MusterrollError {
         io::ErrorKind::NotFound => MusterrollError::unavailable("musterroll unavailable on PATH"),
         _ => MusterrollError::command(format!("failed to spawn {command}: {error}")),
     }
-}
-
-fn command_failure(command: &str, output: &std::process::Output) -> MusterrollError {
-    let status = output
-        .status
-        .code()
-        .map_or_else(|| "signal".to_string(), |code| code.to_string());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let detail = if stderr.trim().is_empty() {
-        stdout.trim()
-    } else {
-        stderr.trim()
-    };
-    MusterrollError::command(format!("{command} exited {status}: {detail}"))
 }
 
 #[allow(dead_code)]
@@ -1424,6 +1539,117 @@ mod tests {
     use sha2::Digest;
     use std::cell::Cell;
     use test_support::FakeMusterrollClient;
+
+    /// Finding 4 (final adversarial review): the failure message must
+    /// never render the bare `Debug` form of `Option<i32>` (`Some(2)`),
+    /// and dropped stderr detail must be restored, sanitized, and bounded.
+    #[test]
+    fn command_failure_message_shows_clean_exit_and_sanitized_capped_stderr() {
+        let outcome = crate::process::CommandOutcome {
+            stdout: Vec::new(),
+            stderr: b"boom: connection refused\x1b[31m!!\x1b[0m".to_vec(),
+            exit_code: Some(2),
+            stop_condition: crate::process::StopCondition::None,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let message = command_failure_message("musterroll status --json", &outcome);
+        assert!(
+            !message.contains("Some("),
+            "must never render the bare Option<i32> debug form, got: {message}"
+        );
+        assert!(message.contains("exit 2"), "got: {message}");
+        assert!(
+            message.contains("boom: connection refused"),
+            "stderr detail must be restored, got: {message}"
+        );
+        assert!(
+            !message.contains('\x1b'),
+            "stderr must be sanitized, got: {message}"
+        );
+    }
+
+    #[test]
+    fn command_failure_message_caps_an_oversized_detail() {
+        let outcome = crate::process::CommandOutcome {
+            stdout: Vec::new(),
+            stderr: "e".repeat(10_000).into_bytes(),
+            exit_code: Some(1),
+            stop_condition: crate::process::StopCondition::None,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let message = command_failure_message("musterroll observe", &outcome);
+        assert!(
+            message.chars().count() < 600,
+            "detail must be capped well below the raw 10,000-char stderr, got {} chars",
+            message.chars().count()
+        );
+        assert!(
+            message.ends_with('\u{2026}'),
+            "capped detail must be marked, got: {message}"
+        );
+    }
+
+    #[test]
+    fn command_failure_message_falls_back_to_stdout_when_stderr_is_empty() {
+        let outcome = crate::process::CommandOutcome {
+            stdout: b"stdout detail here".to_vec(),
+            stderr: Vec::new(),
+            exit_code: Some(3),
+            stop_condition: crate::process::StopCondition::None,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let message = command_failure_message("musterroll roster snapshot --json", &outcome);
+        assert!(message.contains("stdout detail here"), "got: {message}");
+    }
+
+    #[test]
+    fn command_failure_message_omits_a_dangling_colon_when_output_is_empty() {
+        let outcome = crate::process::CommandOutcome {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_code: Some(2),
+            stop_condition: crate::process::StopCondition::None,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let message = command_failure_message("musterroll status --json", &outcome);
+        assert_eq!(message, "musterroll status --json exit 2");
+    }
+
+    #[test]
+    fn command_failure_message_reports_signal_death_not_none() {
+        let outcome = crate::process::CommandOutcome {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_code: None,
+            stop_condition: crate::process::StopCondition::None,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let message = command_failure_message("musterroll observe", &outcome);
+        assert_eq!(message, "musterroll observe signal");
+    }
+
+    /// Cancellation must be reported distinctly from a bare signal death:
+    /// "the operator quit while this was in flight" is a different fact
+    /// from "the process died unexpectedly," even though both leave
+    /// `exit_code` at `None`.
+    #[test]
+    fn command_failure_message_reports_cancelled_not_signal() {
+        let outcome = crate::process::CommandOutcome {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_code: None,
+            stop_condition: crate::process::StopCondition::Cancelled,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let message = command_failure_message("musterroll status --json", &outcome);
+        assert_eq!(message, "musterroll status --json cancelled");
+    }
 
     #[derive(Clone)]
     struct FakeClient {

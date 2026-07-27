@@ -6064,7 +6064,11 @@ fn recover_terminal_claim_transition<B: BdClient + ?Sized>(
 /// through worker execution, mechanical verification, and qualitative review
 /// regardless of how long any single stage takes (heartbeat ticks only happen
 /// during worker execution).
-const STALE_CLAIM_THRESHOLD: ChronoDuration = ChronoDuration::seconds(60);
+/// `pub(crate)` so the read-only dashboard classifies a quiet run exactly as
+/// recovery does; two independently declared 60-second thresholds would drift
+/// into the dashboard calling a run live that recovery already treats as
+/// reclaimable.
+pub(crate) const STALE_CLAIM_THRESHOLD: ChronoDuration = ChronoDuration::seconds(60);
 
 /// The exact run outcome the reclaim path itself writes when it durably
 /// finishes a stranded run right before releasing its bd claim. A crashed

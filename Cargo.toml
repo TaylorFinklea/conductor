@@ -10,6 +10,10 @@ rust-version = "1.85"
 name = "undertake"
 path = "src/main.rs"
 
+[features]
+default = ["tui"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:signal-hook"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -19,6 +23,33 @@ libc = "0.2"
 nix = { version = "0.30", features = ["process", "signal", "socket"] }
 sha2 = "0.10"
 sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
+ratatui = { version = "=0.29.0", optional = true, default-features = false, features = ["crossterm"] }
+crossterm = { version = "=0.28.1", optional = true }
+# Safe SIGTERM/SIGHUP handling for dashboard terminal restoration (crate
+# forbids `unsafe_code`, so raw `sigaction`/`nix::unistd::fork`-based
+# approaches are unavailable). Already resolved transitively via
+# crossterm's own dependency graph; pinned exactly like ratatui/crossterm.
+signal-hook = { version = "=0.3.18", optional = true, default-features = false }
+
+[dev-dependencies]
+# PTY spawning for dashboard terminal-restoration tests (raw mode, SIGTERM,
+# release-profile panic). Hand-rolling this needs `fork`/`pre_exec`, both
+# `unsafe fn`, blocked by `unsafe_code = "forbid"`; portable-pty's public API
+# is fully safe and its own `MasterPty::get_termios()` covers the termios
+# inspection this suite needs. Dev-only: never links into the shipped binary.
+portable-pty = "0.9"
+# Same crate, same 0.28 line portable-pty itself depends on (renamed to
+# coexist with the crate's own `nix = "0.30"`): `MasterPty::get_termios()`
+# returns *this* version's `Termios`, so comparing it needs the identical
+# type, not a same-shaped one from a different resolved version.
+nix-pty-termios = { package = "nix", version = "0.28", default-features = false, features = ["term"] }
+# Already resolved transitively via crossterm's own dependency graph.
+parking_lot = "0.12"
+
+# Temporary dead-TTY fix for crossterm issue #793 / PR #1067. Remove only
+# after a compatible release includes all three upstream fixes.
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm-0.28.1" }
 
 [profile.release]
 strip = true
