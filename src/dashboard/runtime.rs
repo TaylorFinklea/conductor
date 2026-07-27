@@ -1011,7 +1011,7 @@ pub(crate) mod terminal {
             process_group_leader: Option<i32>,
         }
 
-        fn spawn_under_pty(mut command: CommandBuilder, rows: u16, cols: u16) -> SpawnedPty {
+        fn spawn_under_pty(command: CommandBuilder, rows: u16, cols: u16) -> SpawnedPty {
             let pty_system = native_pty_system();
             let pair = pty_system
                 .openpty(PtySize {

@@ -9,5 +9,5 @@
 - Verification: vendored EOF tests (MIO and `use-dev-tty`) pass; cursor poll propagation test passes; `cargo tree --features tui -i crossterm@0.28.1` shows one patched package; `cargo test --features tui` passes 801 tests; `cargo test --no-default-features` passes 606 tests.
 - Postmortem: `docs/postmortems/2026-07-25-macos-resource-exhaustion.md`.
 - Isolated dependency rerun: three fixed runs passed at both refresh extremes; three stock 0.28.1 controls also exited, so the short control did not reproduce the scheduler-dependent live failure documented by three contemporaneous stacks/counters.
-- Fresh gates: focused PTY 3/3, runtime 7/7, TUI 801 passed/8 ignored, non-TUI 606 passed/8 ignored, and single vendored Crossterm resolution. Current-toolchain strict Clippy fails on two pre-existing test-only lints; no unrelated source change was made.
+- Fresh gates: focused PTY 3/3, runtime 7/7, TUI 801 passed/8 ignored, non-TUI 606 passed/8 ignored, single vendored Crossterm resolution, and current-toolchain strict Clippy pass after two narrow test-only cleanup edits.
 - Residual risk: exact PID-to-reviewer assertion ancestry and peak per-process energy/GPU/disk/network shares were not captured. Bounded 1/4/12 viewer measurements scaled approximately linearly and left no descendants.

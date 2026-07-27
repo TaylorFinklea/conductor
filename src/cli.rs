@@ -3150,6 +3150,44 @@ provider = "fixture-provider"
         print_scan_table(&snapshots);
     }
 
+    const ADVERSARIAL_CLI_CONFIG: &str = r#"
+[budgets]
+use_musterroll = true
+item_wall_clock_mins = 1
+
+[adversarial_review]
+max_reviewers = 3
+parallel = 2
+judge = "judge"
+
+[[roster]]
+name = "reviewer-one"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "reviewer-one"
+provider = "opencode-go"
+
+[[roster]]
+name = "reviewer-two"
+tier = "lead"
+ceiling = "L"
+efficiency = "std"
+backend = "pi"
+dispatch_id = "reviewer-two"
+provider = "agy"
+
+[[roster]]
+name = "judge"
+tier = "lead"
+ceiling = "XL"
+efficiency = "heavy"
+backend = "pi"
+dispatch_id = "judge"
+provider = "codex"
+"#;
+
     struct AdversarialCliFixture {
         _temp: CliTempDir,
         target_repo: PathBuf,
@@ -3168,87 +3206,8 @@ provider = "fixture-provider"
             let artifact = target_repo.join("design.md");
             std::fs::write(&artifact, b"immutable design").unwrap();
             let config_path = temp.path().join("undertake.toml");
-            let config = crate::config::parse_str(
-                r#"
-[budgets]
-use_musterroll = true
-item_wall_clock_mins = 1
-
-[adversarial_review]
-max_reviewers = 3
-parallel = 2
-judge = "judge"
-
-[[roster]]
-name = "reviewer-one"
-tier = "senior"
-ceiling = "M"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "reviewer-one"
-provider = "opencode-go"
-
-[[roster]]
-name = "reviewer-two"
-tier = "lead"
-ceiling = "L"
-efficiency = "std"
-backend = "pi"
-dispatch_id = "reviewer-two"
-provider = "agy"
-
-[[roster]]
-name = "judge"
-tier = "lead"
-ceiling = "XL"
-efficiency = "heavy"
-backend = "pi"
-dispatch_id = "judge"
-provider = "codex"
-"#,
-            )
-            .unwrap();
-            std::fs::write(
-                &config_path,
-                r#"
-[budgets]
-use_musterroll = true
-item_wall_clock_mins = 1
-
-[adversarial_review]
-max_reviewers = 3
-parallel = 2
-judge = "judge"
-
-[[roster]]
-name = "reviewer-one"
-tier = "senior"
-ceiling = "M"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "reviewer-one"
-provider = "opencode-go"
-
-[[roster]]
-name = "reviewer-two"
-tier = "lead"
-ceiling = "L"
-efficiency = "std"
-backend = "pi"
-dispatch_id = "reviewer-two"
-provider = "agy"
-
-[[roster]]
-name = "judge"
-tier = "lead"
-ceiling = "XL"
-efficiency = "heavy"
-backend = "pi"
-dispatch_id = "judge"
-provider = "codex"
-"#,
-            )
-            .unwrap();
+            let config = crate::config::parse_str(ADVERSARIAL_CLI_CONFIG).unwrap();
+            std::fs::write(&config_path, ADVERSARIAL_CLI_CONFIG).unwrap();
             let paths = AdversarialPaths {
                 state_root: temp.path().join("state").join("adversarial-reviews"),
                 reports_home: temp.path().join("reports-home"),

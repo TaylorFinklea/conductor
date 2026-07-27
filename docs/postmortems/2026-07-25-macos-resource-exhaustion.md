@@ -203,7 +203,7 @@ Vendored unit regressions freshly passed: MIO EOF (1), `/dev/tty` EOF (1), and c
 - `cargo test --features tui dashboard::runtime::tests`: 7 passed.
 - `cargo test --features tui`: 801 passed, 8 ignored.
 - `cargo test --no-default-features`: 606 passed, 8 ignored.
-- `cargo clippy --all-targets --all-features -- -D warnings`: failed under the current Rust toolchain on two pre-existing non-root-cause lints (`unused_mut` in a test helper and `too_many_lines` in a CLI test fixture). Vendored Crossterm also emitted dependency warnings. Product code was not changed to conceal this gate failure.
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed after two narrow test-only cleanup edits (`unused_mut` removal and deduplicating a CLI fixture configuration). Vendored Crossterm emits dependency warnings that Cargo does not promote through the root package's `-D warnings`.
 
 ## Bounded scenario measurements
 
