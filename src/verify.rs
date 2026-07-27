@@ -251,6 +251,18 @@ pub(crate) fn run_review_stage<B: BdClient + ?Sized, E: Exec + ?Sized>(
     review_or_pass(bd, exec, request, Some(review), timeout)
 }
 
+/// Runs qualitative review with Bead side effects while every review and
+/// repair subprocess shares one caller-owned absolute deadline.
+pub(crate) fn run_review_stage_until<B: BdClient + ?Sized, E: Exec + ?Sized>(
+    bd: &B,
+    exec: &E,
+    request: &VerifyRequest,
+    review: &ReviewSettings,
+    deadline: Instant,
+) -> Result<VerifyOutcome> {
+    review_or_pass_until(bd, exec, request, Some(review), deadline)
+}
+
 /// Runs qualitative review without mutating its Bead. The caller must first
 /// persist `outcome` and the returned action as terminal run evidence, then
 /// replay the action exactly once.
@@ -769,8 +781,30 @@ fn review_or_pass<B: BdClient + ?Sized, E: Exec + ?Sized>(
     let Some(settings) = review else {
         return pass(bd, request);
     };
+    let decision = run_review(exec, request, settings, timeout)?;
+    apply_review_decision(bd, request, decision)
+}
 
-    match run_review(exec, request, settings, timeout)? {
+fn review_or_pass_until<B: BdClient + ?Sized, E: Exec + ?Sized>(
+    bd: &B,
+    exec: &E,
+    request: &VerifyRequest,
+    review: Option<&ReviewSettings>,
+    deadline: Instant,
+) -> Result<VerifyOutcome> {
+    let Some(settings) = review else {
+        return pass(bd, request);
+    };
+    let decision = run_review_until(exec, request, settings, deadline)?;
+    apply_review_decision(bd, request, decision)
+}
+
+fn apply_review_decision<B: BdClient + ?Sized>(
+    bd: &B,
+    request: &VerifyRequest,
+    decision: ReviewDecision,
+) -> Result<VerifyOutcome> {
+    match decision {
         ReviewDecision::NotNeeded => pass(bd, request),
         ReviewDecision::Ship { record, attempts } => {
             pass_with_review(bd, request, attempts.len() as u64, Some(record), attempts)

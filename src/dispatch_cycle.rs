@@ -43,11 +43,36 @@ pub(crate) enum ApprovalGate {
     ChangesRequested,
 }
 
+#[derive(Clone)]
+enum MonotonicClock {
+    System,
+    #[cfg(test)]
+    Injected(std::sync::Arc<dyn Fn() -> Instant + Send + Sync>),
+}
+
+impl MonotonicClock {
+    fn now(&self) -> Instant {
+        match self {
+            Self::System => Instant::now(),
+            #[cfg(test)]
+            Self::Injected(now) => now(),
+        }
+    }
+}
+
+impl fmt::Debug for MonotonicClock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MonotonicClock")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DispatchCycleOptions {
     item_timeout: Duration,
+    cycle_timeout: Duration,
     heartbeat_interval: Duration,
     review_resume_budget: Option<Duration>,
+    clock: MonotonicClock,
     resume: bool,
     #[cfg(test)]
     interrupt_before_review: bool,
@@ -57,24 +82,28 @@ pub(crate) struct DispatchCycleOptions {
     fail_legacy_adoption_event_write: bool,
 }
 
-/// One monotonic ceiling for every spawn in a fresh dispatch invocation.
-/// Recovery creates a new instance only after `--resume` has explicitly
-/// authorized another loop budget.
+/// One caller-owned monotonic ceiling shared by worker and verifier stages.
 #[derive(Debug, Clone, Copy)]
 struct ItemDeadline {
     instant: Instant,
 }
 
 impl ItemDeadline {
-    fn start(timeout: Duration) -> Self {
+    fn start_at(start: Instant, timeout: Duration) -> Self {
         Self {
-            instant: Instant::now() + timeout,
+            instant: start + timeout,
         }
     }
 
-    fn remaining(self) -> Option<Duration> {
+    fn capped_from(self, start: Instant, timeout: Duration) -> Self {
+        Self {
+            instant: self.instant.min(start + timeout),
+        }
+    }
+
+    fn remaining_at(self, now: Instant) -> Option<Duration> {
         self.instant
-            .checked_duration_since(Instant::now())
+            .checked_duration_since(now)
             .filter(|remaining| !remaining.is_zero())
     }
 }
@@ -98,11 +127,13 @@ impl DispatchCycleOptions {
     pub(crate) fn from_config(cfg: &Config, resume: bool) -> Self {
         Self {
             item_timeout: Duration::from_secs(u64::from(cfg.budgets.item_wall_clock_mins) * 60),
+            cycle_timeout: Duration::from_secs(u64::from(cfg.budgets.cycle_wall_clock_mins) * 60),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             review_resume_budget: cfg
                 .budgets
                 .review_resume_budget_mins
                 .map(|minutes| Duration::from_secs(u64::from(minutes) * 60)),
+            clock: MonotonicClock::System,
             resume,
             #[cfg(test)]
             interrupt_before_review: false,
@@ -117,8 +148,10 @@ impl DispatchCycleOptions {
     pub(crate) fn for_tests(heartbeat_interval: Duration) -> Self {
         Self {
             item_timeout: Duration::from_secs(30),
+            cycle_timeout: Duration::from_secs(30),
             heartbeat_interval,
             review_resume_budget: Some(Duration::from_secs(30)),
+            clock: MonotonicClock::System,
             resume: false,
             interrupt_before_review: false,
             promotion_interruption: None,
@@ -127,25 +160,46 @@ impl DispatchCycleOptions {
     }
 
     #[cfg(test)]
-    pub(crate) const fn interrupt_before_review(mut self) -> Self {
+    fn with_item_timeout(mut self, item_timeout: Duration) -> Self {
+        self.item_timeout = item_timeout;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_cycle_timeout(mut self, cycle_timeout: Duration) -> Self {
+        self.cycle_timeout = cycle_timeout;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_monotonic_clock(
+        mut self,
+        now: impl Fn() -> Instant + Send + Sync + 'static,
+    ) -> Self {
+        self.clock = MonotonicClock::Injected(std::sync::Arc::new(now));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interrupt_before_review(mut self) -> Self {
         self.interrupt_before_review = true;
         self
     }
 
     #[cfg(test)]
-    pub(crate) const fn resume(mut self) -> Self {
+    pub(crate) fn resume(mut self) -> Self {
         self.resume = true;
         self
     }
 
     #[cfg(test)]
-    const fn interrupt_promotion_at(mut self, boundary: PromotionInterruption) -> Self {
+    fn interrupt_promotion_at(mut self, boundary: PromotionInterruption) -> Self {
         self.promotion_interruption = Some(boundary);
         self
     }
 
     #[cfg(test)]
-    const fn fail_legacy_adoption_event_write(mut self) -> Self {
+    fn fail_legacy_adoption_event_write(mut self) -> Self {
         self.fail_legacy_adoption_event_write = true;
         self
     }
@@ -243,6 +297,8 @@ pub(crate) fn run_dispatch_cycle<
     live: &L,
     musterroll: &U,
 ) -> std::result::Result<DispatchCycleResult, DispatchCycleError> {
+    let cycle_start = options.clock.now();
+    let cycle_deadline = ItemDeadline::start_at(cycle_start, options.cycle_timeout);
     let _dispatch_lease =
         quarantine::DispatchLease::acquire(state_dir, cycle_id).map_err(|error| {
             DispatchCycleError::message(format!("exclusive dispatch lease unavailable: {error}"))
@@ -304,13 +360,17 @@ pub(crate) fn run_dispatch_cycle<
 
     let items = planned_items(&plan)?;
     let pending_work_index = PendingWorkIndex::scan(state_dir).map_err(run_artifact_error)?;
-    let cycle_start = Instant::now();
     let mut dispatched = 0_u64;
     let mut verified = 0_u64;
     let mut failed = 0_u64;
     let mut report_write_failures = Vec::new();
 
     for item in &items {
+        let item_start = options.clock.now();
+        if cycle_deadline.remaining_at(item_start).is_none() {
+            break;
+        }
+        let item_deadline = cycle_deadline.capped_from(item_start, options.item_timeout);
         let attempt = match dispatch_one(
             cfg,
             bd,
@@ -321,6 +381,7 @@ pub(crate) fn run_dispatch_cycle<
             ledger_path,
             cycle_id,
             options,
+            item_deadline,
             live,
             &report_path,
             cycle_start,
@@ -926,6 +987,8 @@ impl AttemptCheckout {
         run_dir: &Path,
         attempt_id: &str,
         before_head: Option<&str>,
+        deadline: ItemDeadline,
+        clock: &MonotonicClock,
     ) -> std::result::Result<Self, DispatchCycleError> {
         let before_head = before_head.ok_or_else(|| {
             DispatchCycleError::message(
@@ -940,17 +1003,24 @@ impl AttemptCheckout {
             ))
         })?;
         let path = root.join(attempt_id);
+        let clone_timeout = deadline.remaining_at(clock.now()).ok_or_else(|| {
+            DispatchCycleError::message(
+                "item or cycle deadline exhausted before isolated checkout clone",
+            )
+        })?;
         let mut command = std::process::Command::new("git");
         command
             .args(["clone", "--shared", "--no-checkout"])
             .arg(canonical_repo)
             .arg(&path);
-        let output = dispatch::run_bounded_command(&mut command).map_err(|error| {
-            DispatchCycleError::message(format!(
-                "clone isolated worker attempt checkout {}: {error}",
-                path.display()
-            ))
-        })?;
+        let output = dispatch::run_bounded_command_with_timeout(&mut command, clone_timeout).map_err(
+            |error| {
+                DispatchCycleError::message(format!(
+                    "clone isolated worker attempt checkout {}: {error}",
+                    path.display()
+                ))
+            },
+        )?;
         if !output.status.success() {
             return Err(DispatchCycleError::message(format!(
                 "clone isolated worker attempt checkout {} failed: {}",
@@ -958,17 +1028,26 @@ impl AttemptCheckout {
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
+        let Some(checkout_timeout) = deadline.remaining_at(clock.now()) else {
+            let _ = std::fs::remove_dir_all(&path);
+            return Err(DispatchCycleError::message(
+                "item or cycle deadline exhausted before isolated checkout",
+            ));
+        };
         let mut command = std::process::Command::new("git");
         command
             .arg("-C")
             .arg(&path)
             .args(["checkout", "--detach", before_head]);
-        let checkout = dispatch::run_bounded_command(&mut command).map_err(|error| {
-            DispatchCycleError::message(format!(
-                "checkout isolated worker base in {}: {error}",
-                path.display()
-            ))
-        })?;
+        let checkout =
+            dispatch::run_bounded_command_with_timeout(&mut command, checkout_timeout).map_err(
+            |error| {
+                DispatchCycleError::message(format!(
+                    "checkout isolated worker base in {}: {error}",
+                    path.display()
+                ))
+            },
+        )?;
         if !checkout.status.success() {
             let _ = std::fs::remove_dir_all(&path);
             return Err(DispatchCycleError::message(format!(
@@ -1319,6 +1398,7 @@ fn promote_attempt_commit<C: CommitProbe + ?Sized>(
     attempt_id: &str,
     worker_profile: &str,
     run_artifacts: &RunHandle,
+    deadline: ItemDeadline,
     options: &DispatchCycleOptions,
 ) -> std::result::Result<(), DispatchCycleError> {
     let current_head = commits
@@ -1340,6 +1420,13 @@ fn promote_attempt_commit<C: CommitProbe + ?Sized>(
         ));
     }
 
+    let fetch_timeout = deadline
+        .remaining_at(options.clock.now())
+        .ok_or_else(|| {
+            DispatchCycleError::message(
+                "item or cycle deadline exhausted before worker commit import",
+            )
+        })?;
     let mut command = std::process::Command::new("git");
     command
         .arg("-C")
@@ -1347,11 +1434,13 @@ fn promote_attempt_commit<C: CommitProbe + ?Sized>(
         .args(["fetch", "--no-tags", "--no-write-fetch-head"])
         .arg(attempt_repo)
         .arg(worker_commit);
-    let fetch = dispatch::run_bounded_command(&mut command).map_err(|error| {
-        DispatchCycleError::message(format!(
-            "import authenticated worker commit from isolated clone: {error}"
-        ))
-    })?;
+    let fetch = dispatch::run_bounded_command_with_timeout(&mut command, fetch_timeout).map_err(
+        |error| {
+            DispatchCycleError::message(format!(
+                "import authenticated worker commit from isolated clone: {error}"
+            ))
+        },
+    )?;
     if !fetch.status.success() {
         return Err(DispatchCycleError::message(format!(
             "import authenticated worker commit from isolated clone failed: {}",
@@ -1388,7 +1477,13 @@ fn promote_attempt_commit<C: CommitProbe + ?Sized>(
         .arg("-C")
         .arg(canonical_repo)
         .args(["merge", "--ff-only", "--no-edit", worker_commit]);
-    let merge = dispatch::run_bounded_command(&mut command).map_err(|error| error.to_string());
+    let merge = deadline
+        .remaining_at(options.clock.now())
+        .ok_or_else(|| "item or cycle deadline exhausted before promotion merge".to_string())
+        .and_then(|timeout| {
+            dispatch::run_bounded_command_with_timeout(&mut command, timeout)
+                .map_err(|error| error.to_string())
+        });
     let merge = if merge_outcome_is_unreadable(options) {
         Err("simulated unreadable promotion merge outcome".to_string())
     } else {
@@ -1654,6 +1749,7 @@ fn dispatch_one<
     ledger_path: &Path,
     cycle_id: &str,
     options: &DispatchCycleOptions,
+    deadline: ItemDeadline,
     live: &L,
     report_path: &Path,
     cycle_start: Instant,
@@ -1662,7 +1758,6 @@ fn dispatch_one<
     musterroll: &U,
     roster_snapshot: &RosterSnapshotInput,
 ) -> std::result::Result<DispatchOneResult, DispatchCycleError> {
-    let deadline = ItemDeadline::start(options.item_timeout);
     let repo_path = repo_path(cfg, &item.repo)?;
     let canonical_repo = std::fs::canonicalize(&repo_path)
         .map_err(|error| {
@@ -1751,6 +1846,7 @@ fn dispatch_one<
             ledger_path,
             cycle_id,
             options,
+            deadline,
             live,
             report_path,
             cycle_start,
@@ -1782,6 +1878,7 @@ fn dispatch_one<
             ledger_path,
             cycle_id,
             options,
+            deadline,
             live,
             report_path,
             cycle_start,
@@ -2836,6 +2933,7 @@ fn resume_finished_promoted_work<
     state_dir: &Path,
     cycle_id: &str,
     options: &DispatchCycleOptions,
+    deadline: ItemDeadline,
     live: &L,
     report_path: &Path,
     cycle_start: Instant,
@@ -3118,7 +3216,13 @@ fn resume_finished_promoted_work<
         preserve_claim_on_failure: true,
         defer_claim_release: true,
     };
-    let mechanical = match verify::run_mechanical(bd, exec, commits, &verify_request) {
+    let mechanical = match verify::run_mechanical_until(
+        bd,
+        exec,
+        commits,
+        &verify_request,
+        deadline.instant,
+    ) {
         Ok(mechanical) => mechanical,
         Err(error) => {
             return finish_promotion_recovery_failure(
@@ -3216,12 +3320,12 @@ fn resume_finished_promoted_work<
         item_tier_floor: extracted.routing.tier_floor,
     };
     let deferred_close = DeferredCloseBd { inner: bd };
-    let outcome = match verify::run_review_stage(
+    let outcome = match verify::run_review_stage_until(
         &deferred_close,
         exec,
         &verify_request,
         &review,
-        options.item_timeout,
+        deadline.instant,
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -3335,6 +3439,7 @@ fn resume_promoted_work<
     ledger_path: &Path,
     cycle_id: &str,
     options: &DispatchCycleOptions,
+    deadline: ItemDeadline,
     live: &L,
     report_path: &Path,
     cycle_start: Instant,
@@ -3363,6 +3468,7 @@ fn resume_promoted_work<
             state_dir,
             cycle_id,
             options,
+            deadline,
             live,
             report_path,
             cycle_start,
@@ -3421,7 +3527,7 @@ fn resume_promoted_work<
     run_artifacts
         .record_review_resume_budget(resume_budget)
         .map_err(run_artifact_error)?;
-    let deadline = ItemDeadline::start(resume_budget);
+    let deadline = deadline.capped_from(options.clock.now(), resume_budget);
     let mut promotion = read_promotion_record(run_artifacts.dir())?.ok_or_else(|| {
         DispatchCycleError::message("promoted worker run lost its promotion record")
     })?;
@@ -4234,6 +4340,7 @@ fn resume_pending_review<
     ledger_path: &Path,
     cycle_id: &str,
     options: &DispatchCycleOptions,
+    deadline: ItemDeadline,
     live: &L,
     report_path: &Path,
     cycle_start: Instant,
@@ -4356,7 +4463,7 @@ fn resume_pending_review<
     run_artifacts
         .record_review_resume_budget(resume_budget)
         .map_err(run_artifact_error)?;
-    let deadline = ItemDeadline::start(resume_budget);
+    let deadline = deadline.capped_from(options.clock.now(), resume_budget);
 
     patch_live(
         live,
@@ -4679,7 +4786,7 @@ where
                 | BudgetAction::StaticCaps => {}
             }
         }
-        let Some(worker_timeout) = deadline.remaining() else {
+        if deadline.remaining_at(options.clock.now()).is_none() {
             run_artifacts
                 .append_event(
                     EventKind::CoverageGap,
@@ -4690,13 +4797,16 @@ where
                 )
                 .map_err(run_artifact_error)?;
             return Ok(WorkerChainOutcome::Deferred {
-                summary: "item deadline exhausted before worker spawn".to_string(),
+                summary: "item or cycle deadline exhausted before worker spawn".to_string(),
                 attempts,
             });
-        };
+        }
 
-        attempts += 1;
-        let attempt_id = format!("{attempts:03}-{}", sanitize_artifact_piece(&roster.name));
+        let next_attempt = attempts.saturating_add(1);
+        let attempt_id = format!(
+            "{next_attempt:03}-{}",
+            sanitize_artifact_piece(&roster.name)
+        );
         let Some(base_head) = before_head else {
             return Err(DispatchCycleError::message(
                 "worker attempt isolation requires a repository with a born HEAD",
@@ -4713,17 +4823,9 @@ where
             run_artifacts.dir(),
             &attempt_id,
             before_head,
+            deadline,
+            &options.clock,
         )?;
-        run_artifacts
-            .append_event(
-                EventKind::AttemptStarted,
-                EventInput {
-                    profile_id: Some(roster.name.clone()),
-                    outcome: Some(format!("running:{attempt_id}")),
-                    ..EventInput::default()
-                },
-            )
-            .map_err(run_artifact_error)?;
         let prompt = render_worker_prompt(issue, attempt_checkout.path(), &fields.verify_cmd);
         let request = DispatchRequest {
             repo: attempt_checkout.path().to_path_buf(),
@@ -4744,6 +4846,32 @@ where
             attempt_identity: dispatch::attempt_commit_identity(),
             sandbox_profile: Some(attempt_checkout.sandbox_profile().to_path_buf()),
         };
+        let Some(worker_timeout) = deadline.remaining_at(options.clock.now()) else {
+            run_artifacts
+                .append_event(
+                    EventKind::CoverageGap,
+                    EventInput {
+                        outcome: Some("worker_budget_exhausted_before_spawn".to_string()),
+                        ..EventInput::default()
+                    },
+                )
+                .map_err(run_artifact_error)?;
+            return Ok(WorkerChainOutcome::Deferred {
+                summary: "item or cycle deadline exhausted before worker spawn".to_string(),
+                attempts,
+            });
+        };
+        attempts = next_attempt;
+        run_artifacts
+            .append_event(
+                EventKind::AttemptStarted,
+                EventInput {
+                    profile_id: Some(roster.name.clone()),
+                    outcome: Some(format!("running:{attempt_id}")),
+                    ..EventInput::default()
+                },
+            )
+            .map_err(run_artifact_error)?;
         let result = {
             // Reborrow the run handle for the duration of the worker so both
             // the one-shot spawn hook (which mutably records the worker group)
@@ -4851,6 +4979,7 @@ where
                 &attempt_id,
                 &roster.name,
                 run_artifacts,
+                deadline,
                 options,
             ) {
                 Ok(()) => {}
@@ -6816,6 +6945,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
@@ -7324,6 +7454,149 @@ mod tests {
         assert_eq!(fallback["dispatched"], 1);
         assert_eq!(fallback["verified"], 1);
         assert_eq!(fallback["failed"], 1);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the deterministic two-item fixture proves both the current spawn cap and next-item cutoff"
+    )]
+    fn cycle_budget_caps_current_worker_and_stops_before_next_item() {
+        struct ExhaustCycleExec {
+            clock: Arc<Mutex<Instant>>,
+            exhausted_at: Instant,
+            spawns: Rc<RefCell<usize>>,
+            waits: Rc<RefCell<Vec<Duration>>>,
+        }
+
+        struct ExhaustCycleChild {
+            clock: Arc<Mutex<Instant>>,
+            exhausted_at: Instant,
+            waits: Rc<RefCell<Vec<Duration>>>,
+        }
+
+        impl ChildProcess for ExhaustCycleChild {
+            fn wait_for(
+                &mut self,
+                timeout: Duration,
+            ) -> crate::dispatch::Result<Option<ProcessStatus>> {
+                self.waits.borrow_mut().push(timeout);
+                *self.clock.lock().expect("fake monotonic clock") = self.exhausted_at;
+                Ok(Some(ProcessStatus::code(1)))
+            }
+
+            fn terminate(&mut self) -> crate::dispatch::Result<()> {
+                Ok(())
+            }
+
+            fn kill(&mut self) -> crate::dispatch::Result<()> {
+                Ok(())
+            }
+
+            fn wait(&mut self) -> crate::dispatch::Result<ProcessStatus> {
+                Ok(ProcessStatus::code(1))
+            }
+        }
+
+        impl Exec for ExhaustCycleExec {
+            fn spawn(
+                &self,
+                request: &SpawnRequest,
+            ) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+                assert_eq!(
+                    request.argv.first().map(String::as_str),
+                    Some("pi"),
+                    "cycle exhaustion must happen during the first worker"
+                );
+                *self.spawns.borrow_mut() += 1;
+                std::fs::write(&request.stdout_path, b"worker failed\n")
+                    .expect("write worker stdout");
+                std::fs::write(&request.stderr_path, b"worker failed\n")
+                    .expect("write worker stderr");
+                Ok(Box::new(ExhaustCycleChild {
+                    clock: Arc::clone(&self.clock),
+                    exhausted_at: self.exhausted_at,
+                    waits: Rc::clone(&self.waits),
+                }))
+            }
+        }
+
+        let temp = TempDir::new("cycle-budget");
+        let first_repo = temp.path().join("first-repo");
+        let second_repo = temp.path().join("second-repo");
+        init_sandbox_repo_without_bd(&first_repo);
+        init_sandbox_repo_without_bd(&second_repo);
+        let mut cfg = config::parse_str(fixture_config(temp.path())).expect("config parses");
+        cfg.budgets.max_dispatches_per_cycle = 8;
+        cfg.roster[0].provider = "opencode-go".to_string();
+        cfg.budgets.use_musterroll = false;
+        cfg.review.enabled = false;
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger/model-bench.jsonl");
+        let cycle_id = "cycle-budget";
+        let first_issue = sandbox_issue();
+        let mut second_issue = sandbox_issue();
+        second_issue.id = "sandbox-2".to_string();
+        write_plan_with_items(
+            &state,
+            cycle_id,
+            &[
+                (&first_repo, "first-repo", &first_issue, "fake-worker"),
+                (&second_repo, "second-repo", &second_issue, "fake-worker"),
+            ],
+            &cfg.roster,
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let cycle_budget = Duration::from_secs(60);
+        let clock = Arc::new(Mutex::new(Instant::now()));
+        let cycle_started_at = *clock.lock().expect("fake monotonic clock");
+        let exhausted_at = cycle_started_at + cycle_budget;
+        let spawns = Rc::new(RefCell::new(0));
+        let waits = Rc::new(RefCell::new(Vec::new()));
+        let exec = ExhaustCycleExec {
+            clock: Arc::clone(&clock),
+            exhausted_at,
+            spawns: Rc::clone(&spawns),
+            waits: Rc::clone(&waits),
+        };
+        let clock_for_options = Arc::clone(&clock);
+        let options = DispatchCycleOptions::for_tests(Duration::from_secs(60))
+            .with_item_timeout(Duration::from_secs(120))
+            .with_cycle_timeout(cycle_budget)
+            .with_monotonic_clock(move || {
+                *clock_for_options.lock().expect("fake monotonic clock")
+            });
+        let bd = RecordingBdClient::new_with_issues([first_issue, second_issue]);
+
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &GitCommitProbe,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &options,
+            &RecordingLiveSink::new(true),
+            &FakeMusterrollClient::unavailable(),
+        )
+        .expect("cycle exhaustion is a normal bounded result");
+
+        assert_eq!(result.dispatched, 1);
+        assert_eq!(result.verified, 0);
+        assert_eq!(result.failed, 1);
+        assert_eq!(*spawns.borrow(), 1, "the second worker must not launch");
+        assert_eq!(
+            waits.borrow().as_slice(),
+            &[cycle_budget],
+            "the current worker receives the lesser cycle budget"
+        );
+        assert_eq!(bd.claim_count(), 1);
+        assert_eq!(bd.show(&second_repo, "sandbox-2").unwrap().status, "open");
     }
 
     #[test]
@@ -9304,6 +9577,182 @@ print("worker committed without its authenticated receipt")
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the finished-promotion fixture proves timeout escalation, durable failure evidence, and release ordering"
+    )]
+    fn finished_promotion_recovery_timeout_is_killed_and_persisted_before_claim_release() {
+        struct RecoveryTimeoutExec {
+            worker_spawns: RefCell<usize>,
+            verify_spawns: RefCell<usize>,
+            review_spawns: RefCell<usize>,
+            waits: Rc<RefCell<Vec<Duration>>>,
+            terminates: Rc<RefCell<usize>>,
+            kills: Rc<RefCell<usize>>,
+        }
+
+        struct RecoveryTimeoutChild {
+            waits: Rc<RefCell<Vec<Duration>>>,
+            terminates: Rc<RefCell<usize>>,
+            kills: Rc<RefCell<usize>>,
+        }
+
+        impl ChildProcess for RecoveryTimeoutChild {
+            fn wait_for(
+                &mut self,
+                timeout: Duration,
+            ) -> crate::dispatch::Result<Option<ProcessStatus>> {
+                self.waits.borrow_mut().push(timeout);
+                Ok(None)
+            }
+
+            fn terminate(&mut self) -> crate::dispatch::Result<()> {
+                *self.terminates.borrow_mut() += 1;
+                Ok(())
+            }
+
+            fn kill(&mut self) -> crate::dispatch::Result<()> {
+                *self.kills.borrow_mut() += 1;
+                Ok(())
+            }
+
+            fn wait(&mut self) -> crate::dispatch::Result<ProcessStatus> {
+                Ok(ProcessStatus::signal())
+            }
+        }
+
+        impl RecoveryTimeoutExec {
+            fn new() -> Self {
+                Self {
+                    worker_spawns: RefCell::new(0),
+                    verify_spawns: RefCell::new(0),
+                    review_spawns: RefCell::new(0),
+                    waits: Rc::new(RefCell::new(Vec::new())),
+                    terminates: Rc::new(RefCell::new(0)),
+                    kills: Rc::new(RefCell::new(0)),
+                }
+            }
+        }
+
+        impl Exec for RecoveryTimeoutExec {
+            fn spawn(
+                &self,
+                request: &SpawnRequest,
+            ) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+                if request.argv.iter().any(|arg| arg == "senior-reviewer") {
+                    *self.review_spawns.borrow_mut() += 1;
+                    panic!("timed-out recovery must not launch qualitative review");
+                }
+                if request.argv.first().map(String::as_str) == Some("pi") {
+                    *self.worker_spawns.borrow_mut() += 1;
+                    std::fs::write(&request.stderr_path, b"").expect("write worker stderr");
+                    std::fs::write(request.cwd.join("worker.txt"), b"promoted\n")
+                        .expect("write worker file");
+                    run_as_worker(request, &["add", "worker.txt"]);
+                    run_as_worker(
+                        request,
+                        &["commit", "-m", "worker: recovery timeout fixture"],
+                    );
+                    write_worker_stdout(request, "worker ran");
+                    return Ok(Box::new(FakeChild::delayed_success()));
+                }
+                if request.argv.first().map(String::as_str) == Some("sh") {
+                    let verify = *self.verify_spawns.borrow();
+                    *self.verify_spawns.borrow_mut() += 1;
+                    std::fs::write(&request.stdout_path, b"").expect("write verifier stdout");
+                    std::fs::write(&request.stderr_path, b"verifier did not finish\n")
+                        .expect("write verifier stderr");
+                    if verify == 0 {
+                        return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(1))));
+                    }
+                    return Ok(Box::new(RecoveryTimeoutChild {
+                        waits: Rc::clone(&self.waits),
+                        terminates: Rc::clone(&self.terminates),
+                        kills: Rc::clone(&self.kills),
+                    }));
+                }
+                panic!("unexpected recovery timeout spawn argv: {:?}", request.argv)
+            }
+        }
+
+        let fixture = ResumeFixture::new("promoted-recovery-timeout");
+        let exec = RecoveryTimeoutExec::new();
+        let initial = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect("initial promoted verifier failure is isolated to the item");
+        assert_eq!(initial.failed, 1);
+        let run_dir = fixture.pending_run_dir();
+        let run_id = run_dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("promoted run id");
+        let mut failed_run =
+            RunHandle::open(&fixture.state, run_id).expect("open failed promoted run");
+        failed_run
+            .finish("failed")
+            .expect("finish historical verifier failure");
+        fixture
+            .bd
+            .release(&fixture.repo, "sandbox-1")
+            .expect("release historical failed claim");
+        set_pending_review_owner(
+            &fixture.state,
+            spawn_dead_pid(),
+            Utc::now() - ChronoDuration::seconds(120),
+        );
+
+        let cycle_budget = Duration::from_secs(60);
+        let recovered = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1))
+                    .with_item_timeout(Duration::from_secs(120))
+                    .with_cycle_timeout(cycle_budget)
+                    .resume(),
+            )
+            .expect("timed-out recovery is durably failed and released");
+
+        assert_eq!(recovered.verified, 0);
+        assert_eq!(recovered.failed, 1);
+        assert_eq!(*exec.worker_spawns.borrow(), 1, "recovery cannot reimplement");
+        assert_eq!(*exec.verify_spawns.borrow(), 2);
+        assert_eq!(*exec.review_spawns.borrow(), 0);
+        assert_eq!(*exec.terminates.borrow(), 1);
+        assert_eq!(*exec.kills.borrow(), 1);
+        let waits = exec.waits.borrow();
+        assert_eq!(waits.len(), 2, "deadline timeout plus TERM grace wait");
+        assert!(
+            !waits[0].is_zero() && waits[0] <= cycle_budget,
+            "mechanical wait {:?} exceeded cycle budget {cycle_budget:?}",
+            waits[0]
+        );
+        drop(waits);
+        assert_eq!(
+            fixture.bd.release_count(),
+            2,
+            "terminal recovery evidence precedes exactly one recovery release"
+        );
+        assert_eq!(fixture.bd.close_count(), 0);
+        let recovered_issue = fixture.bd.show(&fixture.repo, "sandbox-1").unwrap();
+        assert_eq!(recovered_issue.status, "open");
+        assert_eq!(recovered_issue.assignee, None);
+        let recovery: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(run_dir.join("promotion-recovery.json"))
+                .expect("durable timeout recovery evidence"),
+        )
+        .expect("parse timeout recovery evidence");
+        assert_eq!(recovery["phase"], "failed");
+        assert!(
+            recovery["outcome"]
+                .as_str()
+                .is_some_and(|outcome| outcome.contains("timed out"))
+        );
+    }
+
+    #[test]
     fn promotion_receipt_head_mismatch_remains_exactly_discoverable() {
         let mut fixture = ResumeFixture::new("promotion-receipt-head-mismatch");
         fixture.cfg.review.enabled = false;
@@ -9827,12 +10276,29 @@ process.stdout.write("node worker complete\n");
             let run_dir = state.join("runs/test-run");
             std::fs::create_dir_all(&run_dir).expect("create sandbox run dir");
             let head = git(&repo, &["rev-parse", "HEAD"]);
-            let current =
-                AttemptCheckout::create(&repo, &state, &run_dir, "001-current", Some(head.trim()))
-                    .expect("create current isolated clone");
-            let later =
-                AttemptCheckout::create(&repo, &state, &run_dir, "002-later", Some(head.trim()))
-                    .expect("create later isolated clone");
+            let deadline =
+                ItemDeadline::start_at(Instant::now(), Duration::from_secs(30));
+            let clock = MonotonicClock::System;
+            let current = AttemptCheckout::create(
+                &repo,
+                &state,
+                &run_dir,
+                "001-current",
+                Some(head.trim()),
+                deadline,
+                &clock,
+            )
+            .expect("create current isolated clone");
+            let later = AttemptCheckout::create(
+                &repo,
+                &state,
+                &run_dir,
+                "002-later",
+                Some(head.trim()),
+                deadline,
+                &clock,
+            )
+            .expect("create later isolated clone");
             assert!(
                 run_has_durable_worker_isolation(&run_dir, &repo, &state),
                 "stale recovery must recognize the parent-authored isolation boundary"

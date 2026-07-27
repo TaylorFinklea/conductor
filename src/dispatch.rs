@@ -1644,6 +1644,22 @@ pub(crate) fn run_bounded_command(
     run_bounded_command_with_limits(command, None, HELPER_COMMAND_TIMEOUT, KILL_GRACE)
 }
 
+/// Runs a helper with the caller's already-sampled remaining monotonic budget.
+///
+/// A zero budget refuses the spawn; a live child receives only this timeout
+/// before TERM/KILL escalation.
+pub(crate) fn run_bounded_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> std::result::Result<Output, BoundedCommandError> {
+    if timeout.is_zero() {
+        return Err(BoundedCommandError::new(
+            BoundedCommandErrorKind::TimedOut(Duration::ZERO),
+        ));
+    }
+    run_bounded_command_with_limits(command, None, timeout, KILL_GRACE)
+}
+
 /// Runs a production helper command with file-backed stdin so input and output
 /// cannot deadlock on opposing pipe capacity.
 pub(crate) fn run_bounded_command_with_input(
