@@ -810,7 +810,7 @@ mod tests {
     fn spawn(command: &str) -> SpawnRequest {
         SpawnRequest {
             argv: vec![command.to_string()], cwd: PathBuf::from("."), env: Vec::new(), stdin: StdinMode::Null,
-            sandbox_profile: None, commit_receipt_socket: None, stdout_path: PathBuf::from("stdout"), stderr_path: PathBuf::from("stderr"),
+            sandbox_profile: None, worker_resource_limits: None, commit_receipt_socket: None, stdout_path: PathBuf::from("stdout"), stderr_path: PathBuf::from("stderr"),
         }
     }
 

@@ -13,7 +13,7 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::{Backend, ReasoningEffort};
+use crate::config::{Backend, Budgets, ReasoningEffort};
 
 const PI_THINKING: &str = "xhigh";
 const ATTEMPT_IDENTITY_NAME: &str = "Undertake Worker Attempt";
@@ -60,6 +60,56 @@ impl fmt::Display for DispatchError {
 
 impl std::error::Error for DispatchError {}
 
+const MIB: u64 = 1024 * 1024;
+
+/// Hard Unix limits installed by the trusted worker session wrapper before it
+/// changes session or executes backend-controlled code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkerResourceLimits {
+    cpu_seconds: u64,
+    process_headroom: u64,
+    address_space_headroom_bytes: u64,
+    file_size_bytes: u64,
+}
+
+impl WorkerResourceLimits {
+    pub(crate) fn new(
+        cpu_seconds: u64,
+        process_headroom: u64,
+        address_space_headroom_bytes: u64,
+        file_size_bytes: u64,
+    ) -> Result<Self> {
+        if [
+            cpu_seconds,
+            process_headroom,
+            address_space_headroom_bytes,
+            file_size_bytes,
+        ]
+        .contains(&0)
+        {
+            return Err(DispatchError::new(
+                "worker resource limits must all be greater than zero",
+            ));
+        }
+        Ok(Self {
+            cpu_seconds,
+            process_headroom,
+            address_space_headroom_bytes,
+            file_size_bytes,
+        })
+    }
+
+    pub(crate) fn from_budgets(budgets: &Budgets) -> Self {
+        Self {
+            cpu_seconds: u64::from(budgets.worker_cpu_seconds),
+            process_headroom: u64::from(budgets.worker_process_headroom),
+            address_space_headroom_bytes:
+                u64::from(budgets.worker_address_space_headroom_mib) * MIB,
+            file_size_bytes: u64::from(budgets.worker_file_size_mib) * MIB,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DispatchRequest {
     pub(crate) repo: PathBuf,
@@ -77,6 +127,9 @@ pub(crate) struct DispatchRequest {
     /// Parent-authored Seatbelt profile which confines this worker and all of
     /// its descendants to the current isolated checkout.
     pub(crate) sandbox_profile: Option<PathBuf>,
+    /// Parent-created scratch root allowed by the profile for this attempt.
+    pub(crate) worker_runtime_dir: Option<PathBuf>,
+    pub(crate) worker_resource_limits: WorkerResourceLimits,
 }
 
 /// Mints a unique audit identity for a single worker attempt's Git metadata.
@@ -182,6 +235,7 @@ pub(crate) struct SpawnRequest {
     pub(crate) env: Vec<(String, String)>,
     pub(crate) stdin: StdinMode,
     pub(crate) sandbox_profile: Option<PathBuf>,
+    pub(crate) worker_resource_limits: Option<WorkerResourceLimits>,
     pub(crate) commit_receipt_socket: Option<PathBuf>,
     pub(crate) stdout_path: PathBuf,
     pub(crate) stderr_path: PathBuf,
@@ -472,6 +526,10 @@ where
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "spawn construction is a linear fail-closed assembly of argv, audit paths, and controls"
+)]
 fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnRequest> {
     let log_dir = state_dir.join("logs").join(&request.cycle_id);
     fs::create_dir_all(&log_dir).map_err(|e| {
@@ -523,46 +581,92 @@ fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnReq
     }
     let receipt_socket = commit_receipt_socket_path(&request.attempt_identity);
     let hook_dir = prepare_authenticated_commit_hook(state_dir, &request.attempt_identity)?;
+    if request.sandbox_profile.is_some() && request.worker_runtime_dir.is_none() {
+        return Err(DispatchError::new(
+            "worker sandbox mutation containment requires a per-attempt runtime directory",
+        ));
+    }
+    // Git identity remains useful audit evidence. The socket receipt is the
+    // authority: its peer pid is authenticated by the kernel.
+    let mut env = vec![
+        (
+            "GIT_AUTHOR_NAME".to_string(),
+            ATTEMPT_IDENTITY_NAME.to_string(),
+        ),
+        (
+            "GIT_AUTHOR_EMAIL".to_string(),
+            request.attempt_identity.clone(),
+        ),
+        (
+            "GIT_COMMITTER_NAME".to_string(),
+            ATTEMPT_IDENTITY_NAME.to_string(),
+        ),
+        (
+            "GIT_COMMITTER_EMAIL".to_string(),
+            request.attempt_identity.clone(),
+        ),
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        ("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string()),
+        (
+            "GIT_CONFIG_VALUE_0".to_string(),
+            hook_dir.display().to_string(),
+        ),
+        (
+            "UNDERTAKE_COMMIT_RECEIPT_SOCKET".to_string(),
+            receipt_socket.display().to_string(),
+        ),
+    ];
+    if let Some(runtime) = &request.worker_runtime_dir {
+        let runtime = fs::canonicalize(runtime).map_err(|error| {
+            DispatchError::new(format!(
+                "canonicalize per-attempt worker runtime {}: {error}",
+                runtime.display()
+            ))
+        })?;
+        let tmp = canonical_worker_runtime_child(&runtime, "tmp")?;
+        let cache = canonical_worker_runtime_child(&runtime, "cache")?;
+        let config = canonical_worker_runtime_child(&runtime, "config")?;
+        let data = canonical_worker_runtime_child(&runtime, "data")?;
+        let state = canonical_worker_runtime_child(&runtime, "state")?;
+        let tmp = tmp.display().to_string();
+        env.extend([
+            ("TMPDIR".to_string(), tmp.clone()),
+            ("TMP".to_string(), tmp.clone()),
+            ("TEMP".to_string(), tmp),
+            ("XDG_CACHE_HOME".to_string(), cache.display().to_string()),
+            ("XDG_CONFIG_HOME".to_string(), config.display().to_string()),
+            ("XDG_DATA_HOME".to_string(), data.display().to_string()),
+            ("XDG_STATE_HOME".to_string(), state.display().to_string()),
+        ]);
+    }
 
     Ok(SpawnRequest {
         argv,
         cwd: request.repo.clone(),
-        // Git identity remains useful audit evidence. The socket receipt is
-        // the authority: its peer pid is authenticated by the kernel.
-        env: vec![
-            (
-                "GIT_AUTHOR_NAME".to_string(),
-                ATTEMPT_IDENTITY_NAME.to_string(),
-            ),
-            (
-                "GIT_AUTHOR_EMAIL".to_string(),
-                request.attempt_identity.clone(),
-            ),
-            (
-                "GIT_COMMITTER_NAME".to_string(),
-                ATTEMPT_IDENTITY_NAME.to_string(),
-            ),
-            (
-                "GIT_COMMITTER_EMAIL".to_string(),
-                request.attempt_identity.clone(),
-            ),
-            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
-            ("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string()),
-            (
-                "GIT_CONFIG_VALUE_0".to_string(),
-                hook_dir.display().to_string(),
-            ),
-            (
-                "UNDERTAKE_COMMIT_RECEIPT_SOCKET".to_string(),
-                receipt_socket.display().to_string(),
-            ),
-        ],
+        env,
         stdin: StdinMode::Null,
         sandbox_profile: request.sandbox_profile.clone(),
+        worker_resource_limits: Some(request.worker_resource_limits),
         commit_receipt_socket: Some(receipt_socket),
         stdout_path,
         stderr_path,
     })
+}
+
+fn canonical_worker_runtime_child(runtime: &Path, name: &str) -> Result<PathBuf> {
+    let child = fs::canonicalize(runtime.join(name)).map_err(|error| {
+        DispatchError::new(format!(
+            "canonicalize worker runtime {name} under {}: {error}",
+            runtime.display()
+        ))
+    })?;
+    if !child.starts_with(runtime) {
+        return Err(DispatchError::new(format!(
+            "worker runtime {name} escapes {}",
+            runtime.display()
+        )));
+    }
+    Ok(child)
 }
 
 pub(crate) fn argv_for_backend(
@@ -1982,8 +2086,18 @@ fn helper_output(
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CommandExec;
 
-const WORKER_SESSION_WRAPPER: &str =
-    "import os, sys; os.setsid(); os.execvpe(sys.argv[1], sys.argv[1:], os.environ)";
+const WORKER_SESSION_WRAPPER: &str = r"import os, resource, sys
+limits = (
+    (resource.RLIMIT_CPU, int(sys.argv[1])),
+    (resource.RLIMIT_NPROC, int(sys.argv[2])),
+    (resource.RLIMIT_AS, int(sys.argv[3])),
+    (resource.RLIMIT_FSIZE, int(sys.argv[4])),
+)
+for resource_id, value in limits:
+    resource.setrlimit(resource_id, (value, value))
+os.setsid()
+os.execvpe(sys.argv[5], sys.argv[5:], os.environ)
+";
 
 impl Exec for CommandExec {
     fn spawn(&self, request: &SpawnRequest) -> Result<Box<dyn ChildProcess>> {
@@ -2005,28 +2119,28 @@ impl Exec for CommandExec {
                 request.stderr_path.display()
             ))
         })?;
-        let session_isolation = request.commit_receipt_socket.is_some();
-        let (target_program, target_args) = if session_isolation {
-            let mut session_args = vec![
-                "-c".to_string(),
-                WORKER_SESSION_WRAPPER.to_string(),
-                program.clone(),
-            ];
-            session_args.extend(args.iter().cloned());
-            ("/usr/bin/python3", session_args)
-        } else {
-            (program.as_str(), args.to_vec())
-        };
+        if (request.commit_receipt_socket.is_some() || request.sandbox_profile.is_some())
+            && request.worker_resource_limits.is_none()
+        {
+            return Err(DispatchError::new(
+                "worker isolation requires inherited resource limits before payload exec",
+            ));
+        }
+        let session_isolation = request.worker_resource_limits.is_some();
+        let (target_program, target_args) = request.worker_resource_limits.map_or_else(
+            || Ok((program.clone(), args.to_vec())),
+            |limits| worker_session_command(program, args, limits),
+        )?;
         let mut command = if let Some(profile) = &request.sandbox_profile {
             let mut command = Command::new("/usr/bin/sandbox-exec");
             command
                 .arg("-f")
                 .arg(profile)
-                .arg(target_program)
+                .arg(&target_program)
                 .args(&target_args);
             command
         } else {
-            let mut command = Command::new(target_program);
+            let mut command = Command::new(&target_program);
             command.args(&target_args);
             command
         };
@@ -2063,6 +2177,80 @@ impl Exec for CommandExec {
             receipt_broker,
         }))
     }
+}
+
+#[cfg(unix)]
+fn worker_session_command(
+    program: &str,
+    args: &[String],
+    limits: WorkerResourceLimits,
+) -> Result<(String, Vec<String>)> {
+    let (same_user_processes, launcher_virtual_memory) = current_process_resource_baseline()?;
+    let process_limit = same_user_processes
+        .checked_add(limits.process_headroom)
+        .ok_or_else(|| DispatchError::new("worker RLIMIT_NPROC overflow"))?;
+    // Darwin maps a several-hundred-GiB shared region into every modern
+    // process. RLIMIT_AS therefore has to cap growth above the trusted
+    // launcher's existing mapping rather than use a small absolute value.
+    let address_space_limit = launcher_virtual_memory
+        .checked_add(limits.address_space_headroom_bytes)
+        .ok_or_else(|| DispatchError::new("worker RLIMIT_AS headroom overflow"))?;
+    let mut session_args = Vec::with_capacity(args.len() + 7);
+    session_args.extend([
+        "-c".to_string(),
+        WORKER_SESSION_WRAPPER.to_string(),
+        limits.cpu_seconds.to_string(),
+        process_limit.to_string(),
+        address_space_limit.to_string(),
+        limits.file_size_bytes.to_string(),
+        program.to_string(),
+    ]);
+    session_args.extend(args.iter().cloned());
+    Ok(("/usr/bin/python3".to_string(), session_args))
+}
+
+#[cfg(unix)]
+fn current_process_resource_baseline() -> Result<(u64, u64)> {
+    use sysinfo::System;
+
+    let system = System::new_all();
+    let current_pid = sysinfo::get_current_pid()
+        .map_err(|error| DispatchError::new(format!("inspect worker launcher pid: {error}")))?;
+    let current_process = system
+        .process(current_pid)
+        .ok_or_else(|| DispatchError::new("inspect worker launcher process"))?;
+    let current_user = current_process
+        .user_id()
+        .ok_or_else(|| DispatchError::new("inspect worker launcher user id"))?;
+    let virtual_memory = current_process.virtual_memory();
+    if virtual_memory == 0 {
+        return Err(DispatchError::new(
+            "inspect worker launcher virtual memory for RLIMIT_AS",
+        ));
+    }
+    // Missing ownership metadata can only undercount, which lowers the hard
+    // limit and refuses forks rather than granting extra authority.
+    let count = system
+        .processes()
+        .values()
+        .filter(|process| process.user_id() == Some(current_user))
+        .count();
+    let count = u64::try_from(count)
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(|| DispatchError::new("count same-user processes for RLIMIT_NPROC"))?;
+    Ok((count, virtual_memory))
+}
+
+#[cfg(not(unix))]
+fn worker_session_command(
+    _program: &str,
+    _args: &[String],
+    _limits: WorkerResourceLimits,
+) -> Result<(String, Vec<String>)> {
+    Err(DispatchError::new(
+        "worker resource and session controls are unsupported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -2510,6 +2698,53 @@ mod tests {
     }
 
     #[test]
+    fn spawn_request_routes_worker_mutable_runtime_to_per_attempt_directory() {
+        let temp = TempDir::new("worker-runtime-env");
+        let repo = temp.path().join("repo");
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        std::fs::create_dir_all(runtime.join("tmp")).expect("mkdir worker tmp");
+        std::fs::create_dir_all(runtime.join("cache")).expect("mkdir worker cache");
+        std::fs::create_dir_all(runtime.join("config")).expect("mkdir worker config");
+        std::fs::create_dir_all(runtime.join("data")).expect("mkdir worker data");
+        std::fs::create_dir_all(runtime.join("state")).expect("mkdir worker state");
+        let runtime = std::fs::canonicalize(runtime).expect("canonical worker runtime");
+        let mut request = request(
+            &repo,
+            Backend::Pi,
+            "opencode-go/glm-5.2",
+            Some(BEFORE_COMMIT),
+        );
+        request.worker_runtime_dir = Some(runtime.clone());
+
+        let spawn = spawn_request(&request, temp.path()).expect("build worker spawn");
+        let env = spawn
+            .env
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(env["TMPDIR"], runtime.join("tmp").display().to_string());
+        assert_eq!(
+            env["XDG_CACHE_HOME"],
+            runtime.join("cache").display().to_string()
+        );
+        assert_eq!(
+            env["XDG_CONFIG_HOME"],
+            runtime.join("config").display().to_string()
+        );
+        assert_eq!(
+            env["XDG_DATA_HOME"],
+            runtime.join("data").display().to_string()
+        );
+        assert_eq!(
+            env["XDG_STATE_HOME"],
+            runtime.join("state").display().to_string()
+        );
+        assert_eq!(env["TMP"], env["TMPDIR"]);
+        assert_eq!(env["TEMP"], env["TMPDIR"]);
+    }
+
+    #[test]
     fn codex_backend_uses_per_run_reasoning_override() {
         let temp = TempDir::new("codex-argv");
         let repo = temp.path().join("repo");
@@ -2519,6 +2754,7 @@ mod tests {
         let mut request = request(&repo, Backend::Codex, "gpt-5.6-sol", Some(BEFORE_COMMIT));
         request.reasoning_effort = Some(ReasoningEffort::Max);
         request.sandbox_profile = Some(repo.join("worker.sb"));
+        request.worker_runtime_dir = Some(test_worker_runtime(temp.path()));
 
         run(
             &exec,
@@ -2633,6 +2869,7 @@ mod tests {
             Some(BEFORE_COMMIT),
         );
         request.sandbox_profile = Some(repo.join("worker.sb"));
+        request.worker_runtime_dir = Some(test_worker_runtime(temp.path()));
 
         run(
             &exec,
@@ -3216,6 +3453,25 @@ mod tests {
     const PROMPT: &str = "work on the bead";
     const TEST_ATTEMPT_IDENTITY: &str = "undertake-attempt-test@invalid";
 
+    fn test_worker_resource_limits() -> WorkerResourceLimits {
+        WorkerResourceLimits::new(
+            900,
+            64,
+            32 * 1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+        )
+        .expect("valid test worker limits")
+    }
+
+    fn test_worker_runtime(root: &Path) -> PathBuf {
+        let runtime = root.join("worker-runtime");
+        for child in ["tmp", "cache", "config", "data", "state"] {
+            std::fs::create_dir_all(runtime.join(child))
+                .expect("create worker runtime child");
+        }
+        std::fs::canonicalize(runtime).expect("canonical worker runtime")
+    }
+
     fn request(
         repo: &Path,
         backend: Backend,
@@ -3234,6 +3490,8 @@ mod tests {
             prompt: PROMPT.to_string(),
             attempt_identity: TEST_ATTEMPT_IDENTITY.to_string(),
             sandbox_profile: None,
+            worker_runtime_dir: None,
+            worker_resource_limits: test_worker_resource_limits(),
         }
     }
 
@@ -3676,6 +3934,186 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn authenticated_worker_without_resource_limits_is_rejected_before_payload_exec() {
+        let temp = TempDir::new("missing-worker-resource-limits");
+        let marker = temp.path().join("payload-ran");
+        let request = SpawnRequest {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("printf ran > {}", marker.display()),
+            ],
+            cwd: temp.path().to_path_buf(),
+            env: Vec::new(),
+            stdin: StdinMode::Null,
+            sandbox_profile: None,
+            worker_resource_limits: None,
+            commit_receipt_socket: Some(commit_receipt_socket_path(&attempt_commit_identity())),
+            stdout_path: temp.path().join("out.log"),
+            stderr_path: temp.path().join("err.log"),
+        };
+
+        let Err(error) = CommandExec.spawn(&request) else {
+            panic!("authenticated worker must not start without resource controls");
+        };
+
+        assert!(error.to_string().contains("resource limits"));
+        assert!(!marker.exists(), "rejected worker payload must not execute");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn worker_session_installs_hard_resource_limits_before_exec() {
+        let temp = TempDir::new("worker-resource-limits");
+        let stdout = temp.path().join("out.log");
+        let stderr = temp.path().join("err.log");
+        let limits = WorkerResourceLimits::new(
+            7,
+            8,
+            32 * 1024 * 1024 * 1024,
+            16 * 1024 * 1024,
+        )
+        .expect("valid test limits");
+        let script = r#"
+import errno, json, mmap, os, resource, subprocess
+address_limit = resource.getrlimit(resource.RLIMIT_AS)
+virtual_bytes = int(subprocess.check_output(
+    ["/bin/ps", "-o", "vsz=", "-p", str(os.getpid())],
+    text=True,
+).strip()) * 1024
+probe_bytes = address_limit[0] - virtual_bytes + 64 * 1024 * 1024
+allocation_errno = None
+try:
+    mmap.mmap(-1, probe_bytes)
+except (OSError, MemoryError) as error:
+    allocation_errno = getattr(error, "errno", errno.ENOMEM)
+print(json.dumps({
+    "cpu": resource.getrlimit(resource.RLIMIT_CPU),
+    "nproc": resource.getrlimit(resource.RLIMIT_NPROC),
+    "as": address_limit,
+    "fsize": resource.getrlimit(resource.RLIMIT_FSIZE),
+    "allocation_errno": allocation_errno,
+}))
+"#;
+        let request = SpawnRequest {
+            argv: vec![
+                "/usr/bin/python3".to_string(),
+                "-c".to_string(),
+                script.to_string(),
+            ],
+            cwd: temp.path().to_path_buf(),
+            env: Vec::new(),
+            stdin: StdinMode::Null,
+            sandbox_profile: None,
+            worker_resource_limits: Some(limits),
+            commit_receipt_socket: Some(commit_receipt_socket_path(&attempt_commit_identity())),
+            stdout_path: stdout.clone(),
+            stderr_path: stderr.clone(),
+        };
+
+        let mut child = CommandExec.spawn(&request).expect("spawn limited worker");
+        let status = child.wait().expect("wait limited worker");
+        assert!(
+            status.success(),
+            "limited worker failed before payload exec: {}",
+            std::fs::read_to_string(stderr).expect("read worker stderr")
+        );
+        let observed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(stdout).expect("read limits"))
+                .expect("parse limits");
+
+        assert_eq!(observed["cpu"], serde_json::json!([7, 7]));
+        assert_eq!(observed["as"][0], observed["as"][1]);
+        let address_limit = observed["as"][0].as_u64().expect("finite RLIMIT_AS");
+        assert_ne!(address_limit, i64::MAX as u64);
+        assert!(address_limit > 32_u64 * 1024 * 1024 * 1024);
+        assert_eq!(observed["allocation_errno"], serde_json::json!(libc::ENOMEM));
+        assert_eq!(
+            observed["fsize"],
+            serde_json::json!([16_777_216_u64, 16_777_216_u64])
+        );
+        assert_eq!(observed["nproc"][0], observed["nproc"][1]);
+        assert!(
+            observed["nproc"][0].as_u64().is_some_and(|value| value > 8),
+            "RLIMIT_NPROC must include the sampled same-UID baseline plus headroom: {observed}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn worker_process_limit_bounds_setsid_fork_exhaustion() {
+        let temp = TempDir::new("worker-fork-limit");
+        let stdout = temp.path().join("out.log");
+        let limits = WorkerResourceLimits::new(
+            30,
+            8,
+            32 * 1024 * 1024 * 1024,
+            16 * 1024 * 1024,
+        )
+        .expect("valid test limits");
+        let script = r#"
+import errno, json, os, signal, time
+children = []
+failure = None
+try:
+    for _ in range(512):
+        pid = os.fork()
+        if pid == 0:
+            os.setsid()
+            time.sleep(30)
+            os._exit(0)
+        children.append(pid)
+except OSError as error:
+    failure = error.errno
+finally:
+    for pid in children:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    for pid in children:
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+print(json.dumps({"children": len(children), "errno": failure}))
+raise SystemExit(0 if failure == errno.EAGAIN and len(children) < 512 else 1)
+"#;
+        let request = SpawnRequest {
+            argv: vec![
+                "/usr/bin/python3".to_string(),
+                "-c".to_string(),
+                script.to_string(),
+            ],
+            cwd: temp.path().to_path_buf(),
+            env: Vec::new(),
+            stdin: StdinMode::Null,
+            sandbox_profile: None,
+            worker_resource_limits: Some(limits),
+            commit_receipt_socket: Some(commit_receipt_socket_path(&attempt_commit_identity())),
+            stdout_path: stdout.clone(),
+            stderr_path: temp.path().join("err.log"),
+        };
+
+        let mut child = CommandExec.spawn(&request).expect("spawn fork probe");
+        let status = child.wait().expect("wait fork probe");
+        let observed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(stdout).expect("read fork result"))
+                .expect("parse fork result");
+
+        assert!(
+            status.success(),
+            "setsid descendants must retain the inherited process ceiling: {observed}"
+        );
+        assert_eq!(
+            observed["errno"],
+            serde_json::json!(libc::EAGAIN),
+            "fork must stop at RLIMIT_NPROC: {observed}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn command_exec_kill_terminates_descendant_processes_in_the_group() {
         // A worker CLI can fork children of its own (subshells, tool
         // invocations); if the timeout path only kills the direct child, a
@@ -3696,6 +4134,7 @@ mod tests {
             env: Vec::new(),
             stdin: StdinMode::Null,
             sandbox_profile: None,
+            worker_resource_limits: None,
             commit_receipt_socket: None,
             stdout_path: temp.path().join("out.log"),
             stderr_path: temp.path().join("err.log"),

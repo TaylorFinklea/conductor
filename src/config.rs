@@ -344,6 +344,10 @@ pub(crate) struct Budgets {
     pub(crate) use_musterroll: bool,
     pub(crate) unknown_429_cooldown_mins: u32,
     pub(crate) item_wall_clock_mins: u32,
+    pub(crate) worker_cpu_seconds: u32,
+    pub(crate) worker_process_headroom: u32,
+    pub(crate) worker_address_space_headroom_mib: u32,
+    pub(crate) worker_file_size_mib: u32,
     /// Upper bound for plan peer-requested revisions; the CLI may choose a
     /// lower value but can never widen this configured hard limit.
     pub(crate) max_plan_revisions: u8,
@@ -370,6 +374,10 @@ impl Default for Budgets {
             use_musterroll: true,
             unknown_429_cooldown_mins: 15,
             item_wall_clock_mins: 45,
+            worker_cpu_seconds: 900,
+            worker_process_headroom: 64,
+            worker_address_space_headroom_mib: 32 * 1024,
+            worker_file_size_mib: 1024,
             max_plan_revisions: 1,
             review_resume_budget_mins: None,
             cycle_wall_clock_mins: 90,
@@ -1099,6 +1107,22 @@ fn parse_budgets(node: Option<&Node>) -> Result<Budgets> {
             "item_wall_clock_mins" => {
                 b.item_wall_clock_mins = expect_u32("budgets.item_wall_clock_mins", val)?;
             }
+            "worker_cpu_seconds" => {
+                b.worker_cpu_seconds =
+                    bounded_worker_limit(key, val, 1, 3600)?;
+            }
+            "worker_process_headroom" => {
+                b.worker_process_headroom =
+                    bounded_worker_limit(key, val, 1, 256)?;
+            }
+            "worker_address_space_headroom_mib" => {
+                b.worker_address_space_headroom_mib =
+                    bounded_worker_limit(key, val, 512, 32 * 1024)?;
+            }
+            "worker_file_size_mib" => {
+                b.worker_file_size_mib =
+                    bounded_worker_limit(key, val, 1, 4096)?;
+            }
             "max_plan_revisions" => {
                 let value = expect_u32("budgets.max_plan_revisions", val)?;
                 b.max_plan_revisions = u8::try_from(value)
@@ -1129,6 +1153,17 @@ fn parse_budgets(node: Option<&Node>) -> Result<Budgets> {
         }
     }
     Ok(b)
+}
+
+fn bounded_worker_limit(key: &str, node: &Node, minimum: u32, maximum: u32) -> Result<u32> {
+    let location = format!("budgets.{key}");
+    let value = expect_u32(&location, node)?;
+    if !(minimum..=maximum).contains(&value) {
+        return Err(ConfigError::new(format!(
+            "{location} must be in {minimum}..={maximum}"
+        )));
+    }
+    Ok(value)
 }
 
 fn parse_verify(node: Option<&Node>) -> Result<VerifyConfig> {
@@ -2255,6 +2290,57 @@ dispatch_id = \"claude-sonnet-5\"
         assert_eq!(cfg.ratchet.clean_cycles_to_unlock, 3);
         assert_eq!(cfg.roster.len(), 1);
     }
+    #[test]
+    fn worker_resource_limits_parse_with_bounded_defaults_and_overrides() {
+        let defaults = parse_str("").expect("default config");
+        assert_eq!(
+            (
+                defaults.budgets.worker_cpu_seconds,
+                defaults.budgets.worker_process_headroom,
+                defaults.budgets.worker_address_space_headroom_mib,
+                defaults.budgets.worker_file_size_mib,
+            ),
+            (900, 64, 32 * 1024, 1024)
+        );
+
+        let configured = parse_str(
+            "[budgets]\n\
+             worker_cpu_seconds = 600\n\
+             worker_process_headroom = 32\n\
+             worker_address_space_headroom_mib = 16384\n\
+             worker_file_size_mib = 512\n",
+        )
+        .expect("bounded worker resource overrides");
+        assert_eq!(
+            (
+                configured.budgets.worker_cpu_seconds,
+                configured.budgets.worker_process_headroom,
+                configured.budgets.worker_address_space_headroom_mib,
+                configured.budgets.worker_file_size_mib,
+            ),
+            (600, 32, 16_384, 512)
+        );
+    }
+
+    #[test]
+    fn worker_resource_limits_reject_zero_or_policy_bypass_values() {
+        for source in [
+            "[budgets]\nworker_cpu_seconds = 0\n",
+            "[budgets]\nworker_cpu_seconds = 3601\n",
+            "[budgets]\nworker_process_headroom = 0\n",
+            "[budgets]\nworker_process_headroom = 257\n",
+            "[budgets]\nworker_address_space_headroom_mib = 511\n",
+            "[budgets]\nworker_address_space_headroom_mib = 32769\n",
+            "[budgets]\nworker_file_size_mib = 0\n",
+            "[budgets]\nworker_file_size_mib = 4097\n",
+        ] {
+            assert!(
+                parse_str(source).is_err(),
+                "unsafe worker limit unexpectedly parsed: {source}"
+            );
+        }
+    }
+
 
     #[test]
     fn empty_input_is_a_valid_empty_roster() {

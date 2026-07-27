@@ -726,6 +726,7 @@ fn spawn_request(request: &VerifyRequest, suffix: &str, argv: Vec<String>) -> Re
         env: Vec::new(),
         stdin: StdinMode::Null,
         sandbox_profile: None,
+        worker_resource_limits: None,
         commit_receipt_socket: None,
         stdout_path,
         stderr_path,

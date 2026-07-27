@@ -3,8 +3,8 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
-use std::fmt;
-use std::io::Write;
+use std::fmt::{self, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -747,6 +747,7 @@ enum WorkerChainOutcome {
 struct AttemptCheckout {
     path: PathBuf,
     sandbox_profile: PathBuf,
+    runtime_path: PathBuf,
     active: bool,
 }
 
@@ -981,11 +982,17 @@ fn read_promotion_recovery_record(
 }
 
 impl AttemptCheckout {
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "checkout, runtime, profile, and recovery record form one linear fail-closed transaction"
+    )]
     fn create(
         canonical_repo: &Path,
         state_dir: &Path,
         run_dir: &Path,
         attempt_id: &str,
+        backend: Backend,
         before_head: Option<&str>,
         deadline: ItemDeadline,
         clock: &MonotonicClock,
@@ -1056,22 +1063,48 @@ impl AttemptCheckout {
                 String::from_utf8_lossy(&checkout.stderr).trim()
             )));
         }
+        let runtime_path = run_dir.join("worker-runtime").join(attempt_id);
+        for child in ["tmp", "cache", "config", "data", "state"] {
+            let child = runtime_path.join(child);
+            if let Err(error) = std::fs::create_dir_all(&child) {
+                let _ = std::fs::remove_dir_all(&path);
+                let _ = std::fs::remove_dir_all(&runtime_path);
+                return Err(DispatchCycleError::message(format!(
+                    "create per-attempt worker runtime {}: {error}",
+                    child.display()
+                )));
+            }
+        }
+        let runtime_path = match std::fs::canonicalize(&runtime_path) {
+            Ok(runtime_path) => runtime_path,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&path);
+                let _ = std::fs::remove_dir_all(&runtime_path);
+                return Err(DispatchCycleError::message(format!(
+                    "canonicalize per-attempt worker runtime: {error}"
+                )));
+            }
+        };
         let sandbox_profile = match write_worker_sandbox_profile(
             canonical_repo,
             state_dir,
             run_dir,
             &path,
+            &runtime_path,
+            backend,
             attempt_id,
         ) {
             Ok(profile) => profile,
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&path);
+                let _ = std::fs::remove_dir_all(&runtime_path);
                 return Err(error);
             }
         };
         Ok(Self {
             path,
             sandbox_profile,
+            runtime_path,
             active: true,
         })
     }
@@ -1084,6 +1117,10 @@ impl AttemptCheckout {
         &self.sandbox_profile
     }
 
+    fn runtime_path(&self) -> &Path {
+        &self.runtime_path
+    }
+
     fn cleanup(&mut self) -> std::result::Result<(), DispatchCycleError> {
         if !self.active {
             return Ok(());
@@ -1092,6 +1129,12 @@ impl AttemptCheckout {
             DispatchCycleError::message(format!(
                 "remove isolated worker attempt checkout {}: {error}",
                 self.path.display()
+            ))
+        })?;
+        std::fs::remove_dir_all(&self.runtime_path).map_err(|error| {
+            DispatchCycleError::message(format!(
+                "remove per-attempt worker runtime {}: {error}",
+                self.runtime_path.display()
             ))
         })?;
         self.active = false;
@@ -1107,19 +1150,18 @@ impl Drop for AttemptCheckout {
     fn drop(&mut self) {
         if self.active {
             let _ = std::fs::remove_dir_all(&self.path);
+            let _ = std::fs::remove_dir_all(&self.runtime_path);
         }
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "profile and its fsynced recovery record are one crash-consistency transaction"
-)]
 fn write_worker_sandbox_profile(
     canonical_repo: &Path,
     state_dir: &Path,
     run_dir: &Path,
     attempt_path: &Path,
+    runtime_path: &Path,
+    backend: Backend,
     attempt_id: &str,
 ) -> std::result::Result<PathBuf, DispatchCycleError> {
     let canonical_repo = std::fs::canonicalize(canonical_repo).map_err(|error| {
@@ -1135,6 +1177,11 @@ fn write_worker_sandbox_profile(
             "canonicalize isolated attempt for sandbox: {error}"
         ))
     })?;
+    let runtime_path = std::fs::canonicalize(runtime_path).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "canonicalize per-attempt worker runtime for sandbox: {error}"
+        ))
+    })?;
     let profile_dir = run_dir.join("worker-sandboxes");
     std::fs::create_dir_all(&profile_dir).map_err(|error| {
         DispatchCycleError::message(format!(
@@ -1143,16 +1190,7 @@ fn write_worker_sandbox_profile(
         ))
     })?;
     let profile_path = profile_dir.join(format!("{attempt_id}.sb"));
-    let profile = format!(
-        "(version 1)\n(allow default)\n\
-         (deny file-link)\n\
-         (deny file-write* (subpath \"{}\"))\n\
-         (deny file-write* (subpath \"{}\"))\n\
-         (allow file-write* (subpath \"{}\"))\n",
-        sandbox_string(&canonical_repo),
-        sandbox_string(&state_dir),
-        sandbox_string(&attempt_path),
-    );
+    let profile = worker_sandbox_profile_contents(&attempt_path, &runtime_path, backend)?;
     std::fs::write(&profile_path, profile).map_err(|error| {
         DispatchCycleError::message(format!(
             "write worker sandbox profile {}: {error}",
@@ -1231,6 +1269,145 @@ fn sandbox_string(path: &Path) -> String {
         .to_string()
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SandboxPathMatcher {
+    Literal,
+    Subpath,
+}
+
+fn worker_sandbox_profile_contents(
+    attempt_path: &Path,
+    runtime_path: &Path,
+    backend: Backend,
+) -> std::result::Result<String, DispatchCycleError> {
+    // This is deliberately a mutation boundary, not a confidentiality claim:
+    // arbitrary developer toolchains remain readable, while every write needs
+    // an exact parent-authored path matcher.
+    let mut profile = "(version 1)\n\
+                       (deny default)\n\
+                       (allow file-read*)\n\
+                       (allow process*)\n\
+                       (allow network*)\n\
+                       (allow sysctl-read)\n\
+                       (allow mach-lookup)\n\
+                       (allow signal)\n\
+                       (deny file-link)\n\
+                       (allow file-write*\n"
+        .to_string();
+    for device in [
+        "/dev/null",
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/dtracehelper",
+        "/dev/tty",
+    ] {
+        writeln!(&mut profile, "  (literal \"{device}\")")
+            .expect("writing a String cannot fail");
+    }
+    for path in [attempt_path, runtime_path] {
+        writeln!(
+            &mut profile,
+            "  (subpath \"{}\")",
+            sandbox_string(path)
+        )
+        .expect("writing a String cannot fail");
+    }
+    for (matcher, path) in backend_runtime_write_roots(backend)? {
+        let matcher = match matcher {
+            SandboxPathMatcher::Literal => "literal",
+            SandboxPathMatcher::Subpath => "subpath",
+        };
+        writeln!(
+            &mut profile,
+            "  ({matcher} \"{}\")",
+            sandbox_string(&path)
+        )
+        .expect("writing a String cannot fail");
+    }
+    profile.push_str(")\n");
+    Ok(profile)
+}
+
+fn backend_runtime_write_roots(
+    backend: Backend,
+) -> std::result::Result<Vec<(SandboxPathMatcher, PathBuf)>, DispatchCycleError> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            DispatchCycleError::message(
+                "HOME is unavailable; worker sandbox cannot enumerate backend runtime roots",
+            )
+        })?;
+    let home = std::fs::canonicalize(&home).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "canonicalize HOME for worker sandbox mutation boundary: {error}"
+        ))
+    })?;
+    let candidates: &[(&str, SandboxPathMatcher)] = match backend {
+        Backend::Claude => &[
+            (".claude", SandboxPathMatcher::Subpath),
+            (".claude.json", SandboxPathMatcher::Literal),
+            (".cache/claude-handoff", SandboxPathMatcher::Subpath),
+            (".cache/claude-skill-usage", SandboxPathMatcher::Subpath),
+            (
+                "Library/Caches/claude-cli-nodejs",
+                SandboxPathMatcher::Subpath,
+            ),
+        ],
+        Backend::Codex => &[
+            (".codex", SandboxPathMatcher::Subpath),
+            (".cache/codex-runtimes", SandboxPathMatcher::Subpath),
+            (
+                "Library/Caches/com.openai.codex",
+                SandboxPathMatcher::Subpath,
+            ),
+        ],
+        Backend::Pi => &[(".pi", SandboxPathMatcher::Subpath)],
+        Backend::Omp => &[(".omp", SandboxPathMatcher::Subpath)],
+        Backend::Agy => &[(".gemini", SandboxPathMatcher::Subpath)],
+    };
+    let mut roots = Vec::with_capacity(candidates.len());
+    for (relative, matcher) in candidates {
+        let candidate = home.join(relative);
+        let resolved = match std::fs::canonicalize(&candidate) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(DispatchCycleError::message(format!(
+                    "canonicalize {backend:?} runtime root {}: {error}",
+                    candidate.display()
+                )));
+            }
+        };
+        if resolved == home || !resolved.starts_with(&home) {
+            return Err(DispatchCycleError::message(format!(
+                "{backend:?} runtime root {} escapes HOME; refusing broad worker write authority",
+                candidate.display()
+            )));
+        }
+        let metadata = std::fs::metadata(&resolved).map_err(|error| {
+            DispatchCycleError::message(format!(
+                "inspect {backend:?} runtime root {}: {error}",
+                resolved.display()
+            ))
+        })?;
+        let expected_type = match matcher {
+            SandboxPathMatcher::Literal => metadata.is_file(),
+            SandboxPathMatcher::Subpath => metadata.is_dir(),
+        };
+        if !expected_type {
+            return Err(DispatchCycleError::message(format!(
+                "{backend:?} runtime root {} has an unexpected file type",
+                resolved.display()
+            )));
+        }
+        roots.push((*matcher, resolved));
+    }
+    Ok(roots)
 }
 
 fn run_has_durable_worker_isolation(
@@ -3892,6 +4069,7 @@ fn retained_unauthenticated_checkout(
     run_dir: &Path,
     canonical_repo: &Path,
     state_dir: &Path,
+    backend: Backend,
     attempt_id: &str,
     capture_is_durable: bool,
 ) -> std::result::Result<Option<PathBuf>, DispatchCycleError> {
@@ -3913,6 +4091,45 @@ fn retained_unauthenticated_checkout(
     let state_dir = std::fs::canonicalize(state_dir).map_err(|error| {
         unauthenticated_recovery_failure(format!("canonicalize state directory: {error}"))
     })?;
+    let runtime_root = run_dir.join("worker-runtime");
+    let runtime_root_metadata = std::fs::symlink_metadata(&runtime_root).map_err(|error| {
+        unauthenticated_recovery_failure(format!(
+            "inspect retained worker runtime root {}: {error}",
+            runtime_root.display()
+        ))
+    })?;
+    if runtime_root_metadata.file_type().is_symlink() || !runtime_root_metadata.is_dir() {
+        return Err(unauthenticated_recovery_failure(
+            "retained worker runtime root is not a real directory",
+        ));
+    }
+    let runtime_root = std::fs::canonicalize(&runtime_root).map_err(|error| {
+        unauthenticated_recovery_failure(format!(
+            "canonicalize retained worker runtime root: {error}"
+        ))
+    })?;
+    let expected_runtime = runtime_root.join(attempt_id);
+    let runtime_metadata = std::fs::symlink_metadata(&expected_runtime).map_err(|error| {
+        unauthenticated_recovery_failure(format!(
+            "inspect retained worker runtime {}: {error}",
+            expected_runtime.display()
+        ))
+    })?;
+    if runtime_metadata.file_type().is_symlink() || !runtime_metadata.is_dir() {
+        return Err(unauthenticated_recovery_failure(
+            "retained worker runtime is not a real directory",
+        ));
+    }
+    let expected_runtime = std::fs::canonicalize(&expected_runtime).map_err(|error| {
+        unauthenticated_recovery_failure(format!(
+            "canonicalize retained worker runtime: {error}"
+        ))
+    })?;
+    if expected_runtime.parent() != Some(runtime_root.as_path()) {
+        return Err(unauthenticated_recovery_failure(
+            "retained worker runtime escaped its run-owned root",
+        ));
+    }
     let attempt_root = run_dir.join("attempt-checkouts");
     let root_metadata = std::fs::symlink_metadata(&attempt_root).map_err(|error| {
         unauthenticated_recovery_failure(format!(
@@ -4001,16 +4218,14 @@ fn retained_unauthenticated_checkout(
     let sandbox_contents = std::fs::read_to_string(&sandbox_profile).map_err(|error| {
         unauthenticated_recovery_failure(format!("read retained sandbox profile: {error}"))
     })?;
-    let expected_sandbox = format!(
-        "(version 1)\n(allow default)\n\
-         (deny file-link)\n\
-         (deny file-write* (subpath \"{}\"))\n\
-         (deny file-write* (subpath \"{}\"))\n\
-         (allow file-write* (subpath \"{}\"))\n",
-        sandbox_string(&canonical_repo),
-        sandbox_string(&state_dir),
-        sandbox_string(&expected_path),
-    );
+    let expected_sandbox =
+        worker_sandbox_profile_contents(&expected_path, &expected_runtime, backend).map_err(
+            |error| {
+                unauthenticated_recovery_failure(format!(
+                    "reconstruct retained worker sandbox profile: {error}"
+                ))
+            },
+        )?;
     if record.schema != WORKER_ISOLATION_SCHEMA
         || Path::new(&record.canonical_repo) != canonical_repo
         || Path::new(&record.state_dir) != state_dir
@@ -4215,6 +4430,7 @@ fn resume_unauthenticated_implementing_work<B: BdClient + ?Sized, C: CommitProbe
         run_artifacts.dir(),
         repo_path,
         state_dir,
+        selected_roster.backend,
         &evidence.attempt_id,
         evidence.artifact.is_some(),
     )?;
@@ -4822,6 +5038,7 @@ where
             state_dir,
             run_artifacts.dir(),
             &attempt_id,
+            roster.backend,
             before_head,
             deadline,
             &options.clock,
@@ -4845,6 +5062,8 @@ where
             // not this observable value, authorizes the worker commit.
             attempt_identity: dispatch::attempt_commit_identity(),
             sandbox_profile: Some(attempt_checkout.sandbox_profile().to_path_buf()),
+            worker_runtime_dir: Some(attempt_checkout.runtime_path().to_path_buf()),
+            worker_resource_limits: dispatch::WorkerResourceLimits::from_budgets(&cfg.budgets),
         };
         let Some(worker_timeout) = deadline.remaining_at(options.clock.now()) else {
             run_artifacts
@@ -6962,6 +7181,10 @@ mod tests {
         ProviderCandidateRecord, ProviderRouteRecord, ScopeSelector, item_authorization_hash,
     };
 
+
+    fn test_worker_resource_limits() -> dispatch::WorkerResourceLimits {
+        dispatch::WorkerResourceLimits::from_budgets(&config::Budgets::default())
+    }
     #[test]
     fn approval_gate_matrix_refuses_absent_closes_changes_requested_and_runs_approved() {
         let temp = TempDir::new("approval-gate");
@@ -9947,6 +10170,8 @@ print("rotating Codex worker completed nested verifier and final commit")
             prompt: "long-running Codex receipt rotation".to_string(),
             attempt_identity: dispatch::attempt_commit_identity(),
             sandbox_profile: None,
+            worker_runtime_dir: None,
+            worker_resource_limits: test_worker_resource_limits(),
         };
 
         let result = dispatch::run(
@@ -10091,6 +10316,8 @@ sys.exit(result.returncode)
             prompt: "subsession receipt core".to_string(),
             attempt_identity: dispatch::attempt_commit_identity(),
             sandbox_profile: None,
+            worker_runtime_dir: None,
+            worker_resource_limits: test_worker_resource_limits(),
         };
 
         let result = dispatch::run(
@@ -10135,10 +10362,6 @@ sys.exit(result.returncode)
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "real Node harness contract keeps the closed-fd and promotion assertions together"
-    )]
     fn node_harness_commit_is_authenticated_without_inherited_extra_fds() {
         struct NodeHarnessExec {
             worker_spawn: RefCell<Option<SpawnRequest>>,
@@ -10200,6 +10423,8 @@ process.stdout.write("node worker complete\n");
             prompt: "node receipt core".to_string(),
             attempt_identity: dispatch::attempt_commit_identity(),
             sandbox_profile: None,
+            worker_runtime_dir: None,
+            worker_resource_limits: test_worker_resource_limits(),
         };
         let direct_result = dispatch::run(
             &direct_exec,
@@ -10234,17 +10459,6 @@ process.stdout.write("node worker complete\n");
         let spawn = exec.worker_spawn.borrow();
         let spawn = spawn.as_ref().expect("node worker spawned");
         let stderr = std::fs::read_to_string(&spawn.stderr_path).expect("read node stderr");
-        if result.verified == 0
-            && stderr.contains("sandbox_apply")
-            && stderr.contains("Operation not permitted")
-        {
-            assert_eq!(
-                git(&fixture.repo, &["rev-parse", "HEAD"]),
-                before,
-                "failed sandbox initialization must execute no worker payload"
-            );
-            return;
-        }
 
         assert_eq!(result.verified, 1, "node stderr:\n{stderr}");
         assert_eq!(fixture.bd.close_count(), 1);
@@ -10254,6 +10468,49 @@ process.stdout.write("node worker complete\n");
             "worker: authenticated node child_process commit"
         );
         assert_ne!(git(&fixture.repo, &["rev-parse", "HEAD"]), before);
+    }
+
+    #[test]
+    fn worker_sandbox_is_a_mutation_boundary_not_a_secret_read_boundary() {
+        let temp = TempDir::new("worker-sandbox-profile");
+        let repo = temp.path().join("canonical-repo");
+        init_sandbox_repo_without_bd(&repo);
+        let state = temp.path().join("state");
+        let run_dir = state.join("runs/test-run");
+        let attempt = run_dir.join("attempt");
+        let runtime = run_dir.join("worker-runtime/001-pi");
+        std::fs::create_dir_all(&attempt).expect("create attempt");
+        std::fs::create_dir_all(&runtime).expect("create worker runtime");
+
+        let profile = write_worker_sandbox_profile(
+            &repo,
+            &state,
+            &run_dir,
+            &attempt,
+            &runtime,
+            Backend::Pi,
+            "001-pi",
+        )
+        .expect("write worker profile");
+        let profile = std::fs::read_to_string(profile).expect("read worker profile");
+        let attempt = sandbox_string(&std::fs::canonicalize(attempt).unwrap());
+        let runtime = sandbox_string(&std::fs::canonicalize(runtime).unwrap());
+        let home =
+            sandbox_string(&std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap());
+
+        assert!(profile.contains("(deny default)"));
+        assert!(
+            profile.contains("(allow file-read*)"),
+            "global reads are intentional: this policy contains mutation and does not claim \
+             secret-read isolation"
+        );
+        assert!(!profile.contains("(allow default)"));
+        assert!(profile.contains(&format!("(subpath \"{attempt}\")")));
+        assert!(profile.contains(&format!("(subpath \"{runtime}\")")));
+        assert!(
+            !profile.contains(&format!("(subpath \"{home}\")")),
+            "backend runtime roots must never widen write authority to all of HOME"
+        );
     }
 
     #[test]
@@ -10284,6 +10541,7 @@ process.stdout.write("node worker complete\n");
                 &state,
                 &run_dir,
                 "001-current",
+                Backend::Pi,
                 Some(head.trim()),
                 deadline,
                 &clock,
@@ -10294,6 +10552,7 @@ process.stdout.write("node worker complete\n");
                 &state,
                 &run_dir,
                 "002-later",
+                Backend::Pi,
                 Some(head.trim()),
                 deadline,
                 &clock,
@@ -10314,6 +10573,15 @@ process.stdout.write("node worker complete\n");
             let symlink_path = current.path().join("later-symlink");
             symlink(&later_target, &symlink_path).expect("create symlink escape");
             let inside = current.path().join("inside-allowed");
+            let home_target = PathBuf::from(std::env::var("HOME").expect("HOME"))
+                .join(format!(
+                    ".undertake-worker-write-probe-{}",
+                    temp.path()
+                        .file_name()
+                        .expect("temp basename")
+                        .to_string_lossy()
+                ));
+            assert!(!home_target.exists(), "HOME probe path must be fresh");
             let stdout = temp.path().join("sandbox.out");
             let stderr = temp.path().join("sandbox.err");
             let script = r#"
@@ -10323,7 +10591,11 @@ printf hacked > "$2"; echo direct-state:$?
 printf hacked > "$3"; echo direct-later:$?
 /bin/ln "$1" "$4"; echo hardlink-create:$?
 printf hacked > "$5"; echo symlink:$?
-printf allowed > "$6"; echo inside:$?
+printf hacked > "$6"; echo direct-home:$?
+/usr/bin/python3 -c 'import os,sys; os.setsid(); open(sys.argv[1], "w").write("hacked")' "$6"; echo setsid-home:$?
+printf allowed > "$7"; echo inside:$?
+printf temporary > "$TMPDIR/probe"; echo tmp:$?
+printf cached > "$XDG_CACHE_HOME/probe"; echo cache:$?
 exit 0
 "#;
             let request = SpawnRequest {
@@ -10337,12 +10609,31 @@ exit 0
                     later_target.display().to_string(),
                     hardlink.display().to_string(),
                     symlink_path.display().to_string(),
+                    home_target.display().to_string(),
                     inside.display().to_string(),
                 ],
                 cwd: current.path().to_path_buf(),
-                env: Vec::new(),
+                env: vec![
+                    (
+                        "TMPDIR".to_string(),
+                        current.runtime_path().join("tmp").display().to_string(),
+                    ),
+                    (
+                        "TMP".to_string(),
+                        current.runtime_path().join("tmp").display().to_string(),
+                    ),
+                    (
+                        "TEMP".to_string(),
+                        current.runtime_path().join("tmp").display().to_string(),
+                    ),
+                    (
+                        "XDG_CACHE_HOME".to_string(),
+                        current.runtime_path().join("cache").display().to_string(),
+                    ),
+                ],
                 stdin: crate::dispatch::StdinMode::Null,
                 sandbox_profile: Some(current.sandbox_profile().to_path_buf()),
+                worker_resource_limits: Some(test_worker_resource_limits()),
                 commit_receipt_socket: None,
                 stdout_path: stdout.clone(),
                 stderr_path: stderr.clone(),
@@ -10351,12 +10642,17 @@ exit 0
                 .spawn(&request)
                 .expect("spawn sandbox probe");
             let status = child.wait().expect("wait sandbox probe");
+            let home_escape = home_target.exists();
+            if home_escape {
+                std::fs::remove_file(&home_target).expect("remove escaped HOME probe");
+            }
             let stderr_text = std::fs::read_to_string(&stderr).expect("read sandbox stderr");
             if status.exit_code() == Some(71)
                 && stderr_text.contains("sandbox_apply")
                 && stderr_text.contains("Operation not permitted")
             {
                 assert!(!inside.exists(), "failed initialization ran worker payload");
+                assert!(!home_escape, "failed initialization wrote outside attempt");
                 assert_eq!(std::fs::read(&canonical_target).unwrap(), b"canonical\n");
                 assert_eq!(std::fs::read(&state_target).unwrap(), b"state\n");
                 assert_eq!(std::fs::read(&later_target).unwrap(), b"later\n");
@@ -10370,6 +10666,8 @@ exit 0
                 "direct-later",
                 "hardlink-create",
                 "symlink",
+                "direct-home",
+                "setsid-home",
             ] {
                 assert!(
                     stdout_text
@@ -10379,8 +10677,19 @@ exit 0
                     "{label} write unexpectedly succeeded:\n{stdout_text}\nstderr:\n{stderr_text}"
                 );
             }
+            assert!(!home_escape, "worker wrote an arbitrary HOME path");
+            assert!(stdout_text.lines().any(|line| line == "tmp:0"));
+            assert!(stdout_text.lines().any(|line| line == "cache:0"));
             assert!(stdout_text.lines().any(|line| line == "inside:0"));
             assert_eq!(std::fs::read(&inside).unwrap(), b"allowed");
+            assert_eq!(
+                std::fs::read(current.runtime_path().join("tmp/probe")).unwrap(),
+                b"temporary"
+            );
+            assert_eq!(
+                std::fs::read(current.runtime_path().join("cache/probe")).unwrap(),
+                b"cached"
+            );
             assert_eq!(std::fs::read(&canonical_target).unwrap(), b"canonical\n");
             assert_eq!(std::fs::read(&state_target).unwrap(), b"state\n");
             assert_eq!(std::fs::read(&later_target).unwrap(), b"later\n");
