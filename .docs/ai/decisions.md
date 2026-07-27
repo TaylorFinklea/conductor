@@ -274,3 +274,60 @@ with its state model.
 **Rationale**: Authorization must name immutable inputs and runtime evidence
 must remain interpretable after configuration changes. A clean namespace and
 closed schemas fail safely rather than silently mixing historical semantics.
+
+## [2026-07-27] An approval-gated supersession transition, never `dispatch --resume`, terminalizes a failed promoted run superseded by a verified descendant
+
+**Context**: bd `conductor-0kc`. `dispatch --resume`'s promotion-receipt/HEAD-mismatch
+discriminator (`dispatch_cycle.rs`'s `resume_promoted_work`/`resume_finished_promoted_work`,
+the `promoted worker HEAD changed` and `finished promoted HEAD changed` checks) is correct
+and load-bearing: once canonical HEAD no longer equals a run's promoted commit, that run
+must stay recovery-required forever, not be silently resumed or re-verified. But a later,
+separately approved run can legitimately continue directly from that exact promoted commit,
+get verified, and advance HEAD past it — and Undertake had no way to close the earlier run's
+Bead without either manually touching bd (forbidden) or weakening the HEAD-equality check
+that makes `--resume` trustworthy.
+
+**Decision**: Add one explicit, additive operator command, `undertake supersede` (`cli.rs`
+`run_supersede`/`parse_supersede_options`), calling a new `dispatch_cycle::run_supersession`.
+The operator pins every identity by hand — source and replacement run id, cycle id, Bead,
+and promoted commit (`SupersessionPin`) — and the transition re-verifies every pinned value
+against the actual durable evidence rather than trusting the run ids alone. It requires, in
+one pass before any mutation: the source run's exact failed-promoted-verifier shape and event
+history (reusing `validate_finished_promoted_failure`/`validate_finished_promoted_failure_events`
+unchanged), the mirrored exact verified shape and event history for the replacement
+(`validate_replacement_promoted_success_shape`/`validate_finished_promoted_success_events`),
+the source owner provably dead or stale (reusing `authenticate_finished_promoted_owner`
+unchanged), the replacement's `before_head` equal to the source's promoted commit, canonical
+HEAD equal to the replacement's promoted commit, a clean repository, both runs' own approval
+envelopes and authorization hashes self-consistent, and durable proof — the replacement run's
+own `terminal_transition()` — that Undertake itself, not a manual `bd close`, closed the
+replacement's Bead. Only then does it persist a schema-versioned `undertake/supersession@1`
+receipt (source and replacement promotion-artifact sha256 hashes, both run/cycle/Bead ids) via
+`crate::run::durable_atomic_replace` under the source run's own directory, and only then close
+the source Bead with a reason naming both runs. It never opens `RunHandle` for write, never
+touches either run's `promotion.json`/`manifest.json`/`events.jsonl`, never spawns a worker or
+verifier (the function takes no `Exec`), and never rewrites Git history. A
+`quarantine::RepoLease` held for the call's duration makes a concurrent invocation fail closed
+on lease contention rather than double-close. Repeats are idempotent by construction: an
+existing receipt is trusted only when every pinned field matches it exactly; a match with the
+Bead already closed is a pure no-op, and a mismatch fails closed without touching bd.
+
+**Alternatives considered**: Loosening `--resume`'s HEAD-equality check for a "known good"
+descendant (rejected — this is exactly the weakening the bead prohibits and would let any
+later HEAD move quietly re-authenticate a stale claim); auto-discovering the "latest" verified
+run to supersede a given failed one (rejected — ambiguous by construction, and the bead
+requires pinning one *exact* pair, not a heuristic search); folding supersession into the
+ordinary per-cycle dispatch loop as another `dispatch_one` outcome (rejected — supersession
+operates on two already-terminal runs from two different, already-closed cycles and needs no
+`PlannedItem`/roster/cycle-plan machinery; forcing it through that path would either fabricate
+a fake plan item or silently loosen the real one's invariants); marking the source run
+`verified` (rejected outright — the bead is explicit that the failed run must never be reported
+verified, only its Bead terminalized).
+
+**Rationale**: Bounding the operator surface to one pinned, independently re-verified, receipted
+transition keeps `dispatch --resume`'s HEAD-equality discriminator exactly as strict as before
+while giving Undertake an evidence-bound way to stop carrying an inaccurate open P0 forever.
+Retention: the `supersession.json` receipt is kept indefinitely alongside the source run's other
+durable evidence (`promotion.json`, `events.jsonl`) — it is the only record proving why a Bead
+with a `failed` terminal run outcome is nonetheless closed, and deleting it would make that
+closure unauditable.

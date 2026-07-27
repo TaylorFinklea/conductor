@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use sha2::{Digest, Sha256};
 
 use crate::bd::{BdClient, Issue};
 use crate::musterroll::{
@@ -3304,6 +3305,614 @@ fn finish_promotion_recovery_failure<B: BdClient + ?Sized>(
         decision: Some(decision),
         dispatches: review_dispatches,
     })
+}
+
+/// Schema tag for the durable receipt binding a failed promoted run to the
+/// later, separately approved run that verifiably supersedes it. Distinct
+/// from [`PROMOTION_SCHEMA`]: a supersession receipt never mutates either
+/// run's own promotion evidence, it only records that Undertake proved the
+/// link between them before closing the earlier run's Bead.
+const SUPERSESSION_SCHEMA: &str = "undertake/supersession@1";
+
+/// The operator-supplied identity an explicit `undertake supersede`
+/// invocation pins before Undertake will trust it. Every field is
+/// re-verified against the actual durable evidence on disk; a caller cannot
+/// close a Bead merely by naming its run id — the pinned cycle, Bead, and
+/// promoted commit must also match exactly, so a fat-fingered id alone fails
+/// closed rather than silently binding the wrong evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SupersessionPin {
+    pub(crate) source_run_id: String,
+    pub(crate) source_cycle_id: String,
+    pub(crate) source_bead: String,
+    pub(crate) source_promoted_commit: String,
+    pub(crate) replacement_run_id: String,
+    pub(crate) replacement_cycle_id: String,
+    pub(crate) replacement_bead: String,
+    pub(crate) replacement_promoted_commit: String,
+}
+
+/// The durable, schema-versioned proof that one specific failed promoted run
+/// is superseded by one specific later verified run. Persisted under the
+/// source run's own directory via [`crate::run::durable_atomic_replace`]
+/// before the source Bead is closed, and re-read on every future invocation
+/// to make repeats idempotent without re-deriving evidence from scratch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupersessionRecord {
+    schema: String,
+    canonical_repo: String,
+    source_run_id: String,
+    source_cycle_id: String,
+    source_bead: String,
+    source_promoted_commit: String,
+    source_promotion_sha256: String,
+    replacement_run_id: String,
+    replacement_cycle_id: String,
+    replacement_bead: String,
+    replacement_promoted_commit: String,
+    replacement_promotion_sha256: String,
+    reason: String,
+}
+
+/// What an [`run_supersession`] call actually did: `closed = true` means this
+/// invocation performed the Bead close; `closed = false` means the source
+/// Bead was already closed by a prior, identically pinned invocation and
+/// nothing was mutated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SupersessionOutcome {
+    pub(crate) source_bead: String,
+    pub(crate) replacement_bead: String,
+    pub(crate) closed: bool,
+}
+
+fn supersession_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("supersession.json")
+}
+
+fn read_supersession_record(
+    run_dir: &Path,
+) -> std::result::Result<Option<SupersessionRecord>, DispatchCycleError> {
+    let path = supersession_path(run_dir);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(DispatchCycleError::message(format!(
+                "read supersession record {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let record: SupersessionRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "parse supersession record {}: {error}",
+            path.display()
+        ))
+    })?;
+    if record.schema != SUPERSESSION_SCHEMA {
+        return Err(DispatchCycleError::message(format!(
+            "unsupported supersession schema {:?}",
+            record.schema
+        )));
+    }
+    Ok(Some(record))
+}
+
+fn write_supersession_record(
+    run_dir: &Path,
+    record: &SupersessionRecord,
+) -> std::result::Result<(), DispatchCycleError> {
+    let path = supersession_path(run_dir);
+    let mut bytes = serde_json::to_vec_pretty(record).map_err(|error| {
+        DispatchCycleError::message(format!("serialize supersession record: {error}"))
+    })?;
+    bytes.push(b'\n');
+    crate::run::durable_atomic_replace(&path, &bytes).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "durably persist supersession record {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// A prior receipt is only trustworthy for idempotent replay when every
+/// pinned identity it was built from is exactly what this invocation pins
+/// again. Any divergence — a different replacement run substituted for the
+/// same source, say — must fail closed rather than silently reuse someone
+/// else's evidence.
+fn pin_matches_receipt(pin: &SupersessionPin, receipt: &SupersessionRecord) -> bool {
+    pin.source_run_id == receipt.source_run_id
+        && pin.source_cycle_id == receipt.source_cycle_id
+        && pin.source_bead == receipt.source_bead
+        && pin.source_promoted_commit == receipt.source_promoted_commit
+        && pin.replacement_run_id == receipt.replacement_run_id
+        && pin.replacement_cycle_id == receipt.replacement_cycle_id
+        && pin.replacement_bead == receipt.replacement_bead
+        && pin.replacement_promoted_commit == receipt.replacement_promoted_commit
+}
+
+/// Internal shape a source run must have before it can ever be superseded:
+/// the exact same "terminal, promoted, verifier failed, no leaked
+/// follow-on evidence" contract [`validate_finished_promoted_failure`]
+/// enforces for `dispatch --resume`, minus the live-plan/roster
+/// re-derivation that only applies to actually resuming dispatch.
+fn validate_source_promoted_failure_shape(
+    run_artifacts: &RunHandle,
+    work: &WorkState,
+    promotion: &PromotionRecord,
+) -> std::result::Result<(), DispatchCycleError> {
+    if run_artifacts.manifest().lifecycle != crate::run::RunLifecycle::Finished
+        || run_artifacts.manifest().outcome.as_deref() != Some("failed")
+        || work.stage != WorkStage::Completed
+        || work.worker_profile.is_some()
+        || work.worker_commit.is_some()
+        || work.mechanical.is_some()
+        || work.before_head.as_deref() != Some(promotion.before_head.as_str())
+        || work.cycle_id != promotion.cycle_id
+        || promotion.schema != PROMOTION_SCHEMA
+        || promotion.phase != PromotionPhase::Promoted
+        || promotion.attempt_id.trim().is_empty()
+        || promotion.worker_profile.trim().is_empty()
+    {
+        return Err(DispatchCycleError::message(
+            "source run does not match the exact failed-promoted-verifier shape",
+        ));
+    }
+    Ok(())
+}
+
+/// The mirror of [`validate_source_promoted_failure_shape`] for the
+/// replacement run: terminal, promoted, *verified*, with the exact
+/// worker-commit/mechanical evidence a passed verifier leaves behind.
+fn validate_replacement_promoted_success_shape(
+    run_artifacts: &RunHandle,
+    work: &WorkState,
+    promotion: &PromotionRecord,
+) -> std::result::Result<(), DispatchCycleError> {
+    if run_artifacts.manifest().lifecycle != crate::run::RunLifecycle::Finished
+        || run_artifacts.manifest().outcome.as_deref() != Some("verified")
+        || work.stage != WorkStage::Completed
+        || work.worker_profile.as_deref() != Some(promotion.worker_profile.as_str())
+        || work.worker_commit.as_deref() != Some(promotion.worker_commit.as_str())
+        || work.mechanical.is_none()
+        || work.before_head.as_deref() != Some(promotion.before_head.as_str())
+        || work.cycle_id != promotion.cycle_id
+        || promotion.schema != PROMOTION_SCHEMA
+        || promotion.phase != PromotionPhase::Promoted
+        || promotion.attempt_id.trim().is_empty()
+        || promotion.worker_profile.trim().is_empty()
+    {
+        return Err(DispatchCycleError::message(
+            "replacement run does not match the exact verified-promoted shape",
+        ));
+    }
+    Ok(())
+}
+
+/// The mirror of [`validate_finished_promoted_failure_events`] for a
+/// terminal, verified success: proves the event log is *exactly* one
+/// worker attempt, one passed mechanical verify, one qualitative review, and
+/// the terminal `run_finished(verified)` event — nothing more, nothing less.
+fn validate_finished_promoted_success_events(
+    run_artifacts: &RunHandle,
+    promotion: &PromotionRecord,
+) -> std::result::Result<(), DispatchCycleError> {
+    let events =
+        crate::run::read_events(&run_artifacts.events_path()).map_err(run_artifact_error)?;
+    let matching = |kind| {
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.kind == kind)
+            .collect::<Vec<_>>()
+    };
+    let started = matching(EventKind::AttemptStarted);
+    let finished = matching(EventKind::AttemptFinished);
+    let verified = matching(EventKind::VerifyFinished);
+    let reviewed = matching(EventKind::ReviewFinished);
+    let run_finished = matching(EventKind::RunFinished);
+    let exact = events.first().is_some_and(|event| {
+        event.kind == EventKind::RunStarted && event.outcome.as_deref() == Some("started")
+    }) && started.len() == 1
+        && started[0].1.profile_id.as_deref() == Some(promotion.worker_profile.as_str())
+        && started[0].1.outcome.as_deref()
+            == Some(format!("running:{}", promotion.attempt_id).as_str())
+        && finished.len() == 1
+        && finished[0].1.profile_id.as_deref() == Some(promotion.worker_profile.as_str())
+        && finished[0].1.outcome.as_deref() == Some("success")
+        && verified.len() == 1
+        && verified[0].1.outcome.as_deref() == Some("passed")
+        && !verified[0].1.artifact_refs.is_empty()
+        && reviewed.len() == 1
+        && reviewed[0].1.profile_id.is_some()
+        && reviewed[0]
+            .1
+            .outcome
+            .as_deref()
+            .is_some_and(|outcome| outcome.contains("ship"))
+        && run_finished.len() == 1
+        && run_finished[0].0 + 1 == events.len()
+        && run_finished[0].1.outcome.as_deref() == Some("verified")
+        && started[0].0 < finished[0].0
+        && finished[0].0 < verified[0].0
+        && verified[0].0 < reviewed[0].0
+        && reviewed[0].0 < run_finished[0].0;
+    if !exact {
+        return Err(DispatchCycleError::message(
+            "replacement run journal is not the exact verified-and-closed history",
+        ));
+    }
+    for (index, event) in events.iter().enumerate() {
+        let allowed = index == 0
+            || index == started[0].0
+            || index == finished[0].0
+            || index == verified[0].0
+            || index == reviewed[0].0
+            || index == run_finished[0].0
+            || event.kind == EventKind::CoverageGap
+                && event.outcome.as_deref() == Some("musterroll_roster_artifact_unavailable")
+                && index < started[0].0;
+        if !allowed {
+            return Err(DispatchCycleError::message(
+                "replacement run contains evidence outside its exact verified history",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Proves a run's own captured approval snapshot and its own recorded
+/// authorization hash still agree with each other and with the run's own
+/// identity. This is deliberately a self-consistency (tamper-evidence)
+/// check against evidence this exact run already captured at approval
+/// time — not a re-derivation against whatever the Bead currently contains
+/// — because superseding a run launches no new work and must never depend on
+/// content that could have changed after either run finished.
+fn validate_supersession_approval_envelope(
+    run_artifacts: &RunHandle,
+    work: &WorkState,
+    canonical_repo: &str,
+) -> std::result::Result<(), DispatchCycleError> {
+    let bead = run_artifacts
+        .manifest()
+        .target
+        .bead
+        .as_deref()
+        .ok_or_else(|| DispatchCycleError::message("supersession run has no target Bead"))?;
+    let approval = run_artifacts.approval().map_err(run_artifact_error)?;
+    let valid = approval.get("schema").and_then(serde_json::Value::as_str)
+        == Some("undertake/work-approval@1")
+        && approval.get("cycle_id").and_then(serde_json::Value::as_str)
+            == Some(work.cycle_id.as_str())
+        && approval.get("decision").and_then(serde_json::Value::as_str) == Some("approved")
+        && approval
+            .pointer("/item/repo")
+            .and_then(serde_json::Value::as_str)
+            == Some(canonical_repo)
+        && approval
+            .pointer("/item/issue_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(bead)
+        && approval
+            .pointer("/item/authorization_sha256")
+            .and_then(serde_json::Value::as_str)
+            == Some(work.authorization_sha256.as_str());
+    if !valid {
+        return Err(DispatchCycleError::message(
+            "supersession approval envelope or item authorization is stale or mismatched",
+        ));
+    }
+    Ok(())
+}
+
+/// Live-tracker preconditions that must hold before Undertake will even
+/// attempt to build a fresh supersession receipt: the source Bead must be
+/// exactly the state a released, unclaimed recovery-required Bead is left
+/// in, and the replacement Bead must already be closed.
+fn validate_supersession_bead_preconditions<B: BdClient + ?Sized>(
+    bd: &B,
+    repo_path: &Path,
+    pin: &SupersessionPin,
+) -> std::result::Result<(), DispatchCycleError> {
+    let source_issue = bd.show(repo_path, &pin.source_bead).map_err(|error| {
+        DispatchCycleError::message(format!("supersession source Bead fetch: {error}"))
+    })?;
+    if source_issue.status != "open"
+        || source_issue
+            .assignee
+            .as_deref()
+            .is_some_and(|assignee| !assignee.is_empty())
+    {
+        return Err(DispatchCycleError::message(
+            "supersession refuses a source Bead that is not open and unassigned",
+        ));
+    }
+    let replacement_issue = bd.show(repo_path, &pin.replacement_bead).map_err(|error| {
+        DispatchCycleError::message(format!("supersession replacement Bead fetch: {error}"))
+    })?;
+    if replacement_issue.status != "closed" {
+        return Err(DispatchCycleError::message(
+            "supersession refuses a replacement Bead that is not closed",
+        ));
+    }
+    Ok(())
+}
+
+/// Runs every check the supersession transition owes before it may persist a
+/// receipt: pinned identities against the actual promotion evidence, the
+/// exact terminal shapes and event histories of both runs, the source
+/// owner's death, the replacement's ancestry directly from the source's
+/// promoted commit, canonical HEAD equal to the replacement's promoted
+/// commit, a clean repository, both approval envelopes, and durable proof
+/// that Undertake itself — not a manual close — terminalized the
+/// replacement's Bead. Every failure here is a plain, non-recoverable
+/// message: nothing here ever claims, releases, or mutates a Bead.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the supersession authority binds pinned identity, evidence shape, event history, ancestry, and approval together"
+)]
+fn validate_and_build_supersession_record<C: CommitProbe + ?Sized>(
+    commits: &C,
+    repo_path: &Path,
+    canonical_repo: &str,
+    pin: &SupersessionPin,
+    source: &RunHandle,
+    replacement: &RunHandle,
+) -> std::result::Result<SupersessionRecord, DispatchCycleError> {
+    if replacement.manifest().target.repo != canonical_repo {
+        return Err(DispatchCycleError::message(
+            "supersession source and replacement runs are not the same canonical repository",
+        ));
+    }
+
+    let source_promotion = read_promotion_record(source.dir())?.ok_or_else(|| {
+        DispatchCycleError::message("source run has no durable promotion receipt")
+    })?;
+    let replacement_promotion = read_promotion_record(replacement.dir())?.ok_or_else(|| {
+        DispatchCycleError::message("replacement run has no durable promotion receipt")
+    })?;
+
+    let source_work = source
+        .work()
+        .cloned()
+        .ok_or_else(|| DispatchCycleError::message("source run has no work state"))?;
+    let replacement_work = replacement
+        .work()
+        .cloned()
+        .ok_or_else(|| DispatchCycleError::message("replacement run has no work state"))?;
+
+    if pin.source_cycle_id != source_work.cycle_id || pin.source_cycle_id != source_promotion.cycle_id
+    {
+        return Err(DispatchCycleError::message(
+            "pinned source cycle does not match the source run's recorded cycle",
+        ));
+    }
+    if pin.replacement_cycle_id != replacement_work.cycle_id
+        || pin.replacement_cycle_id != replacement_promotion.cycle_id
+    {
+        return Err(DispatchCycleError::message(
+            "pinned replacement cycle does not match the replacement run's recorded cycle",
+        ));
+    }
+    if pin.source_bead != source_promotion.bead
+        || source.manifest().target.bead.as_deref() != Some(pin.source_bead.as_str())
+    {
+        return Err(DispatchCycleError::message(
+            "pinned source Bead does not match the source run's recorded promotion receipt",
+        ));
+    }
+    if pin.replacement_bead != replacement_promotion.bead
+        || replacement.manifest().target.bead.as_deref() != Some(pin.replacement_bead.as_str())
+    {
+        return Err(DispatchCycleError::message(
+            "pinned replacement Bead does not match the replacement run's recorded promotion receipt",
+        ));
+    }
+    if pin.source_promoted_commit != source_promotion.worker_commit {
+        return Err(DispatchCycleError::message(
+            "pinned source promoted commit does not match the source run's promotion receipt",
+        ));
+    }
+    if pin.replacement_promoted_commit != replacement_promotion.worker_commit {
+        return Err(DispatchCycleError::message(
+            "pinned replacement promoted commit does not match the replacement run's promotion receipt",
+        ));
+    }
+
+    validate_source_promoted_failure_shape(source, &source_work, &source_promotion)?;
+    validate_finished_promoted_failure_events(source, &source_promotion)?;
+    validate_replacement_promoted_success_shape(replacement, &replacement_work, &replacement_promotion)?;
+    validate_finished_promoted_success_events(replacement, &replacement_promotion)?;
+
+    authenticate_finished_promoted_owner(source)?;
+
+    if replacement_promotion.before_head != source_promotion.worker_commit {
+        return Err(DispatchCycleError::message(
+            "replacement run's before_head does not equal the source run's promoted commit",
+        ));
+    }
+    let head = commits.head(repo_path).map_err(|error| {
+        DispatchCycleError::message(format!("supersession HEAD probe: {error}"))
+    })?;
+    if head.as_deref() != Some(replacement_promotion.worker_commit.as_str()) {
+        return Err(DispatchCycleError::message(format!(
+            "canonical HEAD does not equal the replacement run's promoted commit: expected {}, found {}",
+            replacement_promotion.worker_commit,
+            head.as_deref().unwrap_or("<none>")
+        )));
+    }
+    if !commits.is_clean(repo_path).map_err(|error| {
+        DispatchCycleError::message(format!("supersession status probe: {error}"))
+    })? {
+        return Err(DispatchCycleError::message(
+            "repository is dirty",
+        ));
+    }
+
+    validate_supersession_approval_envelope(source, &source_work, canonical_repo)?;
+    validate_supersession_approval_envelope(replacement, &replacement_work, canonical_repo)?;
+
+    let replacement_transition = replacement
+        .terminal_transition()
+        .map_err(run_artifact_error)?
+        .ok_or_else(|| {
+            DispatchCycleError::message(
+                "replacement run has no terminal Bead transition evidence",
+            )
+        })?;
+    if replacement_transition.action != TerminalTransitionAction::Close {
+        return Err(DispatchCycleError::message(
+            "replacement run's terminal transition did not close its Bead",
+        ));
+    }
+
+    let source_bytes = std::fs::read(promotion_path(source.dir())).map_err(|error| {
+        DispatchCycleError::message(format!("read source promotion receipt: {error}"))
+    })?;
+    let replacement_bytes = std::fs::read(promotion_path(replacement.dir())).map_err(|error| {
+        DispatchCycleError::message(format!("read replacement promotion receipt: {error}"))
+    })?;
+
+    Ok(SupersessionRecord {
+        schema: SUPERSESSION_SCHEMA.to_string(),
+        canonical_repo: canonical_repo.to_string(),
+        source_run_id: pin.source_run_id.clone(),
+        source_cycle_id: pin.source_cycle_id.clone(),
+        source_bead: pin.source_bead.clone(),
+        source_promoted_commit: pin.source_promoted_commit.clone(),
+        source_promotion_sha256: format!("{:x}", Sha256::digest(&source_bytes)),
+        replacement_run_id: pin.replacement_run_id.clone(),
+        replacement_cycle_id: pin.replacement_cycle_id.clone(),
+        replacement_bead: pin.replacement_bead.clone(),
+        replacement_promoted_commit: pin.replacement_promoted_commit.clone(),
+        replacement_promotion_sha256: format!("{:x}", Sha256::digest(&replacement_bytes)),
+        reason: format!(
+            "undertake supersession: run {} (Bead {}) failed outer verification after promoting {}; \
+             run {} (Bead {}) separately approved and verified a direct descendant that advanced \
+             canonical HEAD, superseding it. Closed without dispatch --resume.",
+            pin.source_run_id,
+            pin.source_bead,
+            pin.source_promoted_commit,
+            pin.replacement_run_id,
+            pin.replacement_bead,
+        ),
+    })
+}
+
+fn finish_supersession_close<B: BdClient + ?Sized>(
+    bd: &B,
+    repo_path: &Path,
+    pin: &SupersessionPin,
+    reason: &str,
+) -> std::result::Result<SupersessionOutcome, DispatchCycleError> {
+    let current = bd.show(repo_path, &pin.source_bead).map_err(|error| {
+        DispatchCycleError::message(format!("supersession source Bead re-fetch: {error}"))
+    })?;
+    if current.status == "closed" {
+        return Ok(SupersessionOutcome {
+            source_bead: pin.source_bead.clone(),
+            replacement_bead: pin.replacement_bead.clone(),
+            closed: false,
+        });
+    }
+    if current.status != "open"
+        || current
+            .assignee
+            .as_deref()
+            .is_some_and(|assignee| !assignee.is_empty())
+    {
+        return Err(DispatchCycleError::message(
+            "supersession refuses to close a source Bead that is no longer open and unassigned",
+        ));
+    }
+    bd.close(repo_path, &pin.source_bead, reason).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "supersession close after durable receipt failed: {error}"
+        ))
+    })?;
+    Ok(SupersessionOutcome {
+        source_bead: pin.source_bead.clone(),
+        replacement_bead: pin.replacement_bead.clone(),
+        closed: true,
+    })
+}
+
+/// The `undertake supersede` operator command: an approval-gated,
+/// Undertake-owned transition that terminalizes a failed promoted run's
+/// Bead once a later, separately approved run verifiably supersedes it by
+/// advancing canonical HEAD directly from the earlier run's promoted
+/// commit. Distinct from `dispatch --resume` in every respect that matters:
+/// it never launches a worker, never reruns a verifier, never mutates
+/// either run's promotion receipt or manifest, never rewrites Git history,
+/// and never reports the superseded run as verified — it only proves the
+/// link and closes exactly one Bead. Repeating an identical invocation is a
+/// no-op; a concurrent invocation for the same repository fails to acquire
+/// the repository lease and mutates nothing.
+pub(crate) fn run_supersession<B: BdClient + ?Sized, C: CommitProbe + ?Sized>(
+    bd: &B,
+    commits: &C,
+    state_dir: &Path,
+    repo_path: &Path,
+    pin: &SupersessionPin,
+) -> std::result::Result<SupersessionOutcome, DispatchCycleError> {
+    let source = RunHandle::open(state_dir, &pin.source_run_id).map_err(run_artifact_error)?;
+    let canonical_repo = source.manifest().target.repo.clone();
+
+    let resolved_repo_path = std::fs::canonicalize(repo_path).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "canonicalize supersession repository {}: {error}",
+            repo_path.display()
+        ))
+    })?;
+    if resolved_repo_path.display().to_string() != canonical_repo {
+        return Err(DispatchCycleError::message(
+            "supersession repository path does not match the source run's recorded canonical repository",
+        ));
+    }
+
+    let _lease = quarantine::RepoLease::acquire(state_dir, &canonical_repo, &pin.source_run_id)
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "supersession repository lease unavailable: {error}"
+            ))
+        })?;
+
+    if let Some(existing) = read_supersession_record(source.dir())? {
+        if !pin_matches_receipt(pin, &existing) {
+            return Err(DispatchCycleError::message(
+                "an existing supersession receipt for this source run does not match the pinned source and replacement identities",
+            ));
+        }
+        let current = bd.show(repo_path, &pin.source_bead).map_err(|error| {
+            DispatchCycleError::message(format!("supersession source Bead re-fetch: {error}"))
+        })?;
+        if current.status == "closed" {
+            return Ok(SupersessionOutcome {
+                source_bead: pin.source_bead.clone(),
+                replacement_bead: pin.replacement_bead.clone(),
+                closed: false,
+            });
+        }
+        return finish_supersession_close(bd, repo_path, pin, &existing.reason);
+    }
+
+    // Only reached without a prior matching receipt: this is the first,
+    // fully-validated invocation, so the replacement run's evidence must
+    // exist and is opened (and re-verified in full) now.
+    let replacement =
+        RunHandle::open(state_dir, &pin.replacement_run_id).map_err(run_artifact_error)?;
+    validate_supersession_bead_preconditions(bd, repo_path, pin)?;
+    let record = validate_and_build_supersession_record(
+        commits,
+        repo_path,
+        &canonical_repo,
+        pin,
+        &source,
+        &replacement,
+    )?;
+    write_supersession_record(source.dir(), &record)?;
+    finish_supersession_close(bd, repo_path, pin, &record.reason)
 }
 
 #[expect(
@@ -10029,6 +10638,663 @@ print("worker committed without its authenticated receipt")
                 .as_str()
                 .is_some_and(|outcome| outcome.contains("authorization"))
         );
+    }
+
+    struct FailingVerifierExec {
+        worker_spawns: RefCell<usize>,
+    }
+
+    impl FailingVerifierExec {
+        fn new() -> Self {
+            Self {
+                worker_spawns: RefCell::new(0),
+            }
+        }
+    }
+
+    impl Exec for FailingVerifierExec {
+        fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+            if request.argv.first().map(String::as_str) == Some("pi") {
+                *self.worker_spawns.borrow_mut() += 1;
+                std::fs::write(&request.stderr_path, b"").expect("write worker stderr");
+                std::fs::write(request.cwd.join("worker.txt"), b"promoted\n")
+                    .expect("write worker file");
+                run_as_worker(request, &["add", "worker.txt"]);
+                run_as_worker(
+                    request,
+                    &["commit", "-m", "worker: promoted supersession fixture"],
+                );
+                write_worker_stdout(request, "worker ran");
+                return Ok(Box::new(FakeChild::delayed_success()));
+            }
+            if request.argv.first().map(String::as_str) == Some("sh") {
+                std::fs::write(&request.stdout_path, b"").expect("write verifier stdout");
+                std::fs::write(&request.stderr_path, b"simulated environment failure\n")
+                    .expect("write verifier stderr");
+                return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(1))));
+            }
+            panic!("unexpected supersession-fixture spawn argv: {:?}", request.argv)
+        }
+    }
+
+    fn find_run_dir_for_bead(state: &Path, bead: &str) -> PathBuf {
+        let mut matches = std::fs::read_dir(crate::run::runs_dir(state))
+            .expect("runs dir")
+            .map(|entry| entry.expect("run dir entry").path())
+            .filter(|path| {
+                crate::run::read_manifest(&path.join("manifest.json"))
+                    .expect("run manifest")
+                    .target
+                    .bead
+                    .as_deref()
+                    == Some(bead)
+            })
+            .collect::<Vec<_>>();
+        matches.sort();
+        assert_eq!(matches.len(), 1, "expected exactly one run for Bead {bead}");
+        matches.pop().expect("one run")
+    }
+
+    fn set_run_owner_at(run_dir: &Path, owner_pid: u32, last_seen: DateTime<Utc>) {
+        let manifest_path = run_dir.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
+        manifest["details"]["state"]["owner_pid"] = serde_json::json!(owner_pid);
+        let mut bytes = serde_json::to_vec_pretty(&manifest).expect("serialize manifest");
+        bytes.push(b'\n');
+        std::fs::write(&manifest_path, bytes).expect("write manifest");
+        std::fs::write(run_dir.join("heartbeat"), last_seen.to_rfc3339())
+            .expect("write heartbeat");
+    }
+
+    struct SupersessionFixture {
+        fixture: ResumeFixture,
+        pin: SupersessionPin,
+        source_run_dir: PathBuf,
+        replacement_run_dir: PathBuf,
+        source_promotion: PromotionRecord,
+        replacement_promotion: PromotionRecord,
+    }
+
+    /// Builds the exact scenario the bead describes: a source Bead
+    /// (`sandbox-1`) whose approved item promotes a worker commit and then
+    /// fails outer verification, released open/unassigned with a dead/stale
+    /// owner; and a separately approved replacement Bead (`sandbox-2`) whose
+    /// item continues from that exact promoted commit, is verified, and
+    /// closes normally through Undertake.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fixture builds two chained cycles/runs and pins every identity the supersession gate needs"
+    )]
+    fn build_supersession_fixture(label: &str) -> SupersessionFixture {
+        let fixture = ResumeFixture::new(label);
+        let source_exec = FailingVerifierExec::new();
+        let initial = fixture
+            .dispatch(
+                &source_exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect("source cycle promotes then fails verification");
+        assert_eq!(initial.verified, 0);
+        assert_eq!(initial.failed, 1);
+        assert_eq!(*source_exec.worker_spawns.borrow(), 1);
+
+        let source_run_dir = fixture.pending_run_dir();
+        let source_run_id = source_run_dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("source run id")
+            .to_string();
+        let source_promotion: PromotionRecord = serde_json::from_slice(
+            &std::fs::read(source_run_dir.join("promotion.json"))
+                .expect("read source promotion receipt"),
+        )
+        .expect("parse source promotion receipt");
+        assert_eq!(source_promotion.phase, PromotionPhase::Promoted);
+        assert_eq!(
+            git(&fixture.repo, &["rev-parse", "HEAD"]).trim(),
+            source_promotion.worker_commit
+        );
+
+        let mut source_run =
+            RunHandle::open(&fixture.state, &source_run_id).expect("open source run");
+        source_run
+            .finish("failed")
+            .expect("finish source run as historically failed");
+        drop(source_run);
+        fixture
+            .bd
+            .release(&fixture.repo, "sandbox-1")
+            .expect("release source Bead");
+        set_run_owner_at(
+            &source_run_dir,
+            spawn_dead_pid(),
+            Utc::now() - ChronoDuration::seconds(120),
+        );
+
+        let replacement_cycle_id = format!("cycle-supersede-replacement-{label}");
+        let mut replacement_issue = sandbox_issue();
+        replacement_issue.id = "sandbox-2".to_string();
+        replacement_issue.title = "Supersession replacement bead".to_string();
+        fixture
+            .bd
+            .issues
+            .borrow_mut()
+            .insert(replacement_issue.id.clone(), replacement_issue.clone());
+        write_plan_with_proposal(
+            &fixture.state,
+            &fixture.repo,
+            &replacement_cycle_id,
+            "sandbox-repo",
+            "sandbox-2",
+            "fake-worker",
+            &["fake-worker"],
+            &fixture.cfg.roster,
+            &replacement_issue,
+        );
+        write_report(&fixture.reports, &replacement_cycle_id);
+        write_response(&fixture.reports, &replacement_cycle_id, "approved");
+
+        let replacement_exec = PendingReviewExec::ship_immediately();
+        let replacement_result = run_dispatch_cycle(
+            &fixture.cfg,
+            &fixture.bd,
+            &replacement_exec,
+            &GitCommitProbe,
+            &fixture.reports,
+            &fixture.state,
+            &fixture.ledger,
+            &replacement_cycle_id,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            &RecordingLiveSink::new(true),
+            &FakeMusterrollClient::unavailable(),
+        )
+        .expect("replacement cycle dispatches and verifies");
+        assert_eq!(replacement_result.verified, 1);
+
+        let replacement_run_dir = find_run_dir_for_bead(&fixture.state, "sandbox-2");
+        let replacement_run_id = replacement_run_dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("replacement run id")
+            .to_string();
+        let replacement_promotion: PromotionRecord = serde_json::from_slice(
+            &std::fs::read(replacement_run_dir.join("promotion.json"))
+                .expect("read replacement promotion receipt"),
+        )
+        .expect("parse replacement promotion receipt");
+        assert_eq!(
+            replacement_promotion.before_head, source_promotion.worker_commit,
+            "the replacement must continue directly from the source's promoted commit"
+        );
+        assert_eq!(
+            git(&fixture.repo, &["rev-parse", "HEAD"]).trim(),
+            replacement_promotion.worker_commit
+        );
+
+        let pin = SupersessionPin {
+            source_run_id,
+            source_cycle_id: fixture.cycle_id.clone(),
+            source_bead: "sandbox-1".to_string(),
+            source_promoted_commit: source_promotion.worker_commit.clone(),
+            replacement_run_id,
+            replacement_cycle_id,
+            replacement_bead: "sandbox-2".to_string(),
+            replacement_promoted_commit: replacement_promotion.worker_commit.clone(),
+        };
+
+        SupersessionFixture {
+            fixture,
+            pin,
+            source_run_dir,
+            replacement_run_dir,
+            source_promotion,
+            replacement_promotion,
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the named gate proves close, receipt contents, zero mutation of either run's evidence, and idempotent replay together"
+    )]
+    fn supersede_failed_promoted_run_with_verified_descendant_closes_without_resume() {
+        let built = build_supersession_fixture("gate");
+        let head_before = git(&built.fixture.repo, &["rev-parse", "HEAD"]).trim().to_string();
+        let source_manifest_before =
+            std::fs::read(built.source_run_dir.join("manifest.json")).expect("source manifest");
+        let source_promotion_before =
+            std::fs::read(built.source_run_dir.join("promotion.json")).expect("source promotion");
+        let source_events_before =
+            std::fs::read(built.source_run_dir.join("events.jsonl")).expect("source events");
+        let replacement_manifest_before =
+            std::fs::read(built.replacement_run_dir.join("manifest.json"))
+                .expect("replacement manifest");
+        let replacement_promotion_before =
+            std::fs::read(built.replacement_run_dir.join("promotion.json"))
+                .expect("replacement promotion");
+        let replacement_events_before =
+            std::fs::read(built.replacement_run_dir.join("events.jsonl"))
+                .expect("replacement events");
+
+        let outcome = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &built.pin,
+        )
+        .expect("supersession closes the source Bead");
+        assert!(outcome.closed);
+        assert_eq!(outcome.source_bead, "sandbox-1");
+        assert_eq!(outcome.replacement_bead, "sandbox-2");
+
+        let source_issue = built
+            .fixture
+            .bd
+            .show(&built.fixture.repo, "sandbox-1")
+            .expect("source Bead");
+        assert_eq!(source_issue.status, "closed");
+        let replacement_issue = built
+            .fixture
+            .bd
+            .show(&built.fixture.repo, "sandbox-2")
+            .expect("replacement Bead");
+        assert_eq!(replacement_issue.status, "closed");
+        assert_eq!(
+            built.fixture.bd.close_count(),
+            2,
+            "the replacement's own verified close plus exactly one supersession close"
+        );
+        assert_eq!(built.fixture.bd.claim_count(), 2, "one claim per Bead, never a resumed claim");
+
+        let receipt_bytes = std::fs::read(built.source_run_dir.join("supersession.json"))
+            .expect("supersession receipt persisted");
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&receipt_bytes).expect("parse supersession receipt");
+        assert_eq!(receipt["schema"], "undertake/supersession@1");
+        assert_eq!(receipt["source_run_id"], built.pin.source_run_id);
+        assert_eq!(receipt["source_bead"], "sandbox-1");
+        assert_eq!(receipt["replacement_run_id"], built.pin.replacement_run_id);
+        assert_eq!(receipt["replacement_bead"], "sandbox-2");
+        assert_eq!(
+            receipt["source_promoted_commit"],
+            built.source_promotion.worker_commit
+        );
+        assert_eq!(
+            receipt["replacement_promoted_commit"],
+            built.replacement_promotion.worker_commit
+        );
+        assert_eq!(receipt["source_promotion_sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(
+            receipt["replacement_promotion_sha256"].as_str().unwrap().len(),
+            64
+        );
+        let reason = receipt["reason"].as_str().expect("reason string");
+        assert!(reason.contains(&built.pin.source_run_id));
+        assert!(reason.contains(&built.pin.replacement_run_id));
+
+        // Neither run's own durable evidence was mutated, HEAD did not move,
+        // and the source run still reports exactly its historical failure —
+        // supersession never reports the old run as verified.
+        assert_eq!(
+            std::fs::read(built.source_run_dir.join("manifest.json")).unwrap(),
+            source_manifest_before
+        );
+        assert_eq!(
+            std::fs::read(built.source_run_dir.join("promotion.json")).unwrap(),
+            source_promotion_before
+        );
+        assert_eq!(
+            std::fs::read(built.source_run_dir.join("events.jsonl")).unwrap(),
+            source_events_before
+        );
+        assert_eq!(
+            std::fs::read(built.replacement_run_dir.join("manifest.json")).unwrap(),
+            replacement_manifest_before
+        );
+        assert_eq!(
+            std::fs::read(built.replacement_run_dir.join("promotion.json")).unwrap(),
+            replacement_promotion_before
+        );
+        assert_eq!(
+            std::fs::read(built.replacement_run_dir.join("events.jsonl")).unwrap(),
+            replacement_events_before
+        );
+        let source_manifest = crate::run::read_manifest(&built.source_run_dir.join("manifest.json"))
+            .expect("source manifest");
+        assert_eq!(source_manifest.outcome.as_deref(), Some("failed"));
+        assert_eq!(
+            git(&built.fixture.repo, &["rev-parse", "HEAD"]).trim(),
+            head_before,
+            "supersession never rewrites Git history"
+        );
+
+        // Repeating the exact same invocation is idempotent: no additional
+        // Bead mutation and no receipt rewrite.
+        let repeated = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &built.pin,
+        )
+        .expect("repeating the exact supersession is a no-op");
+        assert!(!repeated.closed);
+        assert_eq!(built.fixture.bd.close_count(), 2);
+        assert_eq!(
+            std::fs::read(built.source_run_dir.join("supersession.json")).unwrap(),
+            receipt_bytes,
+            "an idempotent repeat must not rewrite the durable receipt"
+        );
+    }
+
+    #[test]
+    fn supersede_second_invocation_with_different_pin_fails_closed_on_existing_receipt() {
+        let built = build_supersession_fixture("mismatched-repeat");
+        run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &built.pin,
+        )
+        .expect("first supersession closes the source Bead");
+        assert_eq!(built.fixture.bd.close_count(), 2);
+
+        let mut different_replacement = built.pin.clone();
+        different_replacement.replacement_run_id = "run-work-not-the-real-replacement".to_string();
+        let error = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &different_replacement,
+        )
+        .expect_err("a differently pinned repeat must not reuse the prior receipt");
+        assert!(error.to_string().contains("does not match the pinned"));
+        assert_eq!(
+            built.fixture.bd.close_count(),
+            2,
+            "a mismatched repeat must not mutate the tracker"
+        );
+    }
+
+    #[test]
+    fn supersede_concurrent_invocation_produces_exactly_one_closure() {
+        let built = build_supersession_fixture("concurrent");
+        let canonical_repo = std::fs::canonicalize(&built.fixture.repo)
+            .expect("canonical repo")
+            .display()
+            .to_string();
+        let held = quarantine::RepoLease::acquire(
+            &built.fixture.state,
+            &canonical_repo,
+            "concurrent-supersession-holder",
+        )
+        .expect("hold the repository lease as a concurrent invocation");
+
+        let blocked = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &built.pin,
+        )
+        .expect_err("a concurrent invocation must fail closed on the held lease");
+        assert!(blocked.to_string().contains("lease"));
+        assert_eq!(built.fixture.bd.close_count(), 1, "only the replacement's own close happened");
+        assert!(!built.source_run_dir.join("supersession.json").exists());
+        drop(held);
+
+        let outcome = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &built.pin,
+        )
+        .expect("supersession succeeds once the lease is free");
+        assert!(outcome.closed);
+        assert_eq!(built.fixture.bd.close_count(), 2, "exactly one supersession closure");
+    }
+
+    #[test]
+    fn supersede_fails_closed_on_mismatched_source_cycle_pin() {
+        let built = build_supersession_fixture("mismatched-cycle");
+        let mut pin = built.pin.clone();
+        pin.source_cycle_id = "cycle-not-the-real-source".to_string();
+        let error = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &pin,
+        )
+        .expect_err("a mismatched source cycle pin must fail closed");
+        assert!(error.to_string().contains("cycle"));
+        assert_eq!(built.fixture.bd.close_count(), 1);
+        assert!(!built.source_run_dir.join("supersession.json").exists());
+    }
+
+    #[test]
+    fn supersede_fails_closed_on_mismatched_promotion_receipt() {
+        let built = build_supersession_fixture("mismatched-receipt");
+        let mut pin = built.pin.clone();
+        pin.replacement_promoted_commit = "0".repeat(40);
+        let error = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &pin,
+        )
+        .expect_err("a mismatched pinned promoted commit must fail closed");
+        assert!(error.to_string().contains("promotion receipt"));
+        assert_eq!(built.fixture.bd.close_count(), 1);
+        assert!(!built.source_run_dir.join("supersession.json").exists());
+    }
+
+    #[test]
+    fn supersede_fails_closed_on_mismatched_authorization() {
+        let built = build_supersession_fixture("mismatched-authorization");
+        let manifest_path = built.source_run_dir.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
+        manifest["details"]["state"]["authorization_sha256"] = serde_json::json!("f".repeat(64));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize corrupted manifest"),
+        )
+        .expect("write corrupted manifest");
+
+        let error = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &built.pin,
+        )
+        .expect_err("a source work state disagreeing with its own approval envelope must fail closed");
+        assert!(error.to_string().contains("authorization"));
+        assert_eq!(built.fixture.bd.close_count(), 1);
+        assert!(!built.source_run_dir.join("supersession.json").exists());
+    }
+
+    #[test]
+    fn supersede_fails_closed_on_mismatched_ancestry() {
+        let built = build_supersession_fixture("mismatched-ancestry");
+        let promotion_path = built.replacement_run_dir.join("promotion.json");
+        let mut promotion: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&promotion_path).expect("read promotion"))
+                .expect("parse promotion");
+        promotion["before_head"] = serde_json::json!("0".repeat(40));
+        std::fs::write(
+            &promotion_path,
+            serde_json::to_vec_pretty(&promotion).expect("serialize corrupted promotion"),
+        )
+        .expect("write corrupted promotion");
+        let manifest_path = built.replacement_run_dir.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
+        manifest["details"]["state"]["before_head"] = serde_json::json!("0".repeat(40));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize corrupted manifest"),
+        )
+        .expect("write corrupted manifest");
+
+        let error = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &built.pin,
+        )
+        .expect_err("ancestry that does not chain from the source's promoted commit must fail closed");
+        assert!(error.to_string().contains("before_head"));
+        assert_eq!(built.fixture.bd.close_count(), 1);
+        assert!(!built.source_run_dir.join("supersession.json").exists());
+    }
+
+    #[test]
+    fn supersede_fails_closed_on_head_mismatch() {
+        let built = build_supersession_fixture("head-mismatch");
+        std::fs::write(built.fixture.repo.join("drift.txt"), b"unexpected further work\n")
+            .expect("write drift file");
+        run(&built.fixture.repo, "git", &["add", "drift.txt"]);
+        run(
+            &built.fixture.repo,
+            "git",
+            &["commit", "-m", "drift: canonical HEAD moved past the replacement"],
+        );
+
+        let error = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &built.pin,
+        )
+        .expect_err("canonical HEAD past the replacement's promoted commit must fail closed");
+        assert!(error.to_string().contains("HEAD"));
+        assert_eq!(built.fixture.bd.close_count(), 1);
+        assert!(!built.source_run_dir.join("supersession.json").exists());
+    }
+
+    #[test]
+    fn supersede_fails_closed_on_dirty_repository() {
+        let built = build_supersession_fixture("dirty-repository");
+        std::fs::write(built.fixture.repo.join("uncommitted.txt"), b"dirty\n")
+            .expect("write uncommitted file");
+
+        let error = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &built.pin,
+        )
+        .expect_err("a dirty repository must fail closed");
+        assert!(error.to_string().contains("dirty"));
+        assert_eq!(built.fixture.bd.close_count(), 1);
+        assert!(!built.source_run_dir.join("supersession.json").exists());
+    }
+
+    #[test]
+    fn supersede_fails_closed_on_live_source_owner() {
+        let built = build_supersession_fixture("live-owner");
+        set_run_owner_at(
+            &built.source_run_dir,
+            std::process::id(),
+            Utc::now() - ChronoDuration::seconds(120),
+        );
+
+        let error = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &built.pin,
+        )
+        .expect_err("a live source owner must fail closed");
+        assert!(error.to_string().contains("alive"));
+        assert_eq!(built.fixture.bd.close_count(), 1);
+        assert!(!built.source_run_dir.join("supersession.json").exists());
+    }
+
+    #[test]
+    fn supersede_fails_closed_on_non_undertake_replacement_closure() {
+        let built = build_supersession_fixture("non-undertake-closure");
+        let transition_path = built
+            .replacement_run_dir
+            .join("artifacts/terminal-transition.json");
+        let mut transition: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&transition_path).expect("read replacement terminal transition"),
+        )
+        .expect("parse replacement terminal transition");
+        transition["action"] = serde_json::json!("release");
+        std::fs::write(
+            &transition_path,
+            serde_json::to_vec_pretty(&transition).expect("serialize tampered transition"),
+        )
+        .expect("write tampered transition");
+
+        let error = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &built.pin,
+        )
+        .expect_err("a tampered replacement terminal-transition artifact must fail closed");
+        assert!(error.to_string().contains("terminal-transition"));
+        assert_eq!(built.fixture.bd.close_count(), 1);
+        assert!(!built.source_run_dir.join("supersession.json").exists());
+    }
+
+    #[test]
+    fn supersede_fails_closed_on_incomplete_replacement_evidence() {
+        let built = build_supersession_fixture("incomplete-replacement");
+        std::fs::remove_file(built.replacement_run_dir.join("promotion.json"))
+            .expect("remove replacement promotion receipt");
+
+        let error = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &built.pin,
+        )
+        .expect_err("missing replacement promotion evidence must fail closed");
+        assert!(error.to_string().contains("promotion receipt"));
+        assert_eq!(built.fixture.bd.close_count(), 1);
+        assert!(!built.source_run_dir.join("supersession.json").exists());
+    }
+
+    #[test]
+    fn supersede_fails_closed_when_source_bead_is_not_open() {
+        let built = build_supersession_fixture("source-not-open");
+        built
+            .fixture
+            .bd
+            .claim(&built.fixture.repo, "sandbox-1", "someone-else")
+            .expect("re-claim the source Bead outside supersession");
+
+        let error = run_supersession(
+            &built.fixture.bd,
+            &GitCommitProbe,
+            &built.fixture.state,
+            &built.fixture.repo,
+            &built.pin,
+        )
+        .expect_err("a source Bead that is not open and unassigned must fail closed");
+        assert!(error.to_string().contains("open and unassigned"));
+        assert_eq!(built.fixture.bd.close_count(), 1);
+        assert!(!built.source_run_dir.join("supersession.json").exists());
     }
 
     #[test]

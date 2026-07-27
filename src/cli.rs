@@ -5,7 +5,7 @@ use std::process::{Command, ExitCode};
 
 use crate::config;
 
-const USAGE: &str = "usage: undertake [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [plan prepare --repo <path> (--bead <id>|--artifact <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL>) --output-kind <spec|implementation-plan> [--max-plan-revisions <0..3>] [--require-second-opinion] [--config <path>]] [plan dispatch <run-id> [--config <path>]] [plan status <run-id> [--config <path>]] [plan cancel <run-id> [--config <path>]] [migrate state --from <legacy-root> --to <undertake-root> [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]]";
+const USAGE: &str = "usage: undertake [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [plan prepare --repo <path> (--bead <id>|--artifact <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL>) --output-kind <spec|implementation-plan> [--max-plan-revisions <0..3>] [--require-second-opinion] [--config <path>]] [plan dispatch <run-id> [--config <path>]] [plan status <run-id> [--config <path>]] [plan cancel <run-id> [--config <path>]] [migrate state --from <legacy-root> --to <undertake-root> [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]] [supersede --repo <path> --source-run <run-id> --source-cycle <cycle-id> --source-bead <id> --source-commit <sha> --replacement-run <run-id> --replacement-cycle <cycle-id> --replacement-bead <id> --replacement-commit <sha>]";
 
 /// The dashboard segment of the usage line. Empty in a
 /// `--no-default-features` build, where the command does not exist at all;
@@ -47,6 +47,7 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
         Some("route") => run_route(&mut it),
         Some("scan") => run_scan(&mut it),
         Some("status") => run_status(&mut it),
+        Some("supersede") => run_supersede(&mut it),
         Some(cmd) => {
             eprintln!("unknown subcommand: {cmd}");
             print_usage();
@@ -2130,6 +2131,120 @@ fn run_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SupersedeOptions {
+    repo: PathBuf,
+    pin: crate::dispatch_cycle::SupersessionPin,
+}
+
+fn parse_supersede_options(args: &[String]) -> Result<SupersedeOptions, String> {
+    let mut repo = None;
+    let mut source_run_id = None;
+    let mut source_cycle_id = None;
+    let mut source_bead = None;
+    let mut source_promoted_commit = None;
+    let mut replacement_run_id = None;
+    let mut replacement_cycle_id = None;
+    let mut replacement_bead = None;
+    let mut replacement_promoted_commit = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        index += 1;
+        let value = args
+            .get(index)
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        index += 1;
+        match flag {
+            "--repo" if repo.is_none() => repo = Some(PathBuf::from(value)),
+            "--source-run" if source_run_id.is_none() => source_run_id = Some(value.clone()),
+            "--source-cycle" if source_cycle_id.is_none() => source_cycle_id = Some(value.clone()),
+            "--source-bead" if source_bead.is_none() => source_bead = Some(value.clone()),
+            "--source-commit" if source_promoted_commit.is_none() => {
+                source_promoted_commit = Some(value.clone());
+            }
+            "--replacement-run" if replacement_run_id.is_none() => {
+                replacement_run_id = Some(value.clone());
+            }
+            "--replacement-cycle" if replacement_cycle_id.is_none() => {
+                replacement_cycle_id = Some(value.clone());
+            }
+            "--replacement-bead" if replacement_bead.is_none() => {
+                replacement_bead = Some(value.clone());
+            }
+            "--replacement-commit" if replacement_promoted_commit.is_none() => {
+                replacement_promoted_commit = Some(value.clone());
+            }
+            other => return Err(format!("unknown or duplicate supersede argument: {other}")),
+        }
+    }
+    Ok(SupersedeOptions {
+        repo: repo.ok_or_else(|| "supersede requires --repo <path>".to_string())?,
+        pin: crate::dispatch_cycle::SupersessionPin {
+            source_run_id: source_run_id
+                .ok_or_else(|| "supersede requires --source-run <run-id>".to_string())?,
+            source_cycle_id: source_cycle_id
+                .ok_or_else(|| "supersede requires --source-cycle <cycle-id>".to_string())?,
+            source_bead: source_bead
+                .ok_or_else(|| "supersede requires --source-bead <id>".to_string())?,
+            source_promoted_commit: source_promoted_commit
+                .ok_or_else(|| "supersede requires --source-commit <sha>".to_string())?,
+            replacement_run_id: replacement_run_id
+                .ok_or_else(|| "supersede requires --replacement-run <run-id>".to_string())?,
+            replacement_cycle_id: replacement_cycle_id
+                .ok_or_else(|| "supersede requires --replacement-cycle <cycle-id>".to_string())?,
+            replacement_bead: replacement_bead
+                .ok_or_else(|| "supersede requires --replacement-bead <id>".to_string())?,
+            replacement_promoted_commit: replacement_promoted_commit
+                .ok_or_else(|| "supersede requires --replacement-commit <sha>".to_string())?,
+        },
+    })
+}
+
+/// `undertake supersede`: the explicit, approval-gated operator command for
+/// bd `conductor-0kc`. Terminalizes a failed promoted run's Bead once a
+/// later, separately approved run verifiably supersedes it — distinct from
+/// `dispatch --resume`, which this command never invokes and whose
+/// promotion-receipt/HEAD-mismatch recovery-required behavior it never
+/// weakens. See `.docs/ai/decisions.md` for the design record.
+fn run_supersede(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let options = match parse_supersede_options(&it.collect::<Vec<_>>()) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("supersede: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let bd = crate::bd::CommandBdClient::new();
+    let commits = crate::dispatch::GitCommitProbe;
+    match crate::dispatch_cycle::run_supersession(
+        &bd,
+        &commits,
+        &state_dir(),
+        &options.repo,
+        &options.pin,
+    ) {
+        Ok(outcome) if outcome.closed => {
+            println!(
+                "supersede: closed {} (superseded by verified run {} / Bead {})",
+                outcome.source_bead, options.pin.replacement_run_id, outcome.replacement_bead
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(outcome) => {
+            println!(
+                "supersede: {} is already closed by this exact supersession; no-op",
+                outcome.source_bead
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("supersede: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MigrateStateOptions {
     source: PathBuf,
     destination: PathBuf,
@@ -2228,6 +2343,10 @@ fn print_help() {
     println!("  status         Show the most recently recorded cycle");
     println!("  cycle          Dry-run scan -> triage -> plan and publish a report");
     println!("  dispatch       Dispatch an approved cycle's ready items");
+    println!(
+        "  supersede      Approval-gated: close a failed promoted run's Bead once a separately"
+    );
+    println!("                 approved run verifiably supersedes it (see .docs/ai/decisions.md)");
     println!();
     println!("Notes:");
     println!("  adversarial-review dispatch exits 0 only for complete validated synthesis.");
@@ -3455,6 +3574,55 @@ provider = "codex"
         assert_eq!(options.destination, PathBuf::from("/state/undertake"));
         assert_eq!(options.config, PathBuf::from("undertake.toml"));
         assert!(parse_migrate_state_options(&["state".to_string()]).is_err());
+    }
+
+    #[test]
+    fn supersede_options_parser_requires_every_pinned_identity() {
+        let options = parse_supersede_options(&[
+            "--repo".to_string(),
+            "/fleet/sandbox-repo".to_string(),
+            "--source-run".to_string(),
+            "run-work-source".to_string(),
+            "--source-cycle".to_string(),
+            "cycle-source".to_string(),
+            "--source-bead".to_string(),
+            "sandbox-1".to_string(),
+            "--source-commit".to_string(),
+            "a".repeat(40),
+            "--replacement-run".to_string(),
+            "run-work-replacement".to_string(),
+            "--replacement-cycle".to_string(),
+            "cycle-replacement".to_string(),
+            "--replacement-bead".to_string(),
+            "sandbox-2".to_string(),
+            "--replacement-commit".to_string(),
+            "b".repeat(40),
+        ])
+        .expect("every pinned identity supplied");
+        assert_eq!(options.repo, PathBuf::from("/fleet/sandbox-repo"));
+        assert_eq!(options.pin.source_run_id, "run-work-source");
+        assert_eq!(options.pin.source_cycle_id, "cycle-source");
+        assert_eq!(options.pin.source_bead, "sandbox-1");
+        assert_eq!(options.pin.source_promoted_commit, "a".repeat(40));
+        assert_eq!(options.pin.replacement_run_id, "run-work-replacement");
+        assert_eq!(options.pin.replacement_cycle_id, "cycle-replacement");
+        assert_eq!(options.pin.replacement_bead, "sandbox-2");
+        assert_eq!(options.pin.replacement_promoted_commit, "b".repeat(40));
+
+        assert!(
+            parse_supersede_options(&[
+                "--repo".to_string(),
+                "/fleet/sandbox-repo".to_string(),
+                "--source-run".to_string(),
+                "run-work-source".to_string(),
+            ])
+            .is_err(),
+            "missing pinned identities must be rejected, not defaulted"
+        );
+        assert!(
+            USAGE.contains("[supersede --repo"),
+            "the operator command must be advertised in usage"
+        );
     }
 
     /// Without `tui` the dashboard command must not exist at all: the usage
