@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{Backend, Budgets, ReasoningEffort};
+use serde_json::Value;
 
 const PI_THINKING: &str = "xhigh";
 const ATTEMPT_IDENTITY_NAME: &str = "Undertake Worker Attempt";
@@ -22,6 +23,13 @@ const WAIT_POLL: Duration = Duration::from_millis(50);
 const HELPER_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const HELPER_CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
 const HELPER_ERROR_EVIDENCE_LIMIT: usize = 4 * 1024;
+/// Bound on the Claude backend auth-readiness probe (bd `conductor-5p8`).
+/// The orchestrator measured `claude auth status --json` hanging past
+/// 120-300s in a non-interactive shell on the affected machine; this timeout
+/// sits far below that so a hang always classifies `Unreadable` well before
+/// it could ever be mistaken for a live "still authenticating" wait, and
+/// long before any cycle/item deadline would otherwise absorb the stall.
+const CLAUDE_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 static HELPER_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) type Result<T> = std::result::Result<T, DispatchError>;
@@ -285,8 +293,44 @@ impl From<ExitStatus> for ProcessStatus {
     }
 }
 
+/// Backend authentication readiness, classified before a Bead is claimed, an
+/// attempt checkout is created, or a worker is spawned (bd `conductor-5p8`).
+/// A probe that cannot prove readiness — a timeout, a spawn failure, or
+/// unparseable evidence — classifies as [`AuthReadiness::Unreadable`] and
+/// fails closed; it is never mistaken for [`AuthReadiness::Ready`]. Every
+/// non-`Ready` variant carries an actionable, non-secret operator message
+/// naming the supported unattended path; no variant is ever built from
+/// token or credential bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuthReadiness {
+    /// The backend proved it can authenticate unattended.
+    Ready,
+    /// The backend responded but reports no valid session — logged out, or
+    /// a subscription OAuth session that expired.
+    NotAuthenticated { message: String },
+    /// The readiness probe itself could not produce a trustworthy answer
+    /// (timed out, failed to spawn, or returned unparseable evidence).
+    Unreadable { message: String },
+}
+
+impl AuthReadiness {
+    pub(crate) const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
 pub(crate) trait Exec {
     fn spawn(&self, request: &SpawnRequest) -> Result<Box<dyn ChildProcess>>;
+
+    /// Classifies whether `backend` is ready to authenticate an unattended
+    /// worker. Dispatch calls this before a Bead is claimed, before an
+    /// attempt checkout is created, and before a worker is spawned (bd
+    /// `conductor-5p8`) — never after. The default runs the production
+    /// probe; in-memory test doubles override it so tests never depend on
+    /// real credential state.
+    fn auth_readiness(&self, backend: Backend) -> AuthReadiness {
+        default_backend_auth_readiness(backend)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1932,6 +1976,107 @@ pub(crate) fn run_bounded_command_with_input(
     input: &[u8],
 ) -> std::result::Result<Output, BoundedCommandError> {
     run_bounded_command_with_limits(command, Some(input), HELPER_COMMAND_TIMEOUT, KILL_GRACE)
+}
+
+/// Non-secret remediation guidance shown whenever a backend cannot prove it
+/// is ready to authenticate unattended (bd `conductor-5p8`). Names the
+/// supported unattended paths only; never echoes probe output, which this
+/// classifier must never leak.
+const CLAUDE_UNATTENDED_AUTH_GUIDANCE: &str = "unattended Claude dispatch requires either an \
+    inference-only token from `claude setup-token` exported as CLAUDE_CODE_OAUTH_TOKEN, or an \
+    apiKeyHelper-configured API key; interactive subscription login (`claude /login`) is not \
+    usable from a detached background worker";
+
+/// The only backend this classifier currently probes is Claude — the
+/// subject of bd `conductor-5p8`'s live incident. The other backends have
+/// no unattended-readiness contract defined yet, so they classify `Ready`
+/// unconditionally; giving one of them a real probe is a separate,
+/// deliberate change, not a side effect of this fix.
+pub(crate) fn default_backend_auth_readiness(backend: Backend) -> AuthReadiness {
+    match backend {
+        Backend::Claude => claude_cli_auth_readiness(),
+        Backend::Pi | Backend::Omp | Backend::Agy | Backend::Codex => AuthReadiness::Ready,
+    }
+}
+
+/// Runs the production Claude auth-readiness probe: bounded, stdin-closed,
+/// and process-group reaped via [`run_bounded_command_with_timeout`], so a
+/// hang can never block dispatch — it times out and classifies
+/// [`AuthReadiness::Unreadable`] instead.
+fn claude_cli_auth_readiness() -> AuthReadiness {
+    let mut command = Command::new("claude");
+    command.args(["--safe-mode", "auth", "status", "--json"]);
+    classify_claude_auth_probe(run_bounded_command_with_timeout(
+        &mut command,
+        CLAUDE_AUTH_PROBE_TIMEOUT,
+    ))
+}
+
+/// Classifies a completed or failed bounded auth probe. Split from
+/// [`claude_cli_auth_readiness`] so tests can feed a synthetic probe result
+/// (built from a real, credential-free `sh` subprocess) without depending on
+/// the actual `claude` CLI or any real credential state.
+fn classify_claude_auth_probe(
+    probe: std::result::Result<Output, BoundedCommandError>,
+) -> AuthReadiness {
+    match probe {
+        Ok(output) => classify_claude_auth_output(&output),
+        Err(error) => {
+            // Never forward `error`'s `Display` verbatim: `BoundedCommandError`
+            // embeds captured stdout/stderr evidence, and a credential probe's
+            // captured streams are exactly the bytes this classifier must never
+            // leak. A timeout classifies `Unreadable`, never `Ready`, so a hang
+            // can never be mistaken for an authenticated backend.
+            let cause = if error.is_timeout() {
+                "the readiness probe did not respond before its bounded timeout"
+            } else if error.spawn_source().is_some() {
+                "the `claude` CLI could not be started (not installed or not on PATH)"
+            } else if error.leaves_process_state_uncertain() {
+                "the readiness probe left the helper process state uncertain"
+            } else {
+                "the readiness probe failed"
+            };
+            AuthReadiness::Unreadable {
+                message: format!("{cause}; {CLAUDE_UNATTENDED_AUTH_GUIDANCE}"),
+            }
+        }
+    }
+}
+
+/// Parses `claude auth status --json` evidence into a readiness
+/// classification. Only two non-secret fields are ever read —
+/// `loggedIn` (bool) and `authMethod` (a short method name, never a
+/// credential) — and only `authMethod` is ever echoed back, bounded to a
+/// short printable token so no unexpected payload can ride along in it.
+fn classify_claude_auth_output(output: &Output) -> AuthReadiness {
+    let Ok(parsed) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return AuthReadiness::Unreadable {
+            message: format!(
+                "`claude auth status --json` returned unparseable output; \
+                 {CLAUDE_UNATTENDED_AUTH_GUIDANCE}"
+            ),
+        };
+    };
+    match parsed.get("loggedIn").and_then(Value::as_bool) {
+        Some(true) => AuthReadiness::Ready,
+        Some(false) => {
+            let method = parsed.get("authMethod").and_then(Value::as_str).filter(|method| {
+                method.len() <= 32 && method.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+            });
+            let observed = method.map_or_else(String::new, |method| format!(" (authMethod={method})"));
+            AuthReadiness::NotAuthenticated {
+                message: format!(
+                    "claude reports no active session{observed}; {CLAUDE_UNATTENDED_AUTH_GUIDANCE}"
+                ),
+            }
+        }
+        None => AuthReadiness::Unreadable {
+            message: format!(
+                "`claude auth status --json` omitted the expected loggedIn field; \
+                 {CLAUDE_UNATTENDED_AUTH_GUIDANCE}"
+            ),
+        },
+    }
 }
 
 #[expect(
@@ -4195,6 +4340,126 @@ mod tests {
                 b"timeout-detail".as_slice()
             )
         );
+    }
+
+    #[test]
+    fn claude_auth_output_classifies_ready_from_logged_in_true() {
+        let output = Output {
+            status: successful_exit_status(),
+            stdout: br#"{"loggedIn":true,"authMethod":"claude.ai"}"#.to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(classify_claude_auth_output(&output), AuthReadiness::Ready);
+    }
+
+    #[test]
+    fn claude_auth_output_classifies_not_authenticated_from_logged_in_false() {
+        let output = Output {
+            status: successful_exit_status(),
+            stdout: br#"{"loggedIn":false,"authMethod":"none"}"#.to_vec(),
+            stderr: Vec::new(),
+        };
+        let AuthReadiness::NotAuthenticated { message } = classify_claude_auth_output(&output)
+        else {
+            panic!("logged-out output must classify NotAuthenticated");
+        };
+        assert!(message.contains("authMethod=none"));
+        assert!(message.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert!(message.contains("apiKeyHelper"));
+    }
+
+    #[test]
+    fn claude_auth_output_classifies_unreadable_on_missing_logged_in_field() {
+        let output = Output {
+            status: successful_exit_status(),
+            stdout: br#"{"authMethod":"none"}"#.to_vec(),
+            stderr: Vec::new(),
+        };
+        let AuthReadiness::Unreadable { message } = classify_claude_auth_output(&output) else {
+            panic!("a missing loggedIn field must classify Unreadable, never Ready");
+        };
+        assert!(message.contains("loggedIn"));
+    }
+
+    /// Never forwards raw probe bytes: unparseable output containing an
+    /// obviously credential-shaped string must classify `Unreadable`
+    /// without that string ever appearing in the produced message (bd
+    /// `conductor-5p8`).
+    #[test]
+    fn claude_auth_output_never_echoes_raw_probe_bytes_on_parse_failure() {
+        let secret_marker = "sk-ant-definitely-not-a-real-secret-marker-12345";
+        let output = Output {
+            status: successful_exit_status(),
+            stdout: format!("not json at all: {secret_marker}").into_bytes(),
+            stderr: Vec::new(),
+        };
+        let AuthReadiness::Unreadable { message } = classify_claude_auth_output(&output) else {
+            panic!("unparseable output must classify Unreadable, never Ready");
+        };
+        assert!(!message.contains(secret_marker), "classifier must never echo raw probe bytes");
+        assert!(message.contains("unparseable"));
+    }
+
+    /// A field longer than the short printable bound this classifier
+    /// enforces must never ride along into the operator message either.
+    #[test]
+    fn claude_auth_output_bounds_and_never_echoes_an_oversized_auth_method() {
+        let secret_marker = "sk-ant-oversized-payload-riding-in-auth-method-field-xyz";
+        let output = Output {
+            status: successful_exit_status(),
+            stdout: format!(r#"{{"loggedIn":false,"authMethod":"{secret_marker}"}}"#).into_bytes(),
+            stderr: Vec::new(),
+        };
+        let AuthReadiness::NotAuthenticated { message } = classify_claude_auth_output(&output)
+        else {
+            panic!("logged-out output must classify NotAuthenticated");
+        };
+        assert!(!message.contains(secret_marker), "an oversized authMethod must never be echoed");
+    }
+
+    /// A probe hang must classify `Unreadable`, never `Ready` — proving a
+    /// stall (the orchestrator measured 120-300s real hangs) cannot block
+    /// dispatch indefinitely (bd `conductor-5p8`). Uses a real, credential-free
+    /// `sh` subprocess; never touches the actual `claude` CLI.
+    #[test]
+    #[cfg(unix)]
+    fn claude_auth_probe_timeout_classifies_unreadable_never_ready() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 30");
+        let probe = run_bounded_command_with_timeout(&mut command, Duration::from_millis(100));
+        let readiness = classify_claude_auth_probe(probe);
+        let AuthReadiness::Unreadable { message } = readiness else {
+            panic!("a probe hang must classify Unreadable, never Ready");
+        };
+        assert!(message.contains("bounded timeout"));
+        assert!(message.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+    }
+
+    /// A probe that fails to spawn (e.g. `claude` missing from PATH) must
+    /// also fail closed to `Unreadable`, never `Ready`.
+    #[test]
+    fn claude_auth_probe_spawn_failure_classifies_unreadable_never_ready() {
+        let mut command = Command::new("/definitely/not/a/real/undertake-test-binary-xyz");
+        let probe = run_bounded_command_with_timeout(&mut command, Duration::from_secs(5));
+        let readiness = classify_claude_auth_probe(probe);
+        let AuthReadiness::Unreadable { message } = readiness else {
+            panic!("a spawn failure must classify Unreadable, never Ready");
+        };
+        assert!(message.contains("could not be started"));
+    }
+
+    #[test]
+    fn default_backend_auth_readiness_is_ready_for_backends_without_a_defined_probe() {
+        for backend in [Backend::Pi, Backend::Omp, Backend::Agy, Backend::Codex] {
+            assert_eq!(default_backend_auth_readiness(backend), AuthReadiness::Ready);
+        }
+    }
+
+    #[cfg(unix)]
+    fn successful_exit_status() -> ExitStatus {
+        std::process::Command::new("true")
+            .status()
+            .expect("run true(1) for a real zero exit status")
     }
 
     #[test]

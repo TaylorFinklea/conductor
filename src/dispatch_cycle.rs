@@ -2160,6 +2160,39 @@ fn dispatch_one<
             DispatchCycleError::message(format!("plan references unknown model {}", item.model))
         })?;
 
+    // Backend authentication readiness is classified as soon as the item's
+    // backend is known — before `bd.show`, `bd.claim`, the dirty-repo
+    // preflight, the attempt checkout, and worker spawn that follow later in
+    // this function (bd `conductor-5p8`). A hung, unauthenticated, or
+    // expired backend therefore fails closed here and never reaches claim
+    // or spawn, on every path through this function (fresh dispatch and
+    // every resume/recovery branch below all pass through this point).
+    match exec.auth_readiness(roster.backend) {
+        dispatch::AuthReadiness::Ready => {}
+        dispatch::AuthReadiness::NotAuthenticated { message } => {
+            record_replan_required(
+                report_path,
+                item,
+                &format!("backend authentication not ready (not authenticated): {message}"),
+            )?;
+            return Ok(DispatchOneResult {
+                decision: None,
+                dispatches: 0,
+            });
+        }
+        dispatch::AuthReadiness::Unreadable { message } => {
+            record_replan_required(
+                report_path,
+                item,
+                &format!("backend authentication not ready (unreadable probe): {message}"),
+            )?;
+            return Ok(DispatchOneResult {
+                decision: None,
+                dispatches: 0,
+            });
+        }
+    }
+
     let mut current = match bd.show(&repo_path, &item.issue_id) {
         Ok(issue) => issue,
         Err(error) => {
@@ -8221,6 +8254,311 @@ mod tests {
         assert_eq!(bd.claim_count(), 0);
         assert!(exec.spawns().is_empty());
         assert!(report_json_string(&reports, cycle_id).contains("REPLAN_REQUIRED"));
+    }
+
+    /// Fails under prior behavior: before bd `conductor-5p8`, `dispatch_one`
+    /// had no backend-authentication gate at all, so a claim-and-spawn
+    /// fixture whose `Exec` panics on `spawn` would panic here instead of
+    /// replanning cleanly — exactly the live incident (an unauthenticated
+    /// Claude session was claimed and spawned before it ever failed).
+    #[test]
+    fn claude_backend_not_authenticated_fails_before_claim_and_spawn() {
+        let (result, bd, _exec, reports, cycle_id, _temp) = run_claude_auth_gate_case(
+            "claude-not-authenticated",
+            dispatch::AuthReadiness::NotAuthenticated {
+                message: "claude reports no active session (authMethod=none); \
+                          unattended Claude dispatch requires either CLAUDE_CODE_OAUTH_TOKEN or \
+                          an apiKeyHelper API key; interactive subscription login is not usable \
+                          from a detached background worker"
+                    .to_string(),
+            },
+        );
+
+        assert_eq!(result.dispatched, 0);
+        assert_eq!(result.failed, 0);
+        assert_eq!(bd.claim_count(), 0, "an unauthenticated backend must never be claimed");
+        // AuthBlockedExec::spawn panics unconditionally; `run_dispatch_cycle`
+        // returning `Ok` here already proves spawn was never invoked.
+        let report = report_json_string(&reports, &cycle_id);
+        assert!(report.contains("REPLAN_REQUIRED"));
+        assert!(report.contains("not authenticated"));
+        assert!(report.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert!(report.contains("apiKeyHelper"));
+    }
+
+    /// A probe hang or failure must classify `Unreadable` and fail closed —
+    /// never `Ready` — so it cannot block dispatch indefinitely (bd
+    /// `conductor-5p8`). Fails under prior behavior for the same reason as
+    /// the sibling `not_authenticated` regression above.
+    #[test]
+    fn claude_backend_unreadable_probe_fails_before_claim_and_spawn() {
+        let (result, bd, _exec, reports, cycle_id, _temp) = run_claude_auth_gate_case(
+            "claude-unreadable",
+            dispatch::AuthReadiness::Unreadable {
+                message: "the readiness probe did not respond before its bounded timeout; \
+                          unattended Claude dispatch requires either CLAUDE_CODE_OAUTH_TOKEN or \
+                          an apiKeyHelper API key; interactive subscription login is not usable \
+                          from a detached background worker"
+                    .to_string(),
+            },
+        );
+
+        assert_eq!(result.dispatched, 0);
+        assert_eq!(result.failed, 0);
+        assert_eq!(bd.claim_count(), 0, "an unreadable probe must never be claimed");
+        // AuthBlockedExec::spawn panics unconditionally; `run_dispatch_cycle`
+        // returning `Ok` here already proves spawn was never invoked.
+        let report = report_json_string(&reports, &cycle_id);
+        assert!(report.contains("REPLAN_REQUIRED"));
+        assert!(report.contains("unreadable probe"));
+        assert!(report.contains("bounded timeout"));
+    }
+
+    /// A ready backend must dispatch exactly as it did before this bead:
+    /// claimed, spawned, and verified.
+    #[test]
+    fn claude_backend_ready_dispatch_proceeds_unchanged() {
+        let temp = TempDir::new("claude-auth-ready");
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+        let cfg = config::parse_str(&claude_backend_fixture_config(&fleet)).expect("config parses");
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+        let cycle_id = "cycle-claude-auth-ready";
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = ClaudeReadyExec::new();
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &GitCommitProbe,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            &RecordingLiveSink::new(true),
+            &FakeMusterrollClient::unavailable().with_roster_snapshot(claude_backend_roster_snapshot()),
+        )
+        .expect("a ready backend dispatches exactly as before this bead");
+
+        assert_eq!(result.dispatched, 1);
+        assert_eq!(result.verified, 1);
+        assert_eq!(result.failed, 0);
+        assert_eq!(bd.claim_count(), 1);
+        assert!(
+            exec.spawns().iter().any(|request| request.argv.first().map(String::as_str)
+                == Some("claude")),
+            "a ready Claude backend must reach worker spawn"
+        );
+    }
+
+    fn claude_backend_fixture_config(root: &Path) -> String {
+        format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+use_musterroll = false
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "fake-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "claude"
+dispatch_id = "fake-worker"
+provider = "anthropic"
+"#,
+            root.display()
+        )
+    }
+
+    /// A Musterroll v2 roster snapshot naming exactly one Claude-backend
+    /// profile matching [`claude_backend_fixture_config`]'s `[[roster]]`
+    /// entry. `resolve_roster` always substitutes the injected client's
+    /// snapshot for `cfg.roster` regardless of `use_musterroll`, so a test
+    /// exercising a specific backend must supply a snapshot naming that
+    /// backend — the default fake snapshot only ever names `pi` profiles.
+    fn claude_backend_roster_snapshot() -> crate::musterroll::RosterSnapshot {
+        crate::musterroll::parse_roster_snapshot(
+            json!({
+                "schema": "musterroll/roster@2",
+                "generated_at": "2026-07-17T12:00:00Z",
+                "source_artifact": {"path": "/fixture/musterroll-roster.toml", "sha256": "a".repeat(64)},
+                "policy_sha256": "b".repeat(64),
+                "providers": [
+                    {"provider_id": "anthropic", "availability_key": "anthropic", "enabled": true, "state": "healthy", "availability": "healthy", "checked_at": "2026-07-17T12:00:00Z", "data_as_of": null, "expires_at": "2100-01-01T00:00:00Z", "reason": null, "eligible": true, "ineligibility_reason": null}
+                ],
+                "profiles": [
+                    {"profile_id": "fake-worker", "provider_id": "anthropic", "model": "fake-worker-model", "harness": "claude-code", "dispatch_id": "fake-worker", "reasoning_effort": null, "tier": "junior", "ceiling": "S", "efficiency": "lean", "cost": 0.0, "data_policy": "standard", "enabled": true, "roles": ["task"], "state": "healthy", "eligible": true, "ineligibility_reason": null}
+                ]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("valid claude backend roster snapshot")
+    }
+
+    /// Shared setup for the two blocking (`NotAuthenticated`/`Unreadable`)
+    /// pre-claim gate regressions: a Claude-backend roster entry, an `Exec`
+    /// double that reports the given fixed [`dispatch::AuthReadiness`] and
+    /// panics if `spawn` is ever called.
+    fn run_claude_auth_gate_case(
+        label: &str,
+        readiness: dispatch::AuthReadiness,
+    ) -> (
+        DispatchCycleResult,
+        RecordingBdClient,
+        AuthBlockedExec,
+        PathBuf,
+        String,
+        TempDir,
+    ) {
+        let temp = TempDir::new(&format!("claude-auth-gate-{label}"));
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+        let cfg = config::parse_str(&claude_backend_fixture_config(&fleet)).expect("config parses");
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+        let cycle_id = format!("cycle-{label}");
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            &cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, &cycle_id);
+        write_response(&reports, &cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = AuthBlockedExec { readiness };
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &GitCommitProbe,
+            &reports,
+            &state,
+            &ledger,
+            &cycle_id,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            &RecordingLiveSink::new(true),
+            &FakeMusterrollClient::unavailable().with_roster_snapshot(claude_backend_roster_snapshot()),
+        )
+        .expect("an unready backend is refused without erroring the cycle");
+
+        (result, bd, exec, reports, cycle_id, temp)
+    }
+
+    /// Reports the fixed readiness it was built with, regardless of
+    /// `backend`, and panics if `spawn` is ever invoked — proving the
+    /// pre-claim gate never reaches worker launch for a non-`Ready`
+    /// classification. Never touches the real `claude` CLI or credentials.
+    struct AuthBlockedExec {
+        readiness: dispatch::AuthReadiness,
+    }
+
+    impl Exec for AuthBlockedExec {
+        fn spawn(&self, _request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+            panic!("worker must never spawn when backend auth is not ready")
+        }
+
+        fn auth_readiness(&self, _backend: Backend) -> dispatch::AuthReadiness {
+            self.readiness.clone()
+        }
+    }
+
+    /// Always reports `Ready` regardless of `backend` — never touches the
+    /// real `claude` CLI — and completes a Claude-backend worker spawn
+    /// exactly like [`SandboxExec`] does for the `pi` backend, proving a
+    /// ready backend's dispatch is unchanged by the new gate.
+    struct ClaudeReadyExec {
+        spawns: RefCell<Vec<SpawnRequest>>,
+    }
+
+    impl ClaudeReadyExec {
+        fn new() -> Self {
+            Self {
+                spawns: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn spawns(&self) -> Vec<SpawnRequest> {
+            self.spawns.borrow().clone()
+        }
+    }
+
+    impl Exec for ClaudeReadyExec {
+        fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+            self.spawns.borrow_mut().push(request.clone());
+            if request.argv.first().map(String::as_str) == Some("claude") {
+                std::fs::write(&request.stderr_path, b"").expect("write worker stderr");
+                std::fs::write(request.cwd.join("worker.txt"), b"done\n")
+                    .expect("write worker file");
+                run_as_worker(request, &["add", "worker.txt"]);
+                run_as_worker(request, &["commit", "-m", "worker: complete sandbox bead"]);
+                write_worker_stdout(request, "worker ran");
+                return Ok(Box::new(FakeChild::delayed_success()));
+            }
+            if request.argv.first().map(String::as_str) == Some("sh") {
+                let output = Command::new(&request.argv[0])
+                    .args(&request.argv[1..])
+                    .current_dir(&request.cwd)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("spawn verify shell");
+                std::fs::write(&request.stdout_path, &output.stdout).expect("write verify stdout");
+                std::fs::write(&request.stderr_path, &output.stderr).expect("write verify stderr");
+                let code = output.status.code().unwrap_or(1);
+                return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(code))));
+            }
+            panic!("unexpected spawn argv: {:?}", request.argv)
+        }
+
+        fn auth_readiness(&self, _backend: Backend) -> dispatch::AuthReadiness {
+            dispatch::AuthReadiness::Ready
+        }
     }
 
     #[test]

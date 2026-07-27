@@ -1514,6 +1514,40 @@ fn run_config_check(it: &mut std::vec::IntoIter<String>) -> ExitCode {
             all_ok = false;
         }
     }
+
+    // Reports the same classifier `dispatch` runs before Bead claim/attempt
+    // mutation/worker spawn (bd `conductor-5p8`), once per distinct backend
+    // the resolved roster actually selects, so an unauthenticated or
+    // unreadable backend is visible at `config check` time rather than only
+    // discovered mid-cycle.
+    let mut selected_backends: Vec<crate::config::Backend> = resolved_roster
+        .roster
+        .iter()
+        .map(|entry| entry.backend)
+        .collect();
+    selected_backends.sort_by_key(|backend| format!("{backend:?}"));
+    selected_backends.dedup();
+    for backend in selected_backends {
+        let name = format!("{backend:?}").to_lowercase();
+        if !matches!(backend, crate::config::Backend::Claude) {
+            println!("backend auth ({name}): ok — no auth-readiness probe defined for this backend");
+            continue;
+        }
+        match crate::dispatch::default_backend_auth_readiness(backend) {
+            crate::dispatch::AuthReadiness::Ready => {
+                println!("backend auth ({name}): ok — ready");
+            }
+            crate::dispatch::AuthReadiness::NotAuthenticated { message } => {
+                println!("backend auth ({name}): FAIL — not authenticated: {message}");
+                all_ok = false;
+            }
+            crate::dispatch::AuthReadiness::Unreadable { message } => {
+                println!("backend auth ({name}): FAIL — unreadable: {message}");
+                all_ok = false;
+            }
+        }
+    }
+
     if all_ok {
         ExitCode::SUCCESS
     } else {
