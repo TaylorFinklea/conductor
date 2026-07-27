@@ -28,6 +28,18 @@ Undertake: a single Rust binary that runs autonomous work-routing cycles over th
   `runs-v2/` is isolated from inert legacy history. Arena is removed.
   Canonical contract: Guildhall `undertake-core-consolidation-spec.md`.
 - [x] The prior suite rebrand and managed-source cutover are complete; their exact migration evidence remains in dated records and git history.
+- [x] Reliability, containment, and reviewer-trust hardening — COMPLETE
+  (2026-07-27). A three-family adversarial audit (Opus 5, Ollama Cloud GLM 5.2,
+  MiniMax M3) was adjudicated against source, then closed as beads `zzw`
+  (bounded helper subprocesses), `b41` (cycle/recovery deadlines), `ptj` (worker
+  resource + deny-default write containment), `u9t` (durable state growth and
+  fsync), `pux` (declared verification inputs), `0kc` (`undertake supersede`),
+  `5p8` (pre-claim backend auth classification), and `z8z`/`zg9`/`5tg`/`koi`/`0ya`
+  (reviewer trust boundary). **Landmines:** Darwin `RLIMIT_AS` bounds virtual
+  address space, not RSS; `claude auth status` hangs past 300s non-interactively,
+  so every backend probe must stay bounded and stdin-closed; undeclared ignored
+  verification inputs now fail closed and need a `[[verification_input]]`
+  `materialize` or `acknowledge` declaration.
 - [ ] Cycle 1 COMPLETE (9 beads closed: m0a, m0b, m1a, m1b, m2a, m2b, prompt, bdro, rev1); `cargo test` passes 84 tests. Live ready queue (`bd ready`, 6 items): `undertake-m4a`/`undertake-m3a` (P1), `undertake-agy`/`undertake-m1c`/`undertake-m0c` (P2), `undertake-cov1` (P3). Routing fields are in bd metadata; every bead's Verify is its `verify_cmd`.
 
 ### Next
