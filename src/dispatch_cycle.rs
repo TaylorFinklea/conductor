@@ -940,20 +940,17 @@ impl AttemptCheckout {
             ))
         })?;
         let path = root.join(attempt_id);
-        let output = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        command
             .args(["clone", "--shared", "--no-checkout"])
             .arg(canonical_repo)
-            .arg(&path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .map_err(|error| {
-                DispatchCycleError::message(format!(
-                    "clone isolated worker attempt checkout {}: {error}",
-                    path.display()
-                ))
-            })?;
+            .arg(&path);
+        let output = dispatch::run_bounded_command(&mut command).map_err(|error| {
+            DispatchCycleError::message(format!(
+                "clone isolated worker attempt checkout {}: {error}",
+                path.display()
+            ))
+        })?;
         if !output.status.success() {
             return Err(DispatchCycleError::message(format!(
                 "clone isolated worker attempt checkout {} failed: {}",
@@ -961,20 +958,17 @@ impl AttemptCheckout {
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
-        let checkout = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        command
             .arg("-C")
             .arg(&path)
-            .args(["checkout", "--detach", before_head])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .map_err(|error| {
-                DispatchCycleError::message(format!(
-                    "checkout isolated worker base in {}: {error}",
-                    path.display()
-                ))
-            })?;
+            .args(["checkout", "--detach", before_head]);
+        let checkout = dispatch::run_bounded_command(&mut command).map_err(|error| {
+            DispatchCycleError::message(format!(
+                "checkout isolated worker base in {}: {error}",
+                path.display()
+            ))
+        })?;
         if !checkout.status.success() {
             let _ = std::fs::remove_dir_all(&path);
             return Err(DispatchCycleError::message(format!(
@@ -1293,17 +1287,14 @@ fn cleanup_run_attempt_worktrees(
     // above is safe only after the recorded worker is dead; prune the now-dead
     // registrations so recovery remains compatible without using linked
     // worktrees for any new worker.
-    let prune = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .arg("-C")
         .arg(canonical_repo)
-        .args(["worktree", "prune"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|error| {
-            DispatchCycleError::message(format!("prune legacy attempt worktrees: {error}"))
-        })?;
+        .args(["worktree", "prune"]);
+    let prune = dispatch::run_bounded_command(&mut command).map_err(|error| {
+        DispatchCycleError::message(format!("prune legacy attempt worktrees: {error}"))
+    })?;
     if !prune.status.success() {
         return Err(DispatchCycleError::message(format!(
             "prune legacy attempt worktrees failed: {}",
@@ -1349,21 +1340,18 @@ fn promote_attempt_commit<C: CommitProbe + ?Sized>(
         ));
     }
 
-    let fetch = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .arg("-C")
         .arg(canonical_repo)
         .args(["fetch", "--no-tags", "--no-write-fetch-head"])
         .arg(attempt_repo)
-        .arg(worker_commit)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|error| {
-            DispatchCycleError::message(format!(
-                "import authenticated worker commit from isolated clone: {error}"
-            ))
-        })?;
+        .arg(worker_commit);
+    let fetch = dispatch::run_bounded_command(&mut command).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "import authenticated worker commit from isolated clone: {error}"
+        ))
+    })?;
     if !fetch.status.success() {
         return Err(DispatchCycleError::message(format!(
             "import authenticated worker commit from isolated clone failed: {}",
@@ -1395,18 +1383,14 @@ fn promote_attempt_commit<C: CommitProbe + ?Sized>(
     };
     write_promotion_record(run_artifacts.dir(), &promotion)?;
 
-    let merge = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .arg("-C")
         .arg(canonical_repo)
-        .args(["merge", "--ff-only", "--no-edit", worker_commit])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output();
+        .args(["merge", "--ff-only", "--no-edit", worker_commit]);
+    let merge = dispatch::run_bounded_command(&mut command).map_err(|error| error.to_string());
     let merge = if merge_outcome_is_unreadable(options) {
-        Err(std::io::Error::other(
-            "simulated unreadable promotion merge outcome",
-        ))
+        Err("simulated unreadable promotion merge outcome".to_string())
     } else {
         merge
     };

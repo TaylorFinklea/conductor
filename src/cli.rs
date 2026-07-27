@@ -1,7 +1,7 @@
 //! subcommand parsing, exit codes (0 ok; 1 cycle had flags/failures; 2 config/env error)
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode};
 
 use crate::config;
 
@@ -477,11 +477,9 @@ impl crate::plan_job::PlanAuthor for CommandPlanAuthor {
         let (program, command_args) = argv
             .split_first()
             .ok_or_else(|| "plan author argv was empty".to_string())?;
-        let output = Command::new(program)
-            .args(command_args)
-            .current_dir(&request.worktree)
-            .stdin(Stdio::null())
-            .output()
+        let mut command = Command::new(program);
+        command.args(command_args).current_dir(&request.worktree);
+        let output = crate::dispatch::run_bounded_command(&mut command)
             .map_err(|error| format!("plan author {program}: {error}"))?;
         if !output.status.success() {
             return Err(format!(
@@ -607,11 +605,9 @@ fn run_plan_backend(
     let (program, command_args) = argv
         .split_first()
         .ok_or_else(|| format!("{stage} argv was empty"))?;
-    let output = Command::new(program)
-        .args(command_args)
-        .current_dir(worktree)
-        .stdin(Stdio::null())
-        .output()
+    let mut command = Command::new(program);
+    command.args(command_args).current_dir(worktree);
+    let output = crate::dispatch::run_bounded_command(&mut command)
         .map_err(|error| format!("{stage} {program}: {error}"))?;
     if !output.status.success() {
         return Err(format!(

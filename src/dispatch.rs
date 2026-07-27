@@ -4,12 +4,13 @@
 #![allow(dead_code)]
 
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{Backend, ReasoningEffort};
@@ -18,6 +19,10 @@ const PI_THINKING: &str = "xhigh";
 const ATTEMPT_IDENTITY_NAME: &str = "Undertake Worker Attempt";
 const KILL_GRACE: Duration = Duration::from_secs(3);
 const WAIT_POLL: Duration = Duration::from_millis(50);
+const HELPER_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const HELPER_CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
+const HELPER_ERROR_EVIDENCE_LIMIT: usize = 4 * 1024;
+static HELPER_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) type Result<T> = std::result::Result<T, DispatchError>;
 
@@ -1310,18 +1315,14 @@ pub(crate) fn prepare_worker_lineage_lease(path: &Path) -> Result<()> {
             parent.display()
         ))
     })?;
-    let output = Command::new("mkfifo")
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| {
-            DispatchError::new(format!(
-                "spawn mkfifo for worker-lineage lease {}: {error}",
-                path.display()
-            ))
-        })?;
+    let mut command = Command::new("mkfifo");
+    command.arg(path);
+    let output = run_bounded_command(&mut command).map_err(|error| {
+        DispatchError::new(format!(
+            "run mkfifo for worker-lineage lease {}: {error}",
+            path.display()
+        ))
+    })?;
     if !output.status.success() {
         return Err(DispatchError::new(format!(
             "mkfifo worker-lineage lease {} failed: {}",
@@ -1392,6 +1393,574 @@ fn stdin_for_mode(mode: &StdinMode) -> Stdio {
     match mode {
         StdinMode::Null => Stdio::null(),
     }
+}
+
+#[derive(Debug)]
+enum BoundedCommandErrorKind {
+    Spawn(std::io::Error),
+    Setup {
+        resource: &'static str,
+        source: std::io::Error,
+    },
+    Poll(std::io::Error),
+    TimedOut(Duration),
+    OutputLimit {
+        streams: &'static str,
+        limit: usize,
+    },
+    StateUncertain(String),
+}
+
+/// Failure from a helper subprocess whose captured evidence remains bounded.
+#[derive(Debug)]
+pub(crate) struct BoundedCommandError {
+    kind: BoundedCommandErrorKind,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+impl BoundedCommandError {
+    fn new(kind: BoundedCommandErrorKind) -> Self {
+        Self {
+            kind,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
+    }
+
+    fn with_capture(kind: BoundedCommandErrorKind, capture: HelperCapture) -> Self {
+        Self {
+            kind,
+            stdout: capture.stdout,
+            stderr: capture.stderr,
+            stdout_truncated: capture.stdout_truncated,
+            stderr_truncated: capture.stderr_truncated,
+        }
+    }
+
+    pub(crate) const fn is_timeout(&self) -> bool {
+        matches!(&self.kind, BoundedCommandErrorKind::TimedOut(_))
+    }
+
+    pub(crate) const fn leaves_process_state_uncertain(&self) -> bool {
+        matches!(&self.kind, BoundedCommandErrorKind::StateUncertain(_))
+    }
+
+    pub(crate) fn spawn_source(&self) -> Option<&std::io::Error> {
+        match &self.kind {
+            BoundedCommandErrorKind::Spawn(source) => Some(source),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    pub(crate) fn stderr(&self) -> &[u8] {
+        &self.stderr
+    }
+
+    fn write_evidence(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_stream_evidence(f, "stdout", &self.stdout, self.stdout_truncated)?;
+        write_stream_evidence(f, "stderr", &self.stderr, self.stderr_truncated)
+    }
+}
+
+impl fmt::Display for BoundedCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            BoundedCommandErrorKind::Spawn(source) => write!(f, "spawn subprocess: {source}")?,
+            BoundedCommandErrorKind::Setup { resource, source } => {
+                write!(f, "prepare subprocess {resource}: {source}")?;
+            }
+            BoundedCommandErrorKind::Poll(source) => {
+                write!(f, "poll subprocess: {source}")?;
+            }
+            BoundedCommandErrorKind::TimedOut(timeout) => {
+                write!(
+                    f,
+                    "subprocess timed out after {} ms and was reaped after TERM/KILL escalation",
+                    timeout.as_millis()
+                )?;
+            }
+            BoundedCommandErrorKind::OutputLimit { streams, limit } => {
+                write!(
+                    f,
+                    "subprocess {streams} exceeded the {limit}-byte capture limit"
+                )?;
+            }
+            BoundedCommandErrorKind::StateUncertain(detail) => {
+                write!(
+                    f,
+                    "subprocess state is uncertain after TERM/KILL escalation: {detail}"
+                )?;
+            }
+        }
+        self.write_evidence(f)
+    }
+}
+
+impl std::error::Error for BoundedCommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            BoundedCommandErrorKind::Spawn(source)
+            | BoundedCommandErrorKind::Setup { source, .. }
+            | BoundedCommandErrorKind::Poll(source) => Some(source),
+            BoundedCommandErrorKind::TimedOut(_)
+            | BoundedCommandErrorKind::OutputLimit { .. }
+            | BoundedCommandErrorKind::StateUncertain(_) => None,
+        }
+    }
+}
+
+fn write_stream_evidence(
+    f: &mut fmt::Formatter<'_>,
+    label: &str,
+    bytes: &[u8],
+    truncated: bool,
+) -> fmt::Result {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let start = bytes.len().saturating_sub(HELPER_ERROR_EVIDENCE_LIMIT);
+    write!(
+        f,
+        "; {label}: {}",
+        String::from_utf8_lossy(&bytes[start..]).trim()
+    )?;
+    if truncated || start > 0 {
+        f.write_str(" [truncated]")?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct HelperCapture {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+struct HelperTempFile {
+    file: File,
+    path: Option<PathBuf>,
+}
+
+impl HelperTempFile {
+    fn create(label: &str) -> std::io::Result<Self> {
+        for _ in 0..16 {
+            let nonce = HELPER_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "undertake-helper-{}-{timestamp}-{nonce}-{label}",
+                std::process::id()
+            ));
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => {
+                    #[cfg(unix)]
+                    {
+                        if let Err(error) = fs::remove_file(&path) {
+                            let _ = fs::remove_file(&path);
+                            return Err(error);
+                        }
+                        return Ok(Self { file, path: None });
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        return Ok(Self {
+                            file,
+                            path: Some(path),
+                        });
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique helper capture file",
+        ))
+    }
+
+    fn stdio(&self) -> std::io::Result<Stdio> {
+        self.file.try_clone().map(Stdio::from)
+    }
+
+    fn stage_input(&mut self, input: &[u8]) -> std::io::Result<()> {
+        self.file.write_all(input)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        Ok(())
+    }
+
+    fn read_bounded(&mut self) -> std::io::Result<(Vec<u8>, bool)> {
+        self.file.seek(SeekFrom::Start(0))?;
+        let read_limit = u64::try_from(HELPER_CAPTURE_LIMIT)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(self.file.metadata()?.len())
+                .unwrap_or(HELPER_CAPTURE_LIMIT)
+                .min(HELPER_CAPTURE_LIMIT),
+        );
+        (&mut self.file)
+            .take(read_limit)
+            .read_to_end(&mut bytes)?;
+        let truncated = bytes.len() > HELPER_CAPTURE_LIMIT;
+        bytes.truncate(HELPER_CAPTURE_LIMIT);
+        Ok((bytes, truncated))
+    }
+}
+
+impl Drop for HelperTempFile {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Runs a production helper command with null stdin, bounded capture, and a
+/// process-group timeout.
+pub(crate) fn run_bounded_command(
+    command: &mut Command,
+) -> std::result::Result<Output, BoundedCommandError> {
+    run_bounded_command_with_limits(command, None, HELPER_COMMAND_TIMEOUT, KILL_GRACE)
+}
+
+/// Runs a production helper command with file-backed stdin so input and output
+/// cannot deadlock on opposing pipe capacity.
+pub(crate) fn run_bounded_command_with_input(
+    command: &mut Command,
+    input: &[u8],
+) -> std::result::Result<Output, BoundedCommandError> {
+    run_bounded_command_with_limits(command, Some(input), HELPER_COMMAND_TIMEOUT, KILL_GRACE)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the bounded helper lifecycle keeps setup, timeout escalation, reap, and capture \
+              ordering explicit in one linear routine"
+)]
+fn run_bounded_command_with_limits(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    grace: Duration,
+) -> std::result::Result<Output, BoundedCommandError> {
+    let mut stdout_file = HelperTempFile::create("stdout").map_err(|source| {
+        BoundedCommandError::new(BoundedCommandErrorKind::Setup {
+            resource: "stdout capture",
+            source,
+        })
+    })?;
+    let mut stderr_file = HelperTempFile::create("stderr").map_err(|source| {
+        BoundedCommandError::new(BoundedCommandErrorKind::Setup {
+            resource: "stderr capture",
+            source,
+        })
+    })?;
+    let input_file = input
+        .map(|bytes| {
+            let mut file = HelperTempFile::create("stdin")?;
+            file.stage_input(bytes)?;
+            Ok::<_, std::io::Error>(file)
+        })
+        .transpose()
+        .map_err(|source| {
+            BoundedCommandError::new(BoundedCommandErrorKind::Setup {
+                resource: "stdin",
+                source,
+            })
+        })?;
+
+    let stdin = input_file.as_ref().map_or_else(
+        || Ok(Stdio::null()),
+        HelperTempFile::stdio,
+    );
+    command
+        .stdin(stdin.map_err(|source| {
+            BoundedCommandError::new(BoundedCommandErrorKind::Setup {
+                resource: "stdin",
+                source,
+            })
+        })?)
+        .stdout(stdout_file.stdio().map_err(|source| {
+            BoundedCommandError::new(BoundedCommandErrorKind::Setup {
+                resource: "stdout capture",
+                source,
+            })
+        })?)
+        .stderr(stderr_file.stdio().map_err(|source| {
+            BoundedCommandError::new(BoundedCommandErrorKind::Setup {
+                resource: "stderr capture",
+                source,
+            })
+        })?);
+    set_own_process_group(command);
+
+    let started = Instant::now();
+    let child = command.spawn();
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = child
+        .map_err(|source| BoundedCommandError::new(BoundedCommandErrorKind::Spawn(source)))?;
+    let pgid = child.id();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let status = terminate_helper_group(&mut child, pgid, Some(status), grace)
+                    .map_err(|detail| {
+                        uncertain_error_with_capture(
+                            detail,
+                            &mut stdout_file,
+                            &mut stderr_file,
+                        )
+                    })?;
+                let capture = read_helper_capture(&mut stdout_file, &mut stderr_file)?;
+                return helper_output(status, capture);
+            }
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(
+                    timeout
+                        .saturating_sub(started.elapsed())
+                        .min(WAIT_POLL),
+                );
+            }
+            Ok(None) => {
+                let outcome = terminate_helper_group(&mut child, pgid, None, grace);
+                let capture = match read_helper_capture(&mut stdout_file, &mut stderr_file) {
+                    Ok(capture) => capture,
+                    Err(error) => {
+                        if let Err(detail) = &outcome {
+                            return Err(BoundedCommandError::new(
+                                BoundedCommandErrorKind::StateUncertain(format!(
+                                    "timed out after {} ms; {detail}; \
+                                     capture unavailable: {error}",
+                                    timeout.as_millis()
+                                )),
+                            ));
+                        }
+                        return Err(error);
+                    }
+                };
+                return match outcome {
+                    Ok(_) => Err(BoundedCommandError::with_capture(
+                        BoundedCommandErrorKind::TimedOut(timeout),
+                        capture,
+                    )),
+                    Err(detail) => Err(BoundedCommandError::with_capture(
+                        BoundedCommandErrorKind::StateUncertain(format!(
+                            "timed out after {} ms; {detail}",
+                            timeout.as_millis()
+                        )),
+                        capture,
+                    )),
+                };
+            }
+            Err(source) => {
+                let original = source.to_string();
+                let outcome = terminate_helper_group(&mut child, pgid, None, grace);
+                let capture = match read_helper_capture(&mut stdout_file, &mut stderr_file) {
+                    Ok(capture) => capture,
+                    Err(error) => {
+                        if let Err(detail) = &outcome {
+                            return Err(BoundedCommandError::new(
+                                BoundedCommandErrorKind::StateUncertain(format!(
+                                    "poll subprocess: {original}; {detail}; \
+                                     capture unavailable: {error}"
+                                )),
+                            ));
+                        }
+                        return Err(error);
+                    }
+                };
+                return match outcome {
+                    Ok(_) => Err(BoundedCommandError::with_capture(
+                        BoundedCommandErrorKind::Poll(source),
+                        capture,
+                    )),
+                    Err(detail) => Err(BoundedCommandError::with_capture(
+                        BoundedCommandErrorKind::StateUncertain(format!(
+                            "poll subprocess: {original}; {detail}"
+                        )),
+                        capture,
+                    )),
+                };
+            }
+        }
+    }
+}
+
+fn terminate_helper_group(
+    child: &mut std::process::Child,
+    pgid: u32,
+    mut status: Option<ExitStatus>,
+    grace: Duration,
+) -> std::result::Result<ExitStatus, String> {
+    use std::fmt::Write as _;
+
+    if status.is_some() && !helper_group_alive(pgid) {
+        return status.ok_or_else(|| "child exited without a reapable status".to_string());
+    }
+
+    let term_error = send_signal_to_group(pgid, "-TERM")
+        .err()
+        .map(|error| error.to_string());
+    if helper_reaped_and_quiescent(child, pgid, &mut status, grace).is_ok_and(|done| done) {
+        return status.ok_or_else(|| "child exited without a reapable status".to_string());
+    }
+
+    let kill_error = send_signal_to_group(pgid, "-KILL")
+        .err()
+        .map(|error| error.to_string());
+    let direct_kill_error = if status.is_none() {
+        child.kill().err().map(|error| error.to_string())
+    } else {
+        None
+    };
+    let final_wait = helper_reaped_and_quiescent(child, pgid, &mut status, grace);
+    if matches!(&final_wait, Ok(true)) {
+        return status.ok_or_else(|| "child exited without a reapable status".to_string());
+    }
+
+    let mut detail = format!(
+        "child_reaped={}, process_group_alive={}",
+        status.is_some(),
+        helper_group_alive(pgid)
+    );
+    if let Err(error) = final_wait {
+        let _ = write!(detail, ", final poll failed: {error}");
+    }
+    if let Some(error) = term_error {
+        let _ = write!(detail, ", TERM failed: {error}");
+    }
+    if let Some(error) = kill_error {
+        let _ = write!(detail, ", KILL failed: {error}");
+    }
+    if let Some(error) = direct_kill_error {
+        let _ = write!(detail, ", direct KILL failed: {error}");
+    }
+    Err(detail)
+}
+
+fn helper_reaped_and_quiescent(
+    child: &mut std::process::Child,
+    pgid: u32,
+    status: &mut Option<ExitStatus>,
+    timeout: Duration,
+) -> std::io::Result<bool> {
+    let started = Instant::now();
+    loop {
+        if status.is_none() {
+            *status = child.try_wait()?;
+        }
+        if status.is_some() && !helper_group_alive(pgid) {
+            return Ok(true);
+        }
+        if started.elapsed() >= timeout {
+            return Ok(false);
+        }
+        std::thread::sleep(
+            timeout
+                .saturating_sub(started.elapsed())
+                .min(WAIT_POLL),
+        );
+    }
+}
+
+#[cfg(unix)]
+fn helper_group_alive(pgid: u32) -> bool {
+    crate::quarantine::process_group_alive(pgid)
+}
+
+#[cfg(not(unix))]
+fn helper_group_alive(_pgid: u32) -> bool {
+    false
+}
+
+fn read_helper_capture(
+    stdout_file: &mut HelperTempFile,
+    stderr_file: &mut HelperTempFile,
+) -> std::result::Result<HelperCapture, BoundedCommandError> {
+    let (stdout, stdout_truncated) = stdout_file.read_bounded().map_err(|source| {
+        BoundedCommandError::new(BoundedCommandErrorKind::Setup {
+            resource: "stdout evidence",
+            source,
+        })
+    })?;
+    let (stderr, stderr_truncated) = stderr_file.read_bounded().map_err(|source| {
+        BoundedCommandError::new(BoundedCommandErrorKind::Setup {
+            resource: "stderr evidence",
+            source,
+        })
+    })?;
+    Ok(HelperCapture {
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+    })
+}
+
+fn uncertain_error_with_capture(
+    detail: String,
+    stdout_file: &mut HelperTempFile,
+    stderr_file: &mut HelperTempFile,
+) -> BoundedCommandError {
+    match read_helper_capture(stdout_file, stderr_file) {
+        Ok(capture) => BoundedCommandError::with_capture(
+            BoundedCommandErrorKind::StateUncertain(detail),
+            capture,
+        ),
+        Err(error) => BoundedCommandError::new(BoundedCommandErrorKind::StateUncertain(format!(
+            "{detail}; capture unavailable: {error}"
+        ))),
+    }
+}
+
+fn helper_output(
+    status: ExitStatus,
+    capture: HelperCapture,
+) -> std::result::Result<Output, BoundedCommandError> {
+    let streams = match (capture.stdout_truncated, capture.stderr_truncated) {
+        (true, true) => Some("stdout and stderr"),
+        (true, false) => Some("stdout"),
+        (false, true) => Some("stderr"),
+        (false, false) => None,
+    };
+    if let Some(streams) = streams {
+        return Err(BoundedCommandError::with_capture(
+            BoundedCommandErrorKind::OutputLimit {
+                streams,
+                limit: HELPER_CAPTURE_LIMIT,
+            },
+            capture,
+        ));
+    }
+    Ok(Output {
+        status,
+        stdout: capture.stdout,
+        stderr: capture.stderr,
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1622,23 +2191,24 @@ fn set_own_process_group(_command: &mut Command) {}
 /// otherwise.
 #[cfg(unix)]
 fn send_signal_to_group(pid: u32, signal: &str) -> Result<()> {
-    let status = Command::new("kill")
-        .arg(signal)
-        .arg(format!("-{pid}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| DispatchError::new(format!("failed to spawn kill {signal} -{pid}: {e}")))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(DispatchError::new(format!(
-            "kill {signal} -{pid} failed with status {}",
-            status
-                .code()
-                .map_or_else(|| "signal".to_string(), |code| code.to_string())
-        )))
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let raw_pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| DispatchError::new(format!("invalid process-group id {pid}")))?;
+    let signal = match signal {
+        "-TERM" => Signal::SIGTERM,
+        "-KILL" => Signal::SIGKILL,
+        _ => return Err(DispatchError::new(format!("unsupported signal {signal}"))),
+    };
+    match kill(Pid::from_raw(-raw_pid), Some(signal)) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(DispatchError::new(format!(
+            "kill {signal:?} -{pid} failed: {error}"
+        ))),
     }
 }
 
@@ -1696,20 +2266,14 @@ pub(crate) struct GitCommitProbe;
 
 impl CommitProbe for GitCommitProbe {
     fn head(&self, repo: &Path) -> Result<Option<String>> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["rev-parse", "HEAD"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|e| {
-                DispatchError::new(format!(
-                    "failed to run git rev-parse in {}: {e}",
-                    repo.display()
-                ))
-            })?;
+        let mut command = Command::new("git");
+        command.arg("-C").arg(repo).args(["rev-parse", "HEAD"]);
+        let output = run_bounded_command(&mut command).map_err(|error| {
+            DispatchError::new(format!(
+                "failed to run git rev-parse in {}: {error}",
+                repo.display()
+            ))
+        })?;
         if !output.status.success() {
             return Ok(None);
         }
@@ -1722,20 +2286,17 @@ impl CommitProbe for GitCommitProbe {
     }
 
     fn is_clean(&self, repo: &Path) -> Result<bool> {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(repo)
-            .args(["status", "--porcelain", "--untracked-files=normal"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| {
-                DispatchError::new(format!(
-                    "failed to run git status in {}: {error}",
-                    repo.display()
-                ))
-            })?;
+            .args(["status", "--porcelain", "--untracked-files=normal"]);
+        let output = run_bounded_command(&mut command).map_err(|error| {
+            DispatchError::new(format!(
+                "failed to run git status in {}: {error}",
+                repo.display()
+            ))
+        })?;
         if !output.status.success() {
             return Err(DispatchError::new(format!(
                 "git status failed in {}: {}",
@@ -1747,20 +2308,17 @@ impl CommitProbe for GitCommitProbe {
     }
 
     fn is_direct_child(&self, repo: &Path, before: Option<&str>, commit: &str) -> Result<bool> {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(repo)
-            .args(["rev-list", "--parents", "-n", "1", commit])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|e| {
-                DispatchError::new(format!(
-                    "failed to inspect commit parents in {}: {e}",
-                    repo.display()
-                ))
-            })?;
+            .args(["rev-list", "--parents", "-n", "1", commit]);
+        let output = run_bounded_command(&mut command).map_err(|error| {
+            DispatchError::new(format!(
+                "failed to inspect commit parents in {}: {error}",
+                repo.display()
+            ))
+        })?;
         if !output.status.success() {
             return Ok(false);
         }
@@ -1776,20 +2334,17 @@ impl CommitProbe for GitCommitProbe {
     }
 
     fn committer_email(&self, repo: &Path, commit: &str) -> Result<Option<String>> {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(repo)
-            .args(["show", "--no-patch", "--format=%ce", commit])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|e| {
-                DispatchError::new(format!(
-                    "failed to read committer identity in {}: {e}",
-                    repo.display()
-                ))
-            })?;
+            .args(["show", "--no-patch", "--format=%ce", commit]);
+        let output = run_bounded_command(&mut command).map_err(|error| {
+            DispatchError::new(format!(
+                "failed to read committer identity in {}: {error}",
+                repo.display()
+            ))
+        })?;
         if !output.status.success() {
             return Ok(None);
         }
@@ -2954,6 +3509,153 @@ mod tests {
         fn committer_email(&self, _repo: &Path, _commit: &str) -> Result<Option<String>> {
             Ok(Some(TEST_ATTEMPT_IDENTITY.to_string()))
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_command_captures_normal_output() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("printf normal; printf diagnostic >&2");
+
+        let output = run_bounded_command_with_limits(
+            &mut command,
+            None,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .expect("bounded command succeeds");
+
+        assert_eq!(
+            (
+                output.status.code(),
+                output.stdout.as_slice(),
+                output.stderr.as_slice()
+            ),
+            (Some(0), b"normal".as_slice(), b"diagnostic".as_slice())
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_command_file_backed_stdin_cannot_deadlock_against_output() {
+        let input = vec![b'i'; 256 * 1024];
+        let mut command = Command::new("/usr/bin/python3");
+        command.args([
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'o' * 131072); sys.stdout.flush(); \
+             data = sys.stdin.buffer.read(); sys.stdout.write(str(len(data)))",
+        ]);
+
+        let output = run_bounded_command_with_limits(
+            &mut command,
+            Some(&input),
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .expect("opposing large stdin/stdout completes without pipe deadlock");
+
+        assert!(
+            output.status.success()
+                && output.stdout.len() == 131_072 + 6
+                && output.stdout.ends_with(b"262144"),
+            "unexpected staged-stdin output: status={}, bytes={}",
+            output.status,
+            output.stdout.len()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_command_returns_nonzero_output_without_hiding_evidence() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf partial; printf rejected >&2; exit 7");
+
+        let output = run_bounded_command_with_limits(
+            &mut command,
+            None,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .expect("nonzero status is observable output, not a runner error");
+
+        assert_eq!(
+            (
+                output.status.code(),
+                output.stdout.as_slice(),
+                output.stderr.as_slice()
+            ),
+            (Some(7), b"partial".as_slice(), b"rejected".as_slice())
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_command_timeout_preserves_captured_output_after_reap() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf before-timeout; printf timeout-detail >&2; sleep 30");
+
+        let error = run_bounded_command_with_limits(
+            &mut command,
+            None,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .expect_err("sleep must time out");
+
+        assert_eq!(
+            (
+                error.is_timeout(),
+                error.leaves_process_state_uncertain(),
+                error.stdout(),
+                error.stderr()
+            ),
+            (
+                true,
+                false,
+                b"before-timeout".as_slice(),
+                b"timeout-detail".as_slice()
+            )
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_command_kills_term_resistant_descendant_before_timeout_error() {
+        let temp = TempDir::new("bounded-command-descendant");
+        let marker = temp.path().join("descendant.pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                "sh -c 'trap \"\" TERM; echo $$ > \"$1\"; while :; do sleep 1; done' \
+                 descendant \"$1\" & wait",
+            )
+            .arg("parent")
+            .arg(&marker);
+
+        let error = run_bounded_command_with_limits(
+            &mut command,
+            None,
+            Duration::from_secs(1),
+            Duration::from_millis(500),
+        )
+        .expect_err("TERM-resistant descendant must force KILL escalation");
+        let descendant_pid = std::fs::read_to_string(&marker)
+            .expect("descendant wrote pid")
+            .trim()
+            .parse::<u32>()
+            .expect("descendant pid");
+
+        assert!(
+            error.is_timeout()
+                && !error.leaves_process_state_uncertain()
+                && !crate::quarantine::process_alive(descendant_pid),
+            "timeout must be reported only after the TERM-resistant descendant is gone: {error}"
+        );
     }
 
     #[test]

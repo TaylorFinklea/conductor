@@ -8,7 +8,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -613,14 +613,14 @@ impl CommandDeckValidator {
 impl DeckValidator for CommandDeckValidator {
     fn validate(&self, report_path: &Path) -> Result<()> {
         let command = format!("harness-deck validate {}", report_path.display());
-        let output = Command::new("harness-deck")
-            .arg("validate")
-            .arg(report_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| DeckError::new(format!("failed to spawn `{command}`: {e}")))?;
+        let mut process = Command::new("harness-deck");
+        process.arg("validate").arg(report_path);
+        let output = crate::dispatch::run_bounded_command(&mut process).map_err(|error| {
+            error.spawn_source().map_or_else(
+                || DeckError::new(format!("bounded `{command}` failed: {error}")),
+                |source| DeckError::new(format!("failed to spawn `{command}`: {source}")),
+            )
+        })?;
         if output.status.success() {
             return Ok(());
         }

@@ -16,7 +16,9 @@
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(test)]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
@@ -248,15 +250,13 @@ fn split_nul_paths(raw: &[u8]) -> std::result::Result<Vec<String>, String> {
         .collect()
 }
 
-fn run_git(repo: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+fn run_git(
+    repo: &Path,
+    args: &[&str],
+) -> std::result::Result<std::process::Output, crate::dispatch::BoundedCommandError> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args);
+    crate::dispatch::run_bounded_command(&mut command)
 }
 
 fn git_text(repo: &Path, args: &[&str]) -> std::result::Result<String, String> {
@@ -320,27 +320,10 @@ fn git_apply_stdin(
     ];
     args.extend(excluding.iter().map(|path| format!("--exclude={path}")));
     args.push("-".to_string());
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("failed to spawn git apply in {}: {error}", repo.display()))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| "git apply stdin was not piped".to_string())?
-        .write_all(patch)
-        .map_err(|error| format!("failed to write patch to git apply stdin: {error}"))?;
-    let output = child.wait_with_output().map_err(|error| {
-        format!(
-            "failed to wait for git apply in {}: {error}",
-            repo.display()
-        )
-    })?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(&args);
+    let output = crate::dispatch::run_bounded_command_with_input(&mut command, patch)
+        .map_err(|error| format!("failed to run git apply in {}: {error}", repo.display()))?;
     if !output.status.success() {
         return Err(format!(
             "git apply failed in {}: {}",
@@ -759,19 +742,16 @@ fn lease_location(state_dir: &Path, canonical_repo: &str) -> Result<LeaseLocatio
         });
     }
 
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
-        .args(["rev-parse", "--git-common-dir"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| {
-            QuarantineError::CaptureFailed(format!(
-                "failed to resolve repository-scoped lease directory for {canonical_repo}: {error}"
-            ))
-        })?;
+        .args(["rev-parse", "--git-common-dir"]);
+    let output = crate::dispatch::run_bounded_command(&mut command).map_err(|error| {
+        QuarantineError::CaptureFailed(format!(
+            "failed to resolve repository-scoped lease directory for {canonical_repo}: {error}"
+        ))
+    })?;
     if !output.status.success() {
         return Err(QuarantineError::CaptureFailed(format!(
             "failed to resolve repository-scoped lease directory for {canonical_repo}: {}",
@@ -970,21 +950,12 @@ fn wait_for_test_path(path: &Path) {
     }
 }
 
-/// Probes whether `pid` still refers to a live process via `kill -0`, the
-/// standard POSIX existence check (mirrors the shell-out style already used
-/// by [`send_signal_to_group`](crate::dispatch) for the same reason: this
-/// crate forbids `unsafe`, so a direct `kill(2)` syscall is not an option).
-/// Fails closed on *every* ambiguous signal — the `kill` binary missing, an
-/// unreadable result, or, critically, `EPERM` (the process exists but is
-/// owned by another user, e.g. after a pid landed on someone else's daemon):
-/// only a positively confirmed `ESRCH` ("No such process") reports death.
-/// Reclaim therefore only ever fires on a *proven*-dead holder, never on an
-/// inconclusive probe. Shared with `dispatch_cycle`'s stale-claim reclaim so
-/// both recovery paths authenticate a dead owner the same, single way rather
-/// than each growing its own weaker liveness check.
+/// Probes whether `pid` still refers to a live process using POSIX signal
+/// semantics. Only `ESRCH` proves absence; permission and conversion failures
+/// remain live so stale-state recovery fails closed.
 #[cfg(unix)]
 pub(crate) fn process_alive(pid: u32) -> bool {
-    !kill_probe_confirmed_absent(&pid.to_string())
+    signal_target_alive(pid, false)
 }
 
 #[cfg(not(unix))]
@@ -992,20 +963,11 @@ pub(crate) fn process_alive(_pid: u32) -> bool {
     true
 }
 
-/// Probes whether any process in the group led by `pgid` is still alive.
-/// POSIX `kill(2)` treats a negative pid as a process-group target, so
-/// `kill -0 -<pgid>` succeeds while the group has members, reports `EPERM`
-/// when it has members we cannot signal, and only reports `ESRCH` once the
-/// group is empty. This proves an orphaned worker *and every descendant still
-/// in its group* is gone — a dead `undertake` owner is not proof its
-/// separately grouped worker died with it. Fails closed exactly like
-/// [`process_alive`]: anything short of a confirmed-empty group reads as
-/// still-alive.
+/// Probes whether any process remains in the group led by `pgid`. Only
+/// `ESRCH` proves the group empty; every ambiguous result fails closed.
 #[cfg(unix)]
 pub(crate) fn process_group_alive(pgid: u32) -> bool {
-    // Match `send_signal_to_group`'s `-<pid>` convention: the negative operand
-    // addresses the whole group.
-    !kill_probe_confirmed_absent(&format!("-{pgid}"))
+    signal_target_alive(pgid, true)
 }
 
 #[cfg(not(unix))]
@@ -1013,40 +975,17 @@ pub(crate) fn process_group_alive(_pgid: u32) -> bool {
     true
 }
 
-/// Runs `kill -0 <target>` under a forced `C` locale (so the errno text is
-/// the canonical `strerror` form regardless of the operator's `LANG`) and
-/// reports whether the target is *positively confirmed absent*. Only an
-/// `ESRCH` ("No such process") result qualifies; success (alive), `EPERM`
-/// (exists but not ours), a missing `kill` binary, or any unrecognized
-/// failure all report `false` (cannot prove absence) so callers fail closed.
 #[cfg(unix)]
-fn kill_probe_confirmed_absent(target: &str) -> bool {
-    let output = Command::new("kill")
-        .env("LC_ALL", "C")
-        .arg("-0")
-        .arg(target)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output();
-    match output {
-        Ok(output) => classify_kill_probe(output.status.success(), &output.stderr),
-        Err(_) => false,
-    }
-}
+fn signal_target_alive(id: u32, group: bool) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
 
-/// Pure classifier for a `kill -0` result: `true` only when the probe
-/// positively confirms the target is absent (`ESRCH`). Split out from the
-/// shell-out so the `EPERM`-versus-`ESRCH` boundary can be unit-tested without
-/// spawning a real cross-user process.
-#[cfg(unix)]
-fn classify_kill_probe(success: bool, stderr: &[u8]) -> bool {
-    if success {
-        return false;
-    }
-    String::from_utf8_lossy(stderr)
-        .to_ascii_lowercase()
-        .contains("no such process")
+    let Some(raw) = i32::try_from(id).ok().filter(|id| *id > 0) else {
+        return true;
+    };
+    let target = if group { -raw } else { raw };
+    !matches!(kill(Pid::from_raw(target), None), Err(Errno::ESRCH))
 }
 
 /// Scans every run recorded under `state_dir` for another run — one whose
@@ -3007,25 +2946,6 @@ mod tests {
             .expect_err("the live replacement identity must remain fail-closed");
     }
 
-    #[test]
-    fn classify_kill_probe_only_confirms_absence_on_esrch() {
-        // Success => the target exists and we could signal it => alive.
-        assert!(!classify_kill_probe(true, b""));
-        // ESRCH => positively confirmed absent.
-        assert!(classify_kill_probe(
-            false,
-            b"kill: (12345) - No such process\n"
-        ));
-        assert!(classify_kill_probe(false, b"kill: 12345: no such process"));
-        // EPERM => the process exists but is owned by another user; it must
-        // read as alive (fail closed), never as dead.
-        assert!(!classify_kill_probe(
-            false,
-            b"kill: (1) - Operation not permitted\n"
-        ));
-        // Any other unrecognized failure is inconclusive => alive.
-        assert!(!classify_kill_probe(false, b"kill: something unexpected\n"));
-    }
 
     #[test]
     fn process_alive_reports_live_and_reaped_processes_and_survives_eperm() {

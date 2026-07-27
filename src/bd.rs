@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -174,16 +174,18 @@ impl CommandBdClient {
 
     fn run_json(repo: &Path, args: &[String]) -> Result<String> {
         let command = display_command(repo, args);
-        let output = Command::new("bd")
+        let mut process = Command::new("bd");
+        process
             .arg("-C")
             .arg(repo)
             .args(args)
-            .arg("--json")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| BdError::new(format!("failed to spawn `{command}`: {e}")))?;
+            .arg("--json");
+        let output = crate::dispatch::run_bounded_command(&mut process).map_err(|error| {
+            error.spawn_source().map_or_else(
+                || BdError::new(format!("bounded `{command}` failed: {error}")),
+                |source| BdError::new(format!("failed to spawn `{command}`: {source}")),
+            )
+        })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();

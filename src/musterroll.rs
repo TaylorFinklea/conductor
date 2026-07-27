@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -687,13 +687,10 @@ impl CommandMusterrollClient {
 
 impl MusterrollClient for CommandMusterrollClient {
     fn status(&self) -> Result<StatusReport> {
-        let output = Command::new("musterroll")
-            .args(["status", "--json"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| spawn_error("musterroll status --json", &error))?;
+        let mut command = Command::new("musterroll");
+        command.args(["status", "--json"]);
+        let output = crate::dispatch::run_bounded_command(&mut command)
+            .map_err(|error| bounded_command_error("musterroll status --json", &error))?;
 
         if !output.status.success() {
             return Err(command_failure("musterroll status --json", &output));
@@ -705,13 +702,10 @@ impl MusterrollClient for CommandMusterrollClient {
     }
 
     fn roster_snapshot(&self) -> Result<RosterSnapshot> {
-        let output = Command::new("musterroll")
-            .args(["roster", "snapshot", "--json"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| spawn_error("musterroll roster snapshot --json", &error))?;
+        let mut command = Command::new("musterroll");
+        command.args(["roster", "snapshot", "--json"]);
+        let output = crate::dispatch::run_bounded_command(&mut command)
+            .map_err(|error| bounded_command_error("musterroll roster snapshot --json", &error))?;
 
         if !output.status.success() {
             return Err(command_failure("musterroll roster snapshot --json", &output));
@@ -722,19 +716,26 @@ impl MusterrollClient for CommandMusterrollClient {
 
     fn observe(&self, request: &ObservationRequest) -> Result<()> {
         let args = observation_args(request);
-        let output = Command::new("musterroll")
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| spawn_error("musterroll observe", &error))?;
+        let mut command = Command::new("musterroll");
+        command.args(&args);
+        let output = crate::dispatch::run_bounded_command(&mut command)
+            .map_err(|error| bounded_command_error("musterroll observe", &error))?;
 
         if !output.status.success() {
             return Err(command_failure("musterroll observe", &output));
         }
         Ok(())
     }
+}
+
+fn bounded_command_error(
+    command: &str,
+    error: &crate::dispatch::BoundedCommandError,
+) -> MusterrollError {
+    error.spawn_source().map_or_else(
+        || MusterrollError::command(format!("{command}: {error}")),
+        |source| spawn_error(command, source),
+    )
 }
 
 fn spawn_error(command: &str, error: &io::Error) -> MusterrollError {
