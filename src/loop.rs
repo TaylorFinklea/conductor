@@ -28,6 +28,7 @@ use crate::run::{
 
 const LOOP_STATE_PATH: &str = "loop.json";
 const LOOP_SCHEMA: &str = "undertake/loop@1";
+const PROCESS_KILL_GRACE: Duration = Duration::from_secs(5);
 pub(crate) type Result<T, E = LoopError> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone)]
@@ -455,12 +456,17 @@ fn finish_process(mut child: Box<dyn ChildProcess>, timeout: Duration) -> Result
     {
         status
     } else {
-        child
-            .terminate()
-            .map_err(|error| LoopError::new(format!("terminate timed-out subprocess: {error}")))?;
-        child
-            .wait()
-            .map_err(|error| LoopError::new(format!("reap timed-out subprocess: {error}")))?
+        let _ = child.terminate();
+        if let Ok(Some(status)) = child.wait_for(PROCESS_KILL_GRACE) {
+            status
+        } else {
+            child
+                .kill()
+                .map_err(|error| LoopError::new(format!("kill timed-out subprocess: {error}")))?;
+            child
+                .wait()
+                .map_err(|error| LoopError::new(format!("reap killed subprocess: {error}")))?
+        }
     };
     child
         .ensure_worker_quiescent()
@@ -551,7 +557,7 @@ fn run_error(error: crate::run::RunError) -> LoopError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -754,6 +760,51 @@ mod tests {
                 CommitReceiptEvidence::accepting,
             )
         }
+    }
+
+    struct TermResistantChild {
+        terminated: Rc<Cell<bool>>,
+        killed: Rc<Cell<bool>>,
+    }
+
+    impl ChildProcess for TermResistantChild {
+        fn wait_for(
+            &mut self,
+            _timeout: Duration,
+        ) -> crate::dispatch::Result<Option<ProcessStatus>> {
+            Ok(None)
+        }
+
+        fn terminate(&mut self) -> crate::dispatch::Result<()> {
+            self.terminated.set(true);
+            Ok(())
+        }
+
+        fn kill(&mut self) -> crate::dispatch::Result<()> {
+            self.killed.set(true);
+            Ok(())
+        }
+
+        fn wait(&mut self) -> crate::dispatch::Result<ProcessStatus> {
+            assert!(self.killed.get(), "wait must not block before hard kill");
+            Ok(ProcessStatus::code(9))
+        }
+    }
+
+    #[test]
+    fn timed_out_loop_process_escalates_to_kill_before_blocking_wait() {
+        let terminated = Rc::new(Cell::new(false));
+        let killed = Rc::new(Cell::new(false));
+        let child = TermResistantChild {
+            terminated: Rc::clone(&terminated),
+            killed: Rc::clone(&killed),
+        };
+
+        let run = finish_process(Box::new(child), Duration::ZERO).expect("reap process");
+
+        assert!(terminated.get());
+        assert!(killed.get());
+        assert_eq!(run.status, ProcessStatus::code(9));
     }
 
     fn spawn(command: &str) -> SpawnRequest {

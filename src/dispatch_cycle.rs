@@ -6558,6 +6558,12 @@ fn extract_dispatch_fields(
         .ok_or_else(|| {
             DispatchCycleError::message(format!("issue {} has no verify_cmd", issue.id))
         })?;
+    if verify_cmd.trim().is_empty() {
+        return Err(DispatchCycleError::message(format!(
+            "issue {} has an empty verify_cmd",
+            issue.id
+        )));
+    }
     Ok(ExtractedFields {
         verify_cmd,
         routing,
@@ -13895,6 +13901,22 @@ provider = "opencode-go"
             dependent_count: None,
             comment_count: None,
         }
+    }
+
+    #[test]
+    fn dispatch_rejects_a_blank_verify_command() {
+        let mut issue = sandbox_issue();
+        issue
+            .metadata
+            .as_mut()
+            .expect("sandbox metadata")
+            .insert("verify_cmd".to_string(), json!(" \t "));
+
+        let Err(error) = extract_dispatch_fields(&issue, None) else {
+            panic!("blank verifier must fail");
+        };
+
+        assert!(error.to_string().contains("empty verify_cmd"));
     }
 
     /// Runs git in the attempt checkout under the spawn environment, so a fake
