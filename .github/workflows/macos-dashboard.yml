@@ -1,0 +1,53 @@
+name: macOS dashboard regressions
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-dashboard-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  terminal-loss:
+    name: Terminal loss and cleanup
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Select Rust toolchain
+        run: rustup override set stable
+
+      - name: Test PTY master closure at refresh extremes
+        run: cargo test --features tui closed_terminal_exits_at_both_refresh_extremes -- --nocapture
+
+      - name: Test signals after terminal hangup
+        run: |
+          cargo test --features tui sigterm_after_terminal_hangup_cannot_be_starved -- --nocapture
+          cargo test --features tui sighup_after_terminal_hangup_cannot_be_starved -- --nocapture
+
+      - name: Test dashboard runtime cleanup
+        run: cargo test --features tui dashboard::runtime::tests -- --nocapture
+
+      - name: Reject surviving dashboard descendants
+        if: always()
+        shell: bash
+        run: |
+          survivors="$(pgrep -f "$GITHUB_WORKSPACE/target/release/undertake dashboard" || true)"
+          if [[ -n "$survivors" ]]; then
+            survivor_csv="$(printf '%s\n' "$survivors" | paste -sd, -)"
+            ps -ww -p "$survivor_csv" -o pid,ppid,pgid,etime,state,%cpu,command
+            kill -KILL $survivors || true
+            echo "Dashboard descendants survived the PTY regression suite" >&2
+            exit 1
+          fi
