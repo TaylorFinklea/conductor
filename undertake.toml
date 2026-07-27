@@ -73,8 +73,10 @@ item_wall_clock_mins = 45
 cycle_wall_clock_mins = 90
 # Hard limits inherited by every worker descendant, including `setsid` children.
 # Address-space allowance is sampled launcher VM plus 32 GiB for Node/Python JITs.
+# NPROC is per real UID, so this reserve absorbs bounded concurrent host jobs
+# that start after the launcher samples the current same-UID process baseline.
 worker_cpu_seconds = 900
-worker_process_headroom = 64
+worker_process_headroom = 256
 worker_address_space_headroom_mib = 32768
 worker_file_size_mib = 1024
 # Plan requests default to one peer-requested revision; the parser hard-caps

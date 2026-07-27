@@ -4838,15 +4838,12 @@ fn validate_pending_approval(
 }
 
 /// Worker-runtime observer for one work run: before each attempt is spawned,
-/// durably invalidates any earlier attempt's recorded process-group identity;
-/// once the new worker exists, binds the run to its process group before it
-/// can mutate the repository; then heartbeats liveness and the live report
-/// while the worker runs. That invalidate-then-bind order (see
-/// `dispatch::WorkerHooks`) means a crash between a spawn and its matching
-/// `on_spawn` call never leaves a superseded attempt's already-dead identity
-/// standing in for the new, still-unrecorded one. A single observer (rather
-/// than separate closures) holds the one exclusive borrow of the run handle
-/// needed for both hooks.
+/// durably binds its commit-hook generation and invalidates any earlier
+/// process-group identity; once the worker exists, binds the new group before
+/// it can mutate the repository; then heartbeats liveness and the live report
+/// while the worker runs. Persisting the hook reference before materializing
+/// its directory lets bounded garbage collection preserve every current
+/// attempt without a state-directory-wide lock.
 struct WorkRunHooks<'a, L: LiveSink + ?Sized> {
     run_artifacts: &'a mut RunHandle,
     live: &'a L,
@@ -4857,10 +4854,19 @@ struct WorkRunHooks<'a, L: LiveSink + ?Sized> {
 }
 
 impl<L: LiveSink + ?Sized> dispatch::WorkerHooks for WorkRunHooks<'_, L> {
-    fn on_pre_spawn(&mut self) -> dispatch::Result<()> {
-        self.run_artifacts
-            .invalidate_worker_group()
-            .map_err(|error| dispatch::DispatchError::new(error.into_message()))
+    fn on_pre_spawn(
+        &mut self,
+        hook_name: &str,
+    ) -> dispatch::Result<Option<dispatch::WorkerHookRegistration>> {
+        let run_id = self.run_artifacts.run_id().to_string();
+        let superseded_hook = self
+            .run_artifacts
+            .prepare_worker_commit_hook(hook_name)
+            .map_err(|error| dispatch::DispatchError::new(error.into_message()))?;
+        Ok(Some(dispatch::WorkerHookRegistration::new(
+            run_id,
+            superseded_hook,
+        )))
     }
 
     fn on_spawn(&mut self, pid: Option<u32>) -> dispatch::Result<()> {
@@ -4872,6 +4878,12 @@ impl<L: LiveSink + ?Sized> dispatch::WorkerHooks for WorkRunHooks<'_, L> {
         };
         self.run_artifacts
             .record_worker_group(pid)
+            .map_err(|error| dispatch::DispatchError::new(error.into_message()))
+    }
+
+    fn on_worker_quiescent(&mut self, hook_name: &str) -> dispatch::Result<()> {
+        self.run_artifacts
+            .clear_worker_commit_hook(hook_name)
             .map_err(|error| dispatch::DispatchError::new(error.into_message()))
     }
 

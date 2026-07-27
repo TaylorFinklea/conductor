@@ -320,20 +320,11 @@ impl RatchetFileStore {
         }
     }
 
-    /// Atomically write the store to disk (temp file + rename) so a crash
-    /// mid-write can't truncate the persisted state.
+    /// Durably replace the store so neither a process crash nor power loss can
+    /// publish a partial state file.
     pub(crate) fn save(&self, store: &RatchetStore) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let json = serde_json::to_vec_pretty(store).map_err(io::Error::other)?;
-        // Write to a sibling temp file in the same directory, then rename.
-        // Using a sibling (not /tmp) keeps the rename atomic on the same
-        // filesystem.
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
+        crate::run::durable_atomic_replace(&self.path, &json)
     }
 
     /// Look up the ratchet state for a single repo. Returns `Locked` for

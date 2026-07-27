@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -24,6 +24,7 @@ pub(crate) const RUN_SCHEMA: &str = "undertake/run@2";
 /// Schema tag stamped on every event line written by this module.
 pub(crate) const EVENT_SCHEMA: &str = "undertake/event@2";
 const TERMINAL_TRANSITION_PATH: &str = "artifacts/terminal-transition.json";
+const WORKER_COMMIT_HOOK_REF_PATH: &str = "worker-commit-hook";
 
 pub(crate) type Result<T> = std::result::Result<T, RunError>;
 
@@ -1354,6 +1355,51 @@ impl RunHandle {
         self.work().and_then(|work| work.worker_pgid)
     }
 
+    /// Durably names the one commit hook the next worker attempt may execute.
+    ///
+    /// The reference is persisted before the hook directory is created, so a
+    /// concurrent collector cannot mistake an attempt being prepared for stale
+    /// history. Replacing it also returns the superseded hook for prompt
+    /// bounded cleanup after the prior worker has been proven quiescent.
+    pub(crate) fn prepare_worker_commit_hook(
+        &mut self,
+        hook_name: &str,
+    ) -> Result<Option<String>> {
+        validate_worker_commit_hook_name(hook_name)?;
+        let previous = read_worker_commit_hook(&self.dir)?;
+        self.invalidate_worker_group()?;
+        let mut bytes = hook_name.as_bytes().to_vec();
+        bytes.push(b'\n');
+        atomic_replace(&self.dir.join(WORKER_COMMIT_HOOK_REF_PATH), &bytes)?;
+        Ok(previous.filter(|name| name != hook_name))
+    }
+
+    /// Durably releases the current hook only after dispatch has proven the
+    /// worker and its descendants quiescent.
+    pub(crate) fn clear_worker_commit_hook(&mut self, hook_name: &str) -> Result<()> {
+        validate_worker_commit_hook_name(hook_name)?;
+        if matches!(self.manifest.lifecycle, RunLifecycle::Finished) {
+            return Err(RunError::new(
+                "cannot clear a worker commit hook on a finished run",
+            ));
+        }
+        let work = self
+            .work()
+            .ok_or_else(|| RunError::new("clearing a worker commit hook requires work state"))?;
+        if work.stage != WorkStage::Implementing {
+            return Err(RunError::new(
+                "worker commit hook can only be cleared while implementing",
+            ));
+        }
+        let current = read_worker_commit_hook(&self.dir)?;
+        if current.as_deref() != Some(hook_name) {
+            return Err(RunError::new(format!(
+                "worker commit hook {hook_name:?} is not the current attempt hook"
+            )));
+        }
+        atomic_replace(&self.dir.join(WORKER_COMMIT_HOOK_REF_PATH), b"\n")
+    }
+
     /// Durably clears any worker-group identity recorded by an earlier
     /// attempt, before a new attempt's worker is ever spawned (see
     /// `WorkerHooks::on_pre_spawn`). Pairs with [`RunHandle::record_worker_group`]
@@ -2315,6 +2361,73 @@ fn require_v2_activation_preflight(state_dir: &Path) -> Result<()> {
 /// Returns `<state_dir>/runs-v2`, the sole active run namespace.
 pub(crate) fn runs_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("runs-v2")
+}
+
+/// Returns whether one unfinished Work run still names `hook_name` as the
+/// hook its current attempt may execute. Missing and finished runs cannot
+/// retain hook storage; malformed liveness evidence fails closed with `Err`.
+pub(crate) fn worker_commit_hook_is_current(
+    state_dir: &Path,
+    run_id: &str,
+    hook_name: &str,
+) -> Result<bool> {
+    validate_run_id(run_id)?;
+    validate_worker_commit_hook_name(hook_name)?;
+    let run_dir = runs_dir(state_dir).join(run_id);
+    let manifest_path = run_dir.join("manifest.json");
+    let manifest = match std::fs::symlink_metadata(&manifest_path) {
+        Ok(_) => read_manifest(&manifest_path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(RunError::new(format!(
+                "failed to inspect manifest {}: {error}",
+                manifest_path.display()
+            )));
+        }
+    };
+    if manifest.run_id != run_id {
+        return Err(RunError::new(format!(
+            "manifest run_id {:?} does not match hook owner {run_id:?}",
+            manifest.run_id
+        )));
+    }
+    if manifest.job != RunJob::Work || manifest.lifecycle == RunLifecycle::Finished {
+        return Ok(false);
+    }
+    Ok(read_worker_commit_hook(&run_dir)?.as_deref() == Some(hook_name))
+}
+
+fn read_worker_commit_hook(run_dir: &Path) -> Result<Option<String>> {
+    let path = run_dir.join(WORKER_COMMIT_HOOK_REF_PATH);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RunError::new(format!(
+                "failed to read worker commit hook reference {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let hook_name = contents.trim();
+    if hook_name.is_empty() {
+        return Ok(None);
+    }
+    validate_worker_commit_hook_name(hook_name)?;
+    Ok(Some(hook_name.to_string()))
+}
+
+fn validate_worker_commit_hook_name(hook_name: &str) -> Result<()> {
+    if hook_name.len() != 32
+        || !hook_name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(RunError::new(format!(
+            "invalid worker commit hook name {hook_name:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn heartbeat_path(run_dir: &Path) -> PathBuf {
@@ -3374,30 +3487,105 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Whole-file atomic replace: write to a sibling temp file, then rename over
-/// the original. Mirrors `ratchet.rs::save`.
-fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            RunError::new(format!("failed to create dir {}: {e}", parent.display()))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableReplaceStep {
+    FileSynced,
+    Renamed,
+    ParentSynced,
+}
+
+/// Crash-durable whole-file replacement shared by critical state stores.
+///
+/// A unique sibling is fully written and synced before rename; syncing the
+/// parent afterward makes the renamed directory entry durable as well.
+pub(crate) fn durable_atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    durable_atomic_replace_with_observer(path, bytes, |_| Ok(()))
+}
+
+fn durable_atomic_replace_with_observer<F>(
+    path: &Path,
+    bytes: &[u8],
+    mut observer: F,
+) -> io::Result<()>
+where
+    F: FnMut(DurableReplaceStep) -> io::Result<()>,
+{
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let base = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let (temporary, mut file) = (0_u8..100)
+        .find_map(|attempt| {
+            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(
+                ".{base}.{}.{}.{attempt}.tmp",
+                std::process::id(),
+                sequence
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => Some(Ok((candidate, file))),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("failed to allocate a temporary file for {}", path.display()),
+            )
         })?;
+
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, bytes)
-        .map_err(|e| RunError::new(format!("failed to write temp {}: {e}", tmp.display())))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(error) = observer(DurableReplaceStep::FileSynced) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    observer(DurableReplaceStep::Renamed)?;
+    sync_parent_directory(parent)?;
+    observer(DurableReplaceStep::ParentSynced)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    durable_atomic_replace(path, bytes).map_err(|error| {
         RunError::new(format!(
-            "failed to rename temp {} -> {}: {e}",
-            tmp.display(),
+            "failed to durably replace {}: {error}",
             path.display()
         ))
     })
 }
 
-/// Append-only atomic replace: read the existing file, append the new line
-/// in memory, write the full new contents to a sibling temp file, then
-/// rename over the original. Mirrors `ledger.rs::append_serialized`.
+/// Append-only journal update: preserve the existing bytes, add one line, then
+/// durably replace the whole file. Run journals have one owning process.
 fn append_event_line(path: &Path, event: &RunEvent) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -3421,17 +3609,7 @@ fn append_event_line(path: &Path, event: &RunEvent) -> Result<()> {
     let mut contents = existing;
     contents.extend_from_slice(&new_line);
 
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &contents)
-        .map_err(|e| RunError::new(format!("failed to write temp {}: {e}", tmp.display())))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        RunError::new(format!(
-            "failed to rename temp {} -> {}: {e}",
-            tmp.display(),
-            path.display()
-        ))
-    })
+    atomic_replace(path, &contents)
 }
 
 #[cfg(test)]
@@ -3463,6 +3641,83 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn durable_atomic_replace_syncs_file_before_rename_and_parent_afterward() {
+        let temp = TempDir::new("durable-replace-order");
+        let path = temp.path().join("state.json");
+        let mut steps = Vec::new();
+
+        durable_atomic_replace_with_observer(&path, b"new", |step| {
+            steps.push(step);
+            Ok(())
+        })
+        .expect("durable replacement");
+
+        assert_eq!(
+            steps,
+            [
+                DurableReplaceStep::FileSynced,
+                DurableReplaceStep::Renamed,
+                DurableReplaceStep::ParentSynced,
+            ]
+        );
+    }
+
+    #[test]
+    fn durable_atomic_replace_keeps_old_value_at_after_file_sync_failpoint() {
+        let temp = TempDir::new("durable-replace-before-rename");
+        let path = temp.path().join("state.json");
+        std::fs::write(&path, b"old").expect("seed old value");
+
+        let error = durable_atomic_replace_with_observer(&path, b"new", |step| {
+            if step == DurableReplaceStep::FileSynced {
+                Err(std::io::Error::other("modeled crash after file sync"))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("failpoint must stop before rename");
+
+        assert!(error.to_string().contains("modeled crash"));
+        assert_eq!(std::fs::read(&path).expect("read visible value"), b"old");
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("list replacement directory")
+                .count(),
+            1,
+            "failed staging file is removed"
+        );
+    }
+
+    #[test]
+    fn durable_atomic_replace_exposes_only_complete_new_value_at_after_rename_failpoint() {
+        let temp = TempDir::new("durable-replace-after-rename");
+        let path = temp.path().join("state.json");
+        std::fs::write(&path, b"old").expect("seed old value");
+
+        let error = durable_atomic_replace_with_observer(&path, b"complete-new", |step| {
+            if step == DurableReplaceStep::Renamed {
+                Err(std::io::Error::other("modeled crash after rename"))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("failpoint must stop before parent sync");
+
+        assert!(error.to_string().contains("modeled crash"));
+        assert_eq!(
+            std::fs::read(&path).expect("read visible value"),
+            b"complete-new"
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("list replacement directory")
+                .count(),
+            1,
+            "renamed staging file no longer exists"
+        );
     }
 
     fn fixed_now() -> DateTime<Utc> {
@@ -4318,6 +4573,93 @@ mod tests {
             review_resume_budget_secs: None,
         });
         request
+    }
+
+    #[test]
+    fn prepare_worker_commit_hook_supersedes_only_this_runs_prior_hook() {
+        let temp = TempDir::new("worker-hook-supersede");
+        let mut handle = RunHandle::create_at(
+            temp.path(),
+            RunJob::Work,
+            implementing_request_with_worker_pgid(Some(111)),
+            fixed_now(),
+        )
+        .expect("create implementing run");
+        let first = "1".repeat(32);
+        let second = "2".repeat(32);
+
+        assert_eq!(
+            handle
+                .prepare_worker_commit_hook(&first)
+                .expect("prepare first hook"),
+            None
+        );
+        assert!(
+            worker_commit_hook_is_current(temp.path(), handle.run_id(), &first)
+                .expect("check first hook")
+        );
+
+        assert_eq!(
+            handle
+                .prepare_worker_commit_hook(&second)
+                .expect("prepare fallback hook"),
+            Some(first.clone())
+        );
+        assert!(
+            !worker_commit_hook_is_current(temp.path(), handle.run_id(), &first)
+                .expect("old hook is superseded")
+        );
+        assert!(
+            worker_commit_hook_is_current(temp.path(), handle.run_id(), &second)
+                .expect("new hook is current")
+        );
+    }
+
+    #[test]
+    fn clear_worker_commit_hook_releases_only_the_quiescent_current_hook() {
+        let temp = TempDir::new("worker-hook-clear");
+        let mut handle = RunHandle::create_at(
+            temp.path(),
+            RunJob::Work,
+            implementing_request_with_worker_pgid(None),
+            fixed_now(),
+        )
+        .expect("create implementing run");
+        let hook = "c".repeat(32);
+        handle
+            .prepare_worker_commit_hook(&hook)
+            .expect("prepare hook");
+
+        handle
+            .clear_worker_commit_hook(&hook)
+            .expect("clear quiescent hook");
+
+        assert!(
+            !worker_commit_hook_is_current(temp.path(), handle.run_id(), &hook)
+                .expect("cleared hook is not current")
+        );
+    }
+
+    #[test]
+    fn worker_commit_hook_is_not_current_after_run_finishes() {
+        let temp = TempDir::new("worker-hook-finished");
+        let mut handle = RunHandle::create_at(
+            temp.path(),
+            RunJob::Work,
+            implementing_request_with_worker_pgid(None),
+            fixed_now(),
+        )
+        .expect("create implementing run");
+        let hook = "a".repeat(32);
+        handle
+            .prepare_worker_commit_hook(&hook)
+            .expect("prepare hook");
+        handle.finish("failed").expect("finish run");
+
+        assert!(
+            !worker_commit_hook_is_current(temp.path(), handle.run_id(), &hook)
+                .expect("finished run cannot reference a hook")
+        );
     }
 
     #[test]

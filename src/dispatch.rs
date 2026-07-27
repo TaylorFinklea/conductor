@@ -362,22 +362,37 @@ pub(crate) trait ChildProcess {
     }
 }
 
+/// Durable ownership returned by a Work run before its hook is materialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkerHookRegistration {
+    run_id: String,
+    superseded_hook: Option<String>,
+}
+
+impl WorkerHookRegistration {
+    pub(crate) fn new(run_id: String, superseded_hook: Option<String>) -> Self {
+        Self {
+            run_id,
+            superseded_hook,
+        }
+    }
+}
+
 /// Callbacks the worker runtime invokes around a dispatched worker's lifetime.
 /// A single observer (rather than separate closures) so it can hold one
 /// exclusive borrow of the run's durable state across both the one-shot
 /// spawn hooks and the repeated heartbeat ticks.
 pub(crate) trait WorkerHooks {
-    /// Invoked exactly once, immediately before the worker is spawned, to
-    /// durably invalidate any earlier attempt's recorded process-group
-    /// identity. Only after this returns `Ok` does [`run_with_heartbeat`]
-    /// spawn the new worker, so a crash between this call and the matching
-    /// [`WorkerHooks::on_spawn`] leaves the run's durable state holding no
-    /// worker identity at all — never a superseded attempt's (by-then-dead)
-    /// group, which recovery could otherwise mistake for proof this new,
-    /// still-unrecorded attempt died too. Returning `Err` prevents the spawn
-    /// entirely: nothing has started yet, so there is nothing to reap.
-    fn on_pre_spawn(&mut self) -> Result<()> {
-        Ok(())
+    /// Invoked exactly once, immediately before the worker's commit hook is
+    /// materialized. Work runs durably bind `hook_name` and invalidate the
+    /// prior worker group in this callback; the returned run identity lets
+    /// bounded garbage collection distinguish current from stale hooks.
+    /// Returning `Err` prevents hook creation and process spawn entirely.
+    fn on_pre_spawn(
+        &mut self,
+        _hook_name: &str,
+    ) -> Result<Option<WorkerHookRegistration>> {
+        Ok(None)
     }
     /// Invoked exactly once, immediately after the worker is spawned and
     /// before it can meaningfully mutate the repository, with the worker's pid
@@ -386,6 +401,11 @@ pub(crate) trait WorkerHooks {
     /// propagates, so a worker whose identity could not be durably recorded
     /// never runs unattended.
     fn on_spawn(&mut self, _pid: Option<u32>) -> Result<()> {
+        Ok(())
+    }
+    /// Invoked only after dispatch proves the worker and all descendants
+    /// quiescent, allowing the owning run to release its hook reference.
+    fn on_worker_quiescent(&mut self, _hook_name: &str) -> Result<()> {
         Ok(())
     }
     /// Invoked on each heartbeat tick while the worker runs.
@@ -460,7 +480,7 @@ where
     C: CommitProbe + ?Sized,
     K: WorkerHooks + ?Sized,
 {
-    let spawn = spawn_request(request, state_dir)?;
+    let (stdout_path, stderr_path) = attempt_log_paths(request, state_dir);
     let attempt_head = commits.head(&request.repo)?;
     if attempt_head != request.before_head {
         return Ok(DispatchResult {
@@ -469,16 +489,29 @@ where
             authentication_rejection: Some(
                 CommitAuthenticationRejection::CheckoutChangedBeforeSpawn,
             ),
-            stdout_path: spawn.stdout_path,
-            stderr_path: spawn.stderr_path,
+            stdout_path,
+            stderr_path,
             stdout_bytes: 0,
             stderr_bytes: 0,
         });
     }
-    // Durably invalidate any earlier attempt's worker-group identity before
-    // this attempt's process exists at all. A failure here must prevent the
-    // spawn outright — see `WorkerHooks::on_pre_spawn`.
-    hooks.on_pre_spawn()?;
+
+    let hook_name = authenticated_commit_hook_name(&request.attempt_identity);
+    let registration = hooks.on_pre_spawn(&hook_name)?;
+    cleanup_stale_authenticated_commit_hooks(
+        state_dir,
+        registration
+            .as_ref()
+            .and_then(|registration| registration.superseded_hook.as_deref()),
+    )?;
+    let hook_dir = prepare_authenticated_commit_hook(
+        state_dir,
+        &hook_name,
+        registration
+            .as_ref()
+            .map(|registration| registration.run_id.as_str()),
+    )?;
+    let spawn = spawn_request_with_hook(request, state_dir, &hook_dir)?;
     let mut child = exec.spawn(&spawn)?;
     #[cfg(test)]
     let requires_kernel_authentication = child.id().is_some();
@@ -498,6 +531,8 @@ where
     }
     let process =
         wait_with_timeout_and_heartbeat(child.as_mut(), timeout, heartbeat_interval, hooks)?;
+    hooks.on_worker_quiescent(&hook_name)?;
+    let _ = fs::remove_dir_all(&hook_dir);
     let receipt_evidence = child.commit_receipt_evidence();
     let stdout_bytes = file_len(&spawn.stdout_path)?;
     let stderr_bytes = file_len(&spawn.stderr_path)?;
@@ -526,27 +561,42 @@ where
     })
 }
 
+fn attempt_log_paths(request: &DispatchRequest, state_dir: &Path) -> (PathBuf, PathBuf) {
+    let directory = state_dir
+        .join("logs")
+        .join(&request.cycle_id)
+        .join(&request.bead_id);
+    (
+        directory.join(format!("{}.out", request.attempt_id)),
+        directory.join(format!("{}.err", request.attempt_id)),
+    )
+}
+
+fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnRequest> {
+    let hook_name = authenticated_commit_hook_name(&request.attempt_identity);
+    let hook_dir = prepare_authenticated_commit_hook(state_dir, &hook_name, None)?;
+    spawn_request_with_hook(request, state_dir, &hook_dir)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "spawn construction is a linear fail-closed assembly of argv, audit paths, and controls"
 )]
-fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnRequest> {
-    let log_dir = state_dir.join("logs").join(&request.cycle_id);
-    fs::create_dir_all(&log_dir).map_err(|e| {
+fn spawn_request_with_hook(
+    request: &DispatchRequest,
+    state_dir: &Path,
+    hook_dir: &Path,
+) -> Result<SpawnRequest> {
+    let (stdout_path, stderr_path) = attempt_log_paths(request, state_dir);
+    let attempt_log_dir = stdout_path
+        .parent()
+        .ok_or_else(|| DispatchError::new("worker log path has no parent"))?;
+    fs::create_dir_all(attempt_log_dir).map_err(|error| {
         DispatchError::new(format!(
-            "failed to create log dir {}: {e}",
-            log_dir.display()
-        ))
-    })?;
-    let attempt_log_dir = log_dir.join(&request.bead_id);
-    fs::create_dir_all(&attempt_log_dir).map_err(|e| {
-        DispatchError::new(format!(
-            "failed to create attempt log dir {}: {e}",
+            "failed to create attempt log dir {}: {error}",
             attempt_log_dir.display()
         ))
     })?;
-    let stdout_path = attempt_log_dir.join(format!("{}.out", request.attempt_id));
-    let stderr_path = attempt_log_dir.join(format!("{}.err", request.attempt_id));
     File::create(&stdout_path).map_err(|e| {
         DispatchError::new(format!(
             "failed to create stdout log {}: {e}",
@@ -580,7 +630,6 @@ fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnReq
         }
     }
     let receipt_socket = commit_receipt_socket_path(&request.attempt_identity);
-    let hook_dir = prepare_authenticated_commit_hook(state_dir, &request.attempt_identity)?;
     if request.sandbox_profile.is_some() && request.worker_runtime_dir.is_none() {
         return Err(DispatchError::new(
             "worker sandbox mutation containment requires a per-attempt runtime directory",
@@ -1042,11 +1091,13 @@ fn commit_receipt_socket_path(attempt_identity: &str) -> PathBuf {
     ))
 }
 
-fn prepare_authenticated_commit_hook(state_dir: &Path, attempt_identity: &str) -> Result<PathBuf> {
+const HOOK_OWNER_FILE: &str = ".run-id";
+const HOOK_CLEANUP_SCAN_LIMIT: usize = 32;
+const HOOK_CLEANUP_REMOVE_LIMIT: usize = 8;
+
+fn authenticated_commit_hook_name(attempt_identity: &str) -> String {
     use sha2::{Digest as _, Sha256};
     use std::fmt::Write as _;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt as _;
 
     let mut digest = Sha256::new();
     digest.update(attempt_identity.as_bytes());
@@ -1054,7 +1105,23 @@ fn prepare_authenticated_commit_hook(state_dir: &Path, attempt_identity: &str) -
     for byte in digest.finalize().iter().take(16) {
         let _ = write!(name, "{byte:02x}");
     }
-    let hook_dir = state_dir.join("worker-commit-hooks").join(name);
+    name
+}
+
+fn prepare_authenticated_commit_hook(
+    state_dir: &Path,
+    hook_name: &str,
+    owner_run_id: Option<&str>,
+) -> Result<PathBuf> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !valid_authenticated_commit_hook_name(hook_name) {
+        return Err(DispatchError::new(format!(
+            "invalid authenticated commit hook name {hook_name:?}"
+        )));
+    }
+    let hook_dir = state_dir.join("worker-commit-hooks").join(hook_name);
     fs::create_dir_all(&hook_dir).map_err(|error| {
         DispatchError::new(format!(
             "create authenticated commit hook directory {}: {error}",
@@ -1083,7 +1150,101 @@ reply=$(printf '%s\n' "$commit" | /usr/bin/nc -w 3 -U "$UNDERTAKE_COMMIT_RECEIPT
             hook.display()
         ))
     })?;
+    if let Some(run_id) = owner_run_id {
+        let mut owner = run_id.as_bytes().to_vec();
+        owner.push(b'\n');
+        crate::run::durable_atomic_replace(&hook_dir.join(HOOK_OWNER_FILE), &owner).map_err(
+            |error| {
+                DispatchError::new(format!(
+                    "persist authenticated commit hook owner {}: {error}",
+                    hook_dir.display()
+                ))
+            },
+        )?;
+    }
     Ok(hook_dir)
+}
+
+fn valid_authenticated_commit_hook_name(name: &str) -> bool {
+    name.len() == 32
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct HookCleanupStats {
+    scanned: usize,
+    removed: usize,
+}
+
+fn cleanup_stale_authenticated_commit_hooks(
+    state_dir: &Path,
+    superseded_hook: Option<&str>,
+) -> Result<HookCleanupStats> {
+    let root = state_dir.join("worker-commit-hooks");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HookCleanupStats::default());
+        }
+        Err(error) => {
+            return Err(DispatchError::new(format!(
+                "read authenticated commit hook root {}: {error}",
+                root.display()
+            )));
+        }
+    };
+    let mut stats = HookCleanupStats::default();
+    if let Some(name) = superseded_hook {
+        stats.scanned += 1;
+        if remove_stale_authenticated_commit_hook(state_dir, &root.join(name), name) {
+            stats.removed += 1;
+        }
+    }
+    for entry in entries.take(HOOK_CLEANUP_SCAN_LIMIT.saturating_sub(stats.scanned)) {
+        let Ok(entry) = entry else {
+            stats.scanned += 1;
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            stats.scanned += 1;
+            continue;
+        };
+        if superseded_hook == Some(name) {
+            continue;
+        }
+        stats.scanned += 1;
+        if stats.removed < HOOK_CLEANUP_REMOVE_LIMIT
+            && remove_stale_authenticated_commit_hook(state_dir, &entry.path(), name)
+        {
+            stats.removed += 1;
+        }
+    }
+    Ok(stats)
+}
+
+fn remove_stale_authenticated_commit_hook(
+    state_dir: &Path,
+    hook_dir: &Path,
+    hook_name: &str,
+) -> bool {
+    if !valid_authenticated_commit_hook_name(hook_name)
+        || !matches!(
+            fs::symlink_metadata(hook_dir),
+            Ok(metadata) if metadata.file_type().is_dir()
+        )
+    {
+        return false;
+    }
+    let Ok(owner) = fs::read_to_string(hook_dir.join(HOOK_OWNER_FILE)) else {
+        return false;
+    };
+    match crate::run::worker_commit_hook_is_current(state_dir, owner.trim(), hook_name) {
+        Ok(true) | Err(_) => false,
+        Ok(false) => fs::remove_dir_all(hook_dir).is_ok(),
+    }
 }
 
 #[cfg(unix)]
@@ -2561,6 +2722,9 @@ impl CommitProbe for GitCommitProbe {
 mod tests {
     use super::*;
     use crate::config::Backend;
+    use crate::run::{
+        NewRun, RunHandle, RunJob, RunTarget, WorkStage, WorkState,
+    };
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -2690,9 +2854,8 @@ mod tests {
         assert_eq!(env["GIT_CONFIG_COUNT"], "1");
         assert_eq!(env["GIT_CONFIG_KEY_0"], "core.hooksPath");
         assert!(
-            Path::new(&env["GIT_CONFIG_VALUE_0"])
-                .join("post-commit")
-                .exists()
+            exec.hook_existed_at_spawn(),
+            "authenticated post-commit hook must exist when the worker is spawned"
         );
         assert_eq!(env["UNDERTAKE_COMMIT_RECEIPT_SOCKET"], receipt_socket);
     }
@@ -3154,10 +3317,13 @@ mod tests {
     }
 
     impl WorkerHooks for OrderingHooks {
-        fn on_pre_spawn(&mut self) -> Result<()> {
+        fn on_pre_spawn(
+            &mut self,
+            _hook_name: &str,
+        ) -> Result<Option<WorkerHookRegistration>> {
             self.log.borrow_mut().push("pre_spawn");
             match self.pre_spawn_error {
-                None => Ok(()),
+                None => Ok(None),
                 Some(message) => Err(DispatchError::new(message)),
             }
         }
@@ -3520,11 +3686,132 @@ mod tests {
         }
     }
 
+    fn implementing_run(state_dir: &Path) -> RunHandle {
+        RunHandle::create(
+            state_dir,
+            RunJob::Work,
+            NewRun {
+                target: RunTarget {
+                    repo: "/repo/undertake".to_string(),
+                    bead: Some("conductor-u9t".to_string()),
+                },
+                work: Some(WorkState {
+                    cycle_id: "cycle-hook-gc".to_string(),
+                    authorization_sha256: "a".repeat(64),
+                    before_head: Some("b".repeat(40)),
+                    owner_pid: Some(std::process::id()),
+                    worker_pgid: None,
+                    worker_profile: None,
+                    worker_commit: None,
+                    mechanical: None,
+                    review_resume_budget_secs: None,
+                    stage: WorkStage::Implementing,
+                }),
+                ..NewRun::default()
+            },
+        )
+        .expect("create implementing run")
+    }
+
+    #[test]
+    fn worker_commit_hook_cleanup_removes_a_finished_runs_stale_hook() {
+        let temp = TempDir::new("hook-gc-stale");
+        let mut run = implementing_run(temp.path());
+        let hook_name = "a".repeat(32);
+        run.prepare_worker_commit_hook(&hook_name)
+            .expect("record current hook");
+        prepare_authenticated_commit_hook(temp.path(), &hook_name, Some(run.run_id()))
+            .expect("create owned hook");
+        run.finish("failed").expect("finish run");
+
+        let stats = cleanup_stale_authenticated_commit_hooks(temp.path(), None)
+            .expect("clean stale hooks");
+
+        assert_eq!(stats.removed, 1);
+        assert!(!temp.path().join("worker-commit-hooks").join(hook_name).exists());
+    }
+
+    #[test]
+    fn worker_commit_hook_cleanup_preserves_current_unfinished_attempt_hook() {
+        let temp = TempDir::new("hook-gc-active");
+        let mut run = implementing_run(temp.path());
+        let hook_name = "b".repeat(32);
+        run.prepare_worker_commit_hook(&hook_name)
+            .expect("record current hook");
+        let hook_dir =
+            prepare_authenticated_commit_hook(temp.path(), &hook_name, Some(run.run_id()))
+                .expect("create active hook");
+
+        let stats = cleanup_stale_authenticated_commit_hooks(temp.path(), None)
+            .expect("scan hooks");
+
+        assert_eq!(stats.removed, 0);
+        assert!(hook_dir.join("post-commit").is_file());
+    }
+
+    #[test]
+    fn worker_commit_hook_cleanup_bounds_scans_and_removals_per_invocation() {
+        let temp = TempDir::new("hook-gc-bounded");
+        let mut run = implementing_run(temp.path());
+        let run_id = run.run_id().to_string();
+        run.finish("failed").expect("finish run");
+        for index in 0..(HOOK_CLEANUP_SCAN_LIMIT + 5) {
+            let hook_name = format!("{index:032x}");
+            prepare_authenticated_commit_hook(temp.path(), &hook_name, Some(&run_id))
+                .expect("create stale hook");
+        }
+
+        let stats = cleanup_stale_authenticated_commit_hooks(temp.path(), None)
+            .expect("bounded cleanup");
+
+        assert!(stats.scanned <= HOOK_CLEANUP_SCAN_LIMIT);
+        assert!(stats.removed <= HOOK_CLEANUP_REMOVE_LIMIT);
+        assert!(
+            std::fs::read_dir(temp.path().join("worker-commit-hooks"))
+                .expect("read hook root")
+                .count()
+                > 0,
+            "one invocation must not sweep unbounded history"
+        );
+    }
+
+    #[test]
+    fn completed_worker_removes_its_commit_hook_after_quiescence() {
+        let temp = TempDir::new("hook-clean-after-worker");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        let exec = FakeExec::success(WORKER_STDOUT, "");
+        let commits = FakeCommits::new([Some(BEFORE_COMMIT), Some(WORKER_COMMIT)]);
+        let request = request(
+            &repo,
+            Backend::Pi,
+            "opencode-go/glm-5.2",
+            Some(BEFORE_COMMIT),
+        );
+
+        run(
+            &exec,
+            &commits,
+            &request,
+            temp.path(),
+            Duration::from_secs(45),
+        )
+        .expect("worker completes");
+
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("worker-commit-hooks"))
+                .expect("read hook root")
+                .count(),
+            0
+        );
+    }
+
     struct FakeExec {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
         child: RefCell<Option<FakeChild>>,
         spawned: RefCell<Option<SpawnRequest>>,
+        hook_existed_at_spawn: RefCell<Option<bool>>,
         events: Rc<RefCell<Vec<ExecEvent>>>,
     }
 
@@ -3536,6 +3823,7 @@ mod tests {
                 stderr: stderr.as_bytes().to_vec(),
                 child: RefCell::new(Some(FakeChild::success(Rc::clone(&events)))),
                 spawned: RefCell::new(None),
+                hook_existed_at_spawn: RefCell::new(None),
                 events,
             }
         }
@@ -3547,12 +3835,19 @@ mod tests {
                 stderr: Vec::new(),
                 child: RefCell::new(Some(FakeChild::timeout_then_kill(Rc::clone(&events)))),
                 spawned: RefCell::new(None),
+                hook_existed_at_spawn: RefCell::new(None),
                 events,
             }
         }
 
         fn spawned(&self) -> SpawnRequest {
             self.spawned.borrow().as_ref().expect("spawned").clone()
+        }
+
+        fn hook_existed_at_spawn(&self) -> bool {
+            self.hook_existed_at_spawn
+                .borrow()
+                .expect("hook existence recorded at spawn")
         }
 
         fn events(&self) -> Vec<ExecEvent> {
@@ -3652,6 +3947,12 @@ mod tests {
         fn spawn(&self, request: &SpawnRequest) -> Result<Box<dyn ChildProcess>> {
             std::fs::write(&request.stdout_path, &self.stdout).expect("write fake stdout");
             std::fs::write(&request.stderr_path, &self.stderr).expect("write fake stderr");
+            let hook_existed = request
+                .env
+                .iter()
+                .find(|(key, _)| key == "GIT_CONFIG_VALUE_0")
+                .is_some_and(|(_, value)| Path::new(value).join("post-commit").exists());
+            *self.hook_existed_at_spawn.borrow_mut() = Some(hook_existed);
             *self.spawned.borrow_mut() = Some(request.clone());
             let child = self.child.borrow_mut().take().expect("one spawn");
             Ok(Box::new(child))
@@ -3969,7 +4270,7 @@ mod tests {
         let stderr = temp.path().join("err.log");
         let limits = WorkerResourceLimits::new(
             7,
-            8,
+            256,
             32 * 1024 * 1024 * 1024,
             16 * 1024 * 1024,
         )
@@ -4034,8 +4335,8 @@ print(json.dumps({
         );
         assert_eq!(observed["nproc"][0], observed["nproc"][1]);
         assert!(
-            observed["nproc"][0].as_u64().is_some_and(|value| value > 8),
-            "RLIMIT_NPROC must include the sampled same-UID baseline plus headroom: {observed}"
+            observed["nproc"][0].as_u64().is_some_and(|value| value > 256),
+            "RLIMIT_NPROC must include the sampled same-UID baseline plus concurrency headroom: {observed}"
         );
     }
 

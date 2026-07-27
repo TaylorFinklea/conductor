@@ -375,7 +375,7 @@ impl Default for Budgets {
             unknown_429_cooldown_mins: 15,
             item_wall_clock_mins: 45,
             worker_cpu_seconds: 900,
-            worker_process_headroom: 64,
+            worker_process_headroom: 256,
             worker_address_space_headroom_mib: 32 * 1024,
             worker_file_size_mib: 1024,
             max_plan_revisions: 1,
@@ -2300,7 +2300,7 @@ dispatch_id = \"claude-sonnet-5\"
                 defaults.budgets.worker_address_space_headroom_mib,
                 defaults.budgets.worker_file_size_mib,
             ),
-            (900, 64, 32 * 1024, 1024)
+            (900, 256, 32 * 1024, 1024)
         );
 
         let configured = parse_str(
