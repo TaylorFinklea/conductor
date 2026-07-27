@@ -15,7 +15,9 @@ use crate::musterroll::{
     self, BudgetAction, BudgetDecision, MusterrollClient, ObservationExpiryBasis, ObservationRequest,
     RuntimeLimitEvidence, RuntimeLimitReason,
 };
-use crate::config::{Backend, Ceiling, Config, Cost, CostPolicy, RosterEntry, Tier};
+use crate::config::{
+    self, Backend, Ceiling, Config, Cost, CostPolicy, RosterEntry, Tier, VerificationInputKind,
+};
 use crate::deck::{self, CalloutLevel, LiveUpdate, ReportStatus};
 use crate::dispatch::{self, CommitProbe, DispatchRequest, Exec};
 use crate::fields::{self, RoutingFields, Triage};
@@ -601,6 +603,100 @@ fn validate_item_authorization(
     Ok(extracted)
 }
 
+/// The pre-claim half of the declared-inputs contract (bd `conductor-pux`):
+/// enumerates every ignored file currently present in `repo_path`'s working
+/// tree via `git status --porcelain --ignored`, and fails closed if any of
+/// them is undeclared for `repo` in `cfg`. Ignored *directories* (git
+/// collapses e.g. `node_modules/` to a single `!! node_modules/` line rather
+/// than enumerating every file inside) are never individually inspected — a
+/// declared verification input is always a single file, so a whole ignored
+/// directory can never itself be "the" undeclared input a maintainer needs
+/// to resolve. `bd`'s own issue-tracker state directory (`.beads/`) is
+/// exempt for the same reason every other Undertake-owned repo directory is
+/// out of scope: it is Undertake's bookkeeping, present in every dispatched
+/// repo by construction, and `verify_cmd` never reads it.
+///
+/// This runs before `bd.claim`, so an item whose verification depends on
+/// unaccounted-for local state never reaches claim, model launch, or attempt
+/// spawn — this is what actually prevents the Patchstand class of failure,
+/// not the materialization step alone: a secret-shaped ignored file (e.g.
+/// `.dev.vars`) left completely undeclared blocks dispatch here exactly like
+/// any other undeclared ignored file, because it can never be silently
+/// skipped just for matching the deny list — only an explicit
+/// `kind = "acknowledge"` declaration can exempt it.
+fn validate_verification_input_coverage(
+    cfg: &Config,
+    repo_path: &Path,
+    repo: &str,
+    deadline: ItemDeadline,
+    clock: &MonotonicClock,
+) -> std::result::Result<(), String> {
+    let declared: BTreeSet<&str> = cfg.declared_verification_input_paths_for(repo).collect();
+    let timeout = deadline.remaining_at(clock.now()).ok_or_else(|| {
+        "item or cycle deadline exhausted before verification-input preflight".to_string()
+    })?;
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(repo_path)
+        .args(["status", "--porcelain", "--ignored"]);
+    let output = dispatch::run_bounded_command_with_timeout(&mut command, timeout)
+        .map_err(|error| format!("enumerate ignored verification inputs: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status --ignored failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut undeclared = Vec::new();
+    for line in stdout.lines() {
+        let Some(path) = line.strip_prefix("!! ") else {
+            continue;
+        };
+        if path.ends_with('/') {
+            // A whole ignored directory (build/dependency caches); declared
+            // inputs are always individual files, so this never gates.
+            continue;
+        }
+        if Path::new(path)
+            .components()
+            .next()
+            .is_some_and(|component| component.as_os_str() == ".beads")
+        {
+            // bd's own issue-tracker state, not a verification input.
+            continue;
+        }
+        if declared.contains(path) {
+            continue;
+        }
+        undeclared.push(path.to_string());
+    }
+    if undeclared.is_empty() {
+        return Ok(());
+    }
+    undeclared.sort();
+    let remedies: Vec<String> = undeclared
+        .iter()
+        .map(|path| {
+            if let Some(reason) = config::denied_verification_input_reason(path) {
+                format!(
+                    "{path:?} ({reason}; only remedy is `[[verification_input]] {{ repo = {repo:?}, path = {path:?}, kind = \"acknowledge\" }}` — it can never be materialized)"
+                )
+            } else {
+                format!(
+                    "{path:?} (add `[[verification_input]] {{ repo = {repo:?}, path = {path:?}, kind = \"materialize\" }}` if verify_cmd needs its real content, or `kind = \"acknowledge\"` if it is irrelevant to verification)"
+                )
+            }
+        })
+        .collect();
+    Err(format!(
+        "repo {repo:?} has undeclared ignored verification input(s); every ignored file must be \
+         declared before dispatch: {}",
+        remedies.join("; ")
+    ))
+}
+
 fn record_replan_required(
     report_path: &Path,
     item: &PlannedItem,
@@ -989,6 +1085,8 @@ impl AttemptCheckout {
     )]
     fn create(
         canonical_repo: &Path,
+        cfg: &Config,
+        repo: &str,
         state_dir: &Path,
         run_dir: &Path,
         attempt_id: &str,
@@ -1062,6 +1160,15 @@ impl AttemptCheckout {
                 path.display(),
                 String::from_utf8_lossy(&checkout.stderr).trim()
             )));
+        }
+        let declared_materialize: Vec<&str> = cfg
+            .verification_inputs_for(repo, VerificationInputKind::Materialize)
+            .collect();
+        if let Err(error) =
+            materialize_declared_verification_inputs(canonical_repo, &path, &declared_materialize)
+        {
+            let _ = std::fs::remove_dir_all(&path);
+            return Err(error);
         }
         let runtime_path = run_dir.join("worker-runtime").join(attempt_id);
         for child in ["tmp", "cache", "config", "data", "state"] {
@@ -1153,6 +1260,104 @@ impl Drop for AttemptCheckout {
             let _ = std::fs::remove_dir_all(&self.runtime_path);
         }
     }
+}
+
+/// Copies every declared `kind = "materialize"` verification input from the
+/// canonical repository into the isolated attempt checkout, byte-for-byte
+/// and before the worker is ever launched — the deterministic-materialization
+/// half of the declared-inputs contract (bd `conductor-pux`). `declared`
+/// paths have already passed [`config::verification_input_path_is_repo_relative`]
+/// and the deny check at config-parse time; both are re-checked here as
+/// defense in depth so a bypassed or hand-edited config can never smuggle a
+/// secret-shaped path or a traversal into a worker's checkout.
+///
+/// A declared path that does not currently exist in the canonical repo is
+/// not an error: nothing is copied, and the attempt checkout simply matches
+/// canonical's current (also-absent) state.
+///
+/// This performs no Seatbelt profile change: the copy is a parent-owned
+/// (unsandboxed) filesystem write into `attempt_path`, which
+/// `worker_sandbox_profile_contents` already grants the checkout as a
+/// writable subpath, and the worker itself only ever needs to *read* the
+/// materialized file, which the profile's blanket `(allow file-read*)`
+/// already covers.
+fn materialize_declared_verification_inputs(
+    canonical_repo: &Path,
+    attempt_path: &Path,
+    declared: &[&str],
+) -> std::result::Result<(), DispatchCycleError> {
+    if declared.is_empty() {
+        return Ok(());
+    }
+    let canonical_root = std::fs::canonicalize(canonical_repo).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "canonicalize repository for declared verification inputs: {error}"
+        ))
+    })?;
+    let attempt_root = std::fs::canonicalize(attempt_path).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "canonicalize attempt checkout for declared verification inputs: {error}"
+        ))
+    })?;
+    for declared_path in declared {
+        if let Some(reason) = config::denied_verification_input_reason(declared_path) {
+            return Err(DispatchCycleError::message(format!(
+                "declared verification input {declared_path:?} {reason}; refusing to \
+                 materialize a secret-shaped path"
+            )));
+        }
+        if !config::verification_input_path_is_repo_relative(declared_path) {
+            return Err(DispatchCycleError::message(format!(
+                "declared verification input {declared_path:?} is not a repo-relative path"
+            )));
+        }
+        let relative = Path::new(declared_path);
+        let source = canonical_root.join(relative);
+        let source = match std::fs::canonicalize(&source) {
+            Ok(resolved) => resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(DispatchCycleError::message(format!(
+                    "canonicalize declared verification input {}: {error}",
+                    source.display()
+                )));
+            }
+        };
+        if !source.starts_with(&canonical_root) {
+            return Err(DispatchCycleError::message(format!(
+                "declared verification input {declared_path:?} escapes the repository via a \
+                 symlink; refusing to materialize"
+            )));
+        }
+        let metadata = std::fs::metadata(&source).map_err(|error| {
+            DispatchCycleError::message(format!(
+                "inspect declared verification input {}: {error}",
+                source.display()
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(DispatchCycleError::message(format!(
+                "declared verification input {declared_path:?} must resolve to a regular file"
+            )));
+        }
+        let destination = attempt_root.join(relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                DispatchCycleError::message(format!(
+                    "create parent directory for declared verification input {}: {error}",
+                    destination.display()
+                ))
+            })?;
+        }
+        std::fs::copy(&source, &destination).map_err(|error| {
+            DispatchCycleError::message(format!(
+                "materialize declared verification input {} -> {}: {error}",
+                source.display(),
+                destination.display()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn write_worker_sandbox_profile(
@@ -2133,6 +2338,15 @@ fn dispatch_one<
         });
     }
     if let Err(reason) = validate_item_authorization(cfg, item, roster, &canonical_repo, &current) {
+        record_replan_required(report_path, item, &reason)?;
+        return Ok(DispatchOneResult {
+            decision: None,
+            dispatches: 0,
+        });
+    }
+    if let Err(reason) =
+        validate_verification_input_coverage(cfg, &repo_path, &item.repo, deadline, &options.clock)
+    {
         record_replan_required(report_path, item, &reason)?;
         return Ok(DispatchOneResult {
             decision: None,
@@ -5047,6 +5261,8 @@ where
         }
         let mut attempt_checkout = AttemptCheckout::create(
             repo_path,
+            cfg,
+            &item.repo,
             state_dir,
             run_artifacts.dir(),
             &attempt_id,
@@ -10552,8 +10768,11 @@ process.stdout.write("node worker complete\n");
             let deadline =
                 ItemDeadline::start_at(Instant::now(), Duration::from_secs(30));
             let clock = MonotonicClock::System;
+            let cfg = config::parse_str(fixture_config(temp.path())).expect("config parses");
             let current = AttemptCheckout::create(
                 &repo,
+                &cfg,
+                "sandbox-repo",
                 &state,
                 &run_dir,
                 "001-current",
@@ -10565,6 +10784,8 @@ process.stdout.write("node worker complete\n");
             .expect("create current isolated clone");
             let later = AttemptCheckout::create(
                 &repo,
+                &cfg,
+                "sandbox-repo",
                 &state,
                 &run_dir,
                 "002-later",
@@ -10734,6 +10955,276 @@ exit 0
             assert!(!hardlink_payload_marker.exists());
             assert_eq!(std::fs::read(&canonical_target).unwrap(), b"canonical\n");
         }
+    }
+
+    /// Discriminating fixture reproducing the Patchstand class of failure
+    /// (bd `conductor-pux`): a gitignored, non-secret input
+    /// (`worker-configuration.d.ts`, standing in for Wrangler's generated
+    /// types) makes the *same* `verify_cmd` observe different content
+    /// depending only on whether it was declared. Without a declaration the
+    /// attempt checkout never receives the file at all (git clone only ever
+    /// carries tracked content) and `verify_cmd`'s output diverges from
+    /// canonical; with an approved `kind = "materialize"` declaration the
+    /// checkout observes byte-identical content, so the same `verify_cmd`
+    /// observes the same result in both places. This fails under the prior
+    /// behavior: before this bead, `AttemptCheckout::create` never
+    /// materialized anything, so the "declared" branch here would also see
+    /// the ignored input missing.
+    #[test]
+    fn attempt_checkout_materializes_declared_verification_input_byte_for_byte() {
+        let temp = TempDir::new("verification-input-materialize");
+        let repo = temp.path().join("canonical-repo");
+        init_sandbox_repo_without_bd(&repo);
+        std::fs::write(repo.join(".gitignore"), "worker-configuration.d.ts\n")
+            .expect("write gitignore");
+        run(&repo, "git", &["add", ".gitignore"]);
+        run(
+            &repo,
+            "git",
+            &["commit", "-m", "ignore generated wrangler types"],
+        );
+        std::fs::write(
+            repo.join("worker-configuration.d.ts"),
+            "export const PUBLIC_SUPABASE_URL = \"https://real.example\";\n",
+        )
+        .expect("write canonical ignored input");
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        let state = temp.path().join("state");
+        let run_dir = state.join("runs/verification-input-run");
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+        let deadline = ItemDeadline::start_at(Instant::now(), Duration::from_secs(30));
+        let clock = MonotonicClock::System;
+        let verify_cmd_output = |cwd: &Path| -> Vec<u8> {
+            Command::new("sh")
+                .arg("-c")
+                .arg("cat worker-configuration.d.ts 2>/dev/null")
+                .current_dir(cwd)
+                .output()
+                .expect("run verify_cmd probe")
+                .stdout
+        };
+        let canonical_output = verify_cmd_output(&repo);
+        assert_eq!(
+            canonical_output,
+            b"export const PUBLIC_SUPABASE_URL = \"https://real.example\";\n"
+        );
+
+        // Without a declared input, the attempt checkout never sees the
+        // ignored file, so the same verify_cmd observes different output
+        // than canonical — the exact Patchstand-class divergence.
+        let cfg_without = config::parse_str(fixture_config(temp.path())).expect("config parses");
+        let undeclared = AttemptCheckout::create(
+            &repo,
+            &cfg_without,
+            "sandbox-repo",
+            &state,
+            &run_dir,
+            "001-undeclared",
+            Backend::Pi,
+            Some(head.trim()),
+            deadline,
+            &clock,
+        )
+        .expect("create undeclared attempt checkout");
+        assert!(
+            !undeclared
+                .path()
+                .join("worker-configuration.d.ts")
+                .exists(),
+            "an undeclared ignored input must never appear in the attempt checkout"
+        );
+        assert_ne!(
+            verify_cmd_output(undeclared.path()),
+            canonical_output,
+            "verify_cmd must diverge from canonical when the ignored input is undeclared"
+        );
+
+        // With an approved declaration, the attempt checkout observes
+        // byte-identical content, so the same verify_cmd observes the same
+        // result as canonical.
+        let mut cfg_with = config::parse_str(fixture_config(temp.path())).expect("config parses");
+        cfg_with
+            .verification_inputs
+            .push(config::VerificationInput {
+                repo: "sandbox-repo".to_string(),
+                path: "worker-configuration.d.ts".to_string(),
+                kind: VerificationInputKind::Materialize,
+            });
+        let declared = AttemptCheckout::create(
+            &repo,
+            &cfg_with,
+            "sandbox-repo",
+            &state,
+            &run_dir,
+            "002-declared",
+            Backend::Pi,
+            Some(head.trim()),
+            deadline,
+            &clock,
+        )
+        .expect("create declared attempt checkout");
+        let attempt_bytes = std::fs::read(declared.path().join("worker-configuration.d.ts"))
+            .expect("read materialized attempt input");
+        assert_eq!(
+            attempt_bytes, canonical_output,
+            "declared verification input must materialize byte-for-byte identical to canonical"
+        );
+        assert_eq!(
+            verify_cmd_output(declared.path()),
+            canonical_output,
+            "the same verify_cmd must observe the same result in attempt and canonical once the \
+             input is declared and approved"
+        );
+    }
+
+    /// The fail-before-launch path (bd `conductor-pux`): an item whose
+    /// repository has an ignored file that is neither declared nor
+    /// acknowledged must be rejected before `bd.claim` — see the call in
+    /// `dispatch_one` immediately after `validate_item_authorization` and
+    /// before the claim. This is what actually prevents the Patchstand class
+    /// of failure for the paths a maintainer never even notices: a
+    /// secret-shaped ignored file (`.dev.vars`-style) is never silently
+    /// exempted just because it matches the deny list — it still blocks
+    /// dispatch unless explicitly `kind = "acknowledge"`d. This fails under
+    /// the prior behavior: before this bead, no such scan existed and
+    /// `dispatch_one` proceeded straight to `bd.claim` regardless.
+    #[test]
+    fn attempt_checkout_dispatch_fails_before_claim_on_undeclared_ignored_input() {
+        let temp = TempDir::new("verification-input-undeclared");
+        let repo = temp.path().join("canonical-repo");
+        init_sandbox_repo_without_bd(&repo);
+        std::fs::write(repo.join(".gitignore"), "worker-configuration.d.ts\n")
+            .expect("write gitignore");
+        run(&repo, "git", &["add", ".gitignore"]);
+        run(
+            &repo,
+            "git",
+            &["commit", "-m", "ignore generated wrangler types"],
+        );
+        std::fs::write(repo.join("worker-configuration.d.ts"), "REAL_VALUE\n")
+            .expect("write canonical ignored input");
+
+        let cfg = config::parse_str(fixture_config(temp.path())).expect("config parses");
+        let deadline = ItemDeadline::start_at(Instant::now(), Duration::from_secs(30));
+        let clock = MonotonicClock::System;
+
+        let Err(reason) =
+            validate_verification_input_coverage(&cfg, &repo, "sandbox-repo", deadline, &clock)
+        else {
+            panic!("an undeclared ignored verification input must fail before claim");
+        };
+        assert!(
+            reason.contains("worker-configuration.d.ts"),
+            "error must name the exact undeclared path: {reason}"
+        );
+        assert!(
+            reason.contains("kind = \"materialize\"") && reason.contains("kind = \"acknowledge\""),
+            "error must present both remedies: {reason}"
+        );
+
+        // A `kind = "acknowledge"` declaration clears the gate without ever
+        // materializing anything.
+        let mut cfg_acknowledged = cfg.clone();
+        cfg_acknowledged
+            .verification_inputs
+            .push(config::VerificationInput {
+                repo: "sandbox-repo".to_string(),
+                path: "worker-configuration.d.ts".to_string(),
+                kind: VerificationInputKind::Acknowledge,
+            });
+        validate_verification_input_coverage(
+            &cfg_acknowledged,
+            &repo,
+            "sandbox-repo",
+            deadline,
+            &clock,
+        )
+        .expect("an acknowledged ignored input must not block dispatch");
+
+        // A clean repository with no ignored files never blocks.
+        let clean_repo = temp.path().join("clean-repo");
+        init_sandbox_repo_without_bd(&clean_repo);
+        validate_verification_input_coverage(&cfg, &clean_repo, "sandbox-repo", deadline, &clock)
+            .expect("a repository with no ignored files must never block dispatch");
+    }
+
+    /// Regression: `bd init` leaves `.beads/.local_version` as an
+    /// individually-ignored file (not a whole ignored directory), which
+    /// would otherwise trip the undeclared-ignored-input scan on every
+    /// single bd-managed repo. `.beads/` is Undertake's own issue-tracker
+    /// state, never a verification input, and must never require a
+    /// per-repo declaration.
+    #[test]
+    fn attempt_checkout_dispatch_never_blocks_on_bds_own_ignored_state() {
+        let temp = TempDir::new("verification-input-beads-exempt");
+        let repo = temp.path().join("canonical-repo");
+        init_sandbox_repo(&repo);
+        let cfg = config::parse_str(fixture_config(temp.path())).expect("config parses");
+        let deadline = ItemDeadline::start_at(Instant::now(), Duration::from_secs(30));
+        let clock = MonotonicClock::System;
+        validate_verification_input_coverage(&cfg, &repo, "sandbox-repo", deadline, &clock)
+            .expect("bd's own .beads state must never block dispatch");
+    }
+
+    /// The secret-denial path (bd `conductor-pux`): a declared
+    /// `kind = "materialize"` input that matches the non-overridable secret
+    /// deny list must never be honored, even if it bypassed config-parse
+    /// validation (simulated here by constructing the `VerificationInput`
+    /// directly rather than through `config::parse_str`, standing in for a
+    /// hand-edited or stale config). The attempt checkout creation fails
+    /// closed and `.dev.vars` is never copied anywhere.
+    #[test]
+    fn attempt_checkout_never_materializes_a_declared_secret_shaped_input() {
+        let temp = TempDir::new("verification-input-secret-denial");
+        let repo = temp.path().join("canonical-repo");
+        init_sandbox_repo_without_bd(&repo);
+        std::fs::write(repo.join(".gitignore"), ".dev.vars\n").expect("write gitignore");
+        run(&repo, "git", &["add", ".gitignore"]);
+        run(&repo, "git", &["commit", "-m", "ignore local secrets"]);
+        std::fs::write(repo.join(".dev.vars"), "API_TOKEN=super-secret\n")
+            .expect("write canonical secret");
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+
+        let mut cfg = config::parse_str(fixture_config(temp.path())).expect("config parses");
+        cfg.verification_inputs.push(config::VerificationInput {
+            repo: "sandbox-repo".to_string(),
+            path: ".dev.vars".to_string(),
+            kind: VerificationInputKind::Materialize,
+        });
+        let state = temp.path().join("state");
+        let run_dir = state.join("runs/verification-input-secret-run");
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+        let deadline = ItemDeadline::start_at(Instant::now(), Duration::from_secs(30));
+        let clock = MonotonicClock::System;
+
+        let Err(error) = AttemptCheckout::create(
+            &repo,
+            &cfg,
+            "sandbox-repo",
+            &state,
+            &run_dir,
+            "001-secret",
+            Backend::Pi,
+            Some(head.trim()),
+            deadline,
+            &clock,
+        ) else {
+            panic!("a declared secret-shaped materialize input must never be honored");
+        };
+        assert!(
+            error.to_string().contains("secret"),
+            "refusal must be actionable about why: {error}"
+        );
+        assert!(
+            !run_dir
+                .join("attempt-checkouts/001-secret/.dev.vars")
+                .exists(),
+            ".dev.vars must never be copied into an attempt checkout"
+        );
+        assert_eq!(
+            std::fs::read(repo.join(".dev.vars")).expect("canonical secret unchanged"),
+            b"API_TOKEN=super-secret\n"
+        );
     }
 
     fn assert_promotion_boundary_recovers(

@@ -236,6 +236,122 @@ pub(crate) struct RepoPolicy {
     pub(crate) cost_policy: CostPolicy,
 }
 
+/// The disposition an operator declares for one gitignored, repo-relative
+/// verification-input path (bd `conductor-pux`). `Materialize` copies the
+/// canonical file byte-for-byte into the isolated attempt checkout before
+/// worker launch; `Acknowledge` records that the path is known and
+/// irrelevant to `verify_cmd` and is *never* copied. A secret-shaped path
+/// (see [`denied_verification_input_reason`]) may only ever be
+/// `Acknowledge`d — declaring it `Materialize` is rejected at config-parse
+/// time, and materialization re-checks the deny list regardless of
+/// declared kind as defense in depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerificationInputKind {
+    Materialize,
+    Acknowledge,
+}
+
+impl FromStr for VerificationInputKind {
+    type Err = ConfigError;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "materialize" => Ok(Self::Materialize),
+            "acknowledge" => Ok(Self::Acknowledge),
+            _ => Err(ConfigError::new(format!(
+                "unknown verification_input kind {s:?} (expected materialize|acknowledge)"
+            ))),
+        }
+    }
+}
+
+/// A single `[[verification_input]]` entry: one repo-relative gitignored
+/// path that `repo`'s `verify_cmd` is known to touch, with its declared
+/// disposition. This is the *only* mechanism by which Undertake ever copies
+/// untracked state into an isolated worker attempt checkout — see
+/// `dispatch_cycle::AttemptCheckout`. Every ignored file that currently
+/// exists in a repo's working tree must be declared one way or the other or
+/// dispatch fails closed before claim (see
+/// `dispatch_cycle::validate_verification_input_coverage`); this is what
+/// keeps a fleet of repos with routine build/editor litter dispatchable
+/// without silently reintroducing the Patchstand class of bug for the
+/// paths that actually matter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerificationInput {
+    pub(crate) repo: String,
+    pub(crate) path: String,
+    pub(crate) kind: VerificationInputKind,
+}
+
+/// Filename patterns that can never be declared as a verification input,
+/// regardless of operator intent — the deny side of the declared-inputs
+/// contract (bd `conductor-pux`). Checked against the final path component
+/// only (case-insensitive) so a nested `config/.dev.vars` is caught exactly
+/// like a root-level one. Returns a short, non-secret reason suitable for an
+/// error message; never echoes file contents.
+///
+/// This list is intentionally conservative (favors false positives over
+/// false negatives) and cannot be overridden by `[[verification_input]]`
+/// declarations — see `parse_verification_inputs` and
+/// `dispatch_cycle::materialize_declared_verification_inputs`, both of which
+/// call this same function so no path is ever un-denied by skipping one
+/// call site.
+pub(crate) fn denied_verification_input_reason(path: &str) -> Option<&'static str> {
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    let lower = file_name.to_ascii_lowercase();
+    if lower == ".dev.vars" || lower.starts_with(".dev.vars.") {
+        return Some("matches the .dev.vars local-secrets convention");
+    }
+    if lower == ".env" || lower.starts_with(".env.") {
+        return Some("matches the .env local-secrets convention");
+    }
+    if lower == ".netrc" || lower == ".npmrc" {
+        return Some("matches a credential-bearing dotfile convention");
+    }
+    for extension in [".pem", ".key", ".p12", ".pfx"] {
+        if lower.ends_with(extension) {
+            return Some("matches a private-key file extension");
+        }
+    }
+    for prefix in ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"] {
+        if lower.starts_with(prefix) {
+            return Some("matches an SSH private-key naming convention");
+        }
+    }
+    for needle in ["secret", "credential", "password"] {
+        if lower.contains(needle) {
+            return Some("filename contains a credential-related term");
+        }
+    }
+    None
+}
+
+/// A declared path must be a plain repo-relative file path: non-empty,
+/// never absolute, and never containing a `..` (or platform prefix/root)
+/// component. This is a string-level check performed at config-parse time,
+/// before any filesystem exists to canonicalize against; the filesystem-level
+/// symlink-escape check happens separately at materialization time in
+/// `dispatch_cycle`, where the repository actually exists on disk.
+pub(crate) fn verification_input_path_is_repo_relative(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        return false;
+    }
+    !candidate.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    })
+}
+
 impl FromStr for Backend {
     type Err = ConfigError;
     fn from_str(s: &str) -> Result<Self> {
@@ -490,6 +606,13 @@ pub(crate) struct Config {
     /// Per-repo `[[repo_policy]]` entries; absent repos default to
     /// `CostPolicy::Proprietary` (fail closed for `FreeTrainsInput`).
     pub(crate) repo_policies: Vec<RepoPolicy>,
+    /// Per-repo `[[verification_input]]` declarations: the explicit
+    /// contract of gitignored paths approved for materialization into (or
+    /// acknowledged as irrelevant to) an isolated worker attempt checkout
+    /// (bd `conductor-pux`). A repo absent here declares no ignored
+    /// verification inputs at all — any ignored file present in its
+    /// working tree fails dispatch closed before claim.
+    pub(crate) verification_inputs: Vec<VerificationInput>,
 }
 
 impl Config {
@@ -500,6 +623,32 @@ impl Config {
             .find(|p| p.repo == repo)
             .map(|p| p.cost_policy)
             .unwrap_or_default()
+    }
+
+    /// Declared verification-input paths for `repo` of exactly `kind`, in
+    /// declaration order.
+    pub(crate) fn verification_inputs_for<'a>(
+        &'a self,
+        repo: &'a str,
+        kind: VerificationInputKind,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.verification_inputs
+            .iter()
+            .filter(move |input| input.repo == repo && input.kind == kind)
+            .map(|input| input.path.as_str())
+    }
+
+    /// Every declared verification-input path for `repo`, regardless of
+    /// kind — the set that exempts an ignored file from the fail-before-
+    /// launch scan.
+    pub(crate) fn declared_verification_input_paths_for<'a>(
+        &'a self,
+        repo: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.verification_inputs
+            .iter()
+            .filter(move |input| input.repo == repo)
+            .map(|input| input.path.as_str())
     }
 }
 
@@ -928,6 +1077,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
                 | "job_fallback"
                 | "job"
                 | "repo_policy"
+                | "verification_input"
         ) {
             return Err(ConfigError::new(format!("unknown config key: {key}")));
         }
@@ -948,6 +1098,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
     let job_fallbacks = parse_job_fallbacks(doc.get("job_fallback"))?;
     let adversarial_review = parse_adversarial_review(doc.get("adversarial_review"), &roster)?;
     let repo_policies = parse_repo_policies(doc.get("repo_policy"), &roster)?;
+    let verification_inputs = parse_verification_inputs(doc.get("verification_input"))?;
     Ok(Config {
         autonomy,
         scan,
@@ -961,6 +1112,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
         jobs,
         role_bindings,
         repo_policies,
+        verification_inputs,
     })
 }
 
@@ -1641,6 +1793,63 @@ fn parse_repo_policies(node: Option<&Node>, roster: &[RosterEntry]) -> Result<Ve
                 )));
             }
         }
+    }
+    Ok(out)
+}
+
+/// Parses `[[verification_input]]` entries: the declared-inputs contract
+/// for gitignored local verification state (bd `conductor-pux`). Every
+/// entry names one repo-relative `path` and a `kind` of `"materialize"`
+/// (approved non-secret content, copied into the isolated attempt
+/// checkout) or `"acknowledge"` (declared irrelevant to `verify_cmd`,
+/// never copied). Validation here is fail-closed and non-negotiable:
+/// escaping/absolute paths are rejected outright, and a secret-shaped path
+/// (per [`denied_verification_input_reason`]) can only ever be declared
+/// `acknowledge` — there is no config spelling that materializes a secret.
+fn parse_verification_inputs(node: Option<&Node>) -> Result<Vec<VerificationInput>> {
+    let entries = match node {
+        None => return Ok(Vec::new()),
+        Some(Node::Tables(v)) => v,
+        Some(_) => {
+            return Err(ConfigError::new(
+                "verification_input must be an array of tables ([[verification_input]])",
+            ));
+        }
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, t) in entries.iter().enumerate() {
+        for key in t.keys() {
+            if !matches!(key.as_str(), "repo" | "path" | "kind") {
+                return Err(ConfigError::new(format!(
+                    "unknown verification_input key in entry {i}: {key}"
+                )));
+            }
+        }
+        let repo = get_required_str_at("verification_input", t, i, "repo")?;
+        let path = get_required_str_at("verification_input", t, i, "path")?;
+        let kind = get_required_str_at("verification_input", t, i, "kind")?
+            .parse::<VerificationInputKind>()?;
+        if !verification_input_path_is_repo_relative(&path) {
+            return Err(ConfigError::new(format!(
+                "verification_input entry {i} path {path:?} must be a repo-relative path \
+                 (no absolute path, no `..` traversal)"
+            )));
+        }
+        if kind == VerificationInputKind::Materialize
+            && let Some(reason) = denied_verification_input_reason(&path)
+        {
+            return Err(ConfigError::new(format!(
+                "verification_input entry {i} path {path:?} {reason}; secrets are never \
+                 materialized — declare it `kind = \"acknowledge\"` instead"
+            )));
+        }
+        if !seen.insert((repo.clone(), path.clone())) {
+            return Err(ConfigError::new(format!(
+                "duplicate verification_input for repo {repo:?} path {path:?}"
+            )));
+        }
+        out.push(VerificationInput { repo, path, kind });
     }
     Ok(out)
 }
@@ -2834,4 +3043,78 @@ role_policy = "planner"
             assert!(parse_str(source).is_err(), "unexpected success: {source}");
         }
     }
+
+    // --- verification_input (bd conductor-pux) ---
+
+    #[test]
+    fn verification_input_materialize_kind_rejects_secret_shaped_path() {
+        let error = parse_str(
+            "[[verification_input]]\nrepo = \"x\"\npath = \".dev.vars\"\nkind = \"materialize\"\n",
+        )
+        .expect_err("a secret-shaped path must never be declared materialize");
+        let message = error.to_string();
+        assert!(message.contains(".dev.vars"), "{message}");
+        assert!(
+            message.contains("acknowledge"),
+            "error must point at the acknowledge remedy: {message}"
+        );
+    }
+
+    #[test]
+    fn verification_input_acknowledge_kind_allows_secret_shaped_path() {
+        let cfg = parse_str(
+            "[[verification_input]]\nrepo = \"x\"\npath = \".dev.vars\"\nkind = \"acknowledge\"\n",
+        )
+        .expect("acknowledging a secret-shaped path never materializes it, so it is allowed");
+        assert_eq!(cfg.verification_inputs.len(), 1);
+        assert_eq!(cfg.verification_inputs[0].kind, VerificationInputKind::Acknowledge);
+        assert!(
+            cfg.verification_inputs_for("x", VerificationInputKind::Materialize)
+                .next()
+                .is_none(),
+            "an acknowledged path must never surface as a materialize candidate"
+        );
+    }
+
+    #[test]
+    fn verification_input_rejects_absolute_and_traversal_paths() {
+        for path in ["/etc/passwd", "../outside", "nested/../../escape"] {
+            let src = format!(
+                "[[verification_input]]\nrepo = \"x\"\npath = \"{path}\"\nkind = \"materialize\"\n"
+            );
+            assert!(
+                parse_str(&src).is_err(),
+                "expected rejection for path {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verification_input_rejects_duplicates_and_unknown_kind() {
+        let duplicate = "[[verification_input]]\nrepo = \"x\"\npath = \"a.txt\"\nkind = \"acknowledge\"\n\n[[verification_input]]\nrepo = \"x\"\npath = \"a.txt\"\nkind = \"materialize\"\n";
+        assert!(parse_str(duplicate).is_err());
+        let unknown_kind =
+            "[[verification_input]]\nrepo = \"x\"\npath = \"a.txt\"\nkind = \"delete\"\n";
+        assert!(parse_str(unknown_kind).is_err());
+    }
+
+    #[test]
+    fn verification_input_materialize_kind_accepts_non_secret_repo_relative_path() {
+        let cfg = parse_str(
+            "[[verification_input]]\nrepo = \"x\"\npath = \"worker-configuration.d.ts\"\nkind = \"materialize\"\n",
+        )
+        .expect("non-secret repo-relative path is a valid materialize declaration");
+        assert_eq!(
+            cfg.verification_inputs_for("x", VerificationInputKind::Materialize)
+                .collect::<Vec<_>>(),
+            vec!["worker-configuration.d.ts"]
+        );
+        assert!(
+            cfg.verification_inputs_for("other-repo", VerificationInputKind::Materialize)
+                .next()
+                .is_none(),
+            "declarations are per-repository and must not leak across repos"
+        );
+    }
+
 }
