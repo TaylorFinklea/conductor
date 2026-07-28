@@ -318,7 +318,11 @@ fn git_apply_stdin(
         "--binary".to_string(),
         "--whitespace=nowarn".to_string(),
     ];
-    args.extend(excluding.iter().map(|path| format!("--exclude={path}")));
+    args.extend(
+        excluding
+            .iter()
+            .map(|path| format!("--exclude={}", escape_wildmatch_literal(path))),
+    );
     args.push("-".to_string());
     let mut command = Command::new("git");
     command.arg("-C").arg(repo).args(&args);
@@ -332,6 +336,24 @@ fn git_apply_stdin(
         ));
     }
     Ok(())
+}
+
+/// Escapes `\`, `*`, `?`, `[`, and `]` so a repo-relative path passed to
+/// `git apply --exclude=<path-pattern>` is matched as a Git wildmatch
+/// literal instead of a glob. Without this, a survivor path containing any
+/// of these bytes (e.g. `src/[id].ts`) can silently over-exclude an
+/// unrelated path that happens to match the unintended pattern, or
+/// under-exclude the survivor itself when a backslash swallows the
+/// following character.
+fn escape_wildmatch_literal(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for character in path.chars() {
+        if matches!(character, '\\' | '*' | '?' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 /// Captures a worker's uncommitted changes (if any) as a hashed run
@@ -3501,5 +3523,113 @@ mod tests {
             recovery.apply_excluding_calls.borrow().is_empty(),
             "must not attempt any reapply either"
         );
+    }
+
+    #[test]
+    fn escape_wildmatch_literal_escapes_every_metacharacter() {
+        assert_eq!(escape_wildmatch_literal("plain/path.txt"), "plain/path.txt");
+        assert_eq!(escape_wildmatch_literal("src/[id].ts"), "src/\\[id\\].ts");
+        assert_eq!(escape_wildmatch_literal("a*.log"), "a\\*.log");
+        assert_eq!(escape_wildmatch_literal("a?.txt"), "a\\?.txt");
+        assert_eq!(
+            escape_wildmatch_literal("weird\\file.txt"),
+            "weird\\\\file.txt"
+        );
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Builds a real repo with two tracked files — `survivor` (a wildmatch
+    /// metacharacter path git status still reports dirty, mirroring a
+    /// `restore_clean` that never reached it) and `decoy` (a different path
+    /// that a partial restore already reset to HEAD, and so still needs its
+    /// patch hunk reapplied) — then asserts that excluding `survivor` through
+    /// the real `GitRepoRecovery::apply_patch` reapplies `decoy` and leaves
+    /// `survivor` alone. Before the fix, an unescaped wildmatch metacharacter
+    /// in `survivor` could make Git's `--exclude` pattern also match `decoy`
+    /// (over-exclusion) or fail to match `survivor` itself (under-exclusion).
+    fn assert_exclude_treats_survivor_as_literal(case: &str, survivor: &str, decoy: &str) {
+        let temp = TempDir::new(&format!("wildmatch-{case}"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        git(&repo, &["init"]);
+        git(&repo, &["config", "user.name", "Undertake Test"]);
+        git(
+            &repo,
+            &["config", "user.email", "undertake-test@example.invalid"],
+        );
+        for relative in [survivor, decoy] {
+            if let Some(parent) = Path::new(relative)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(repo.join(parent)).expect("mkdir fixture parent");
+            }
+            std::fs::write(repo.join(relative), b"orig\n").expect("write fixture");
+        }
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-m", "init"]);
+
+        std::fs::write(repo.join(survivor), b"changed\n").expect("dirty survivor");
+        std::fs::write(repo.join(decoy), b"changed\n").expect("dirty decoy");
+
+        let recovery = GitRepoRecovery;
+        let patch = recovery.capture_patch(&repo).expect("capture patch");
+
+        // Simulate a partial `restore_clean`: it reached `decoy` and reset it
+        // back to HEAD, but never reached `survivor`, which is still dirty.
+        std::fs::write(repo.join(decoy), b"orig\n").expect("reset decoy to HEAD");
+
+        recovery
+            .apply_patch(&repo, &patch, &[survivor.to_string()])
+            .unwrap_or_else(|error| panic!("apply_patch excluding {survivor:?} failed: {error}"));
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join(decoy)).expect("read decoy"),
+            "changed\n",
+            "case {case}: unescaped --exclude={survivor:?} must not also exclude {decoy:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join(survivor)).expect("read survivor"),
+            "changed\n",
+            "case {case}: excluded survivor {survivor:?} must remain untouched"
+        );
+    }
+
+    #[test]
+    fn quarantine_reapply_treats_bracket_class_survivor_path_as_literal() {
+        assert_exclude_treats_survivor_as_literal("bracket-class", "src/[id].ts", "src/d.ts");
+    }
+
+    #[test]
+    fn quarantine_reapply_treats_star_survivor_path_as_literal() {
+        assert_exclude_treats_survivor_as_literal("star", "a*.log", "aXYZ.log");
+    }
+
+    #[test]
+    fn quarantine_reapply_treats_question_mark_survivor_path_as_literal() {
+        assert_exclude_treats_survivor_as_literal("question", "a?.txt", "aX.txt");
+    }
+
+    #[test]
+    fn quarantine_reapply_treats_backslash_survivor_path_as_literal() {
+        assert_exclude_treats_survivor_as_literal("backslash", "weird\\file.txt", "weirdfile.txt");
     }
 }
