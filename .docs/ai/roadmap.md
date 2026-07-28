@@ -40,14 +40,40 @@ Undertake: a single Rust binary that runs autonomous work-routing cycles over th
   so every backend probe must stay bounded and stdin-closed; undeclared ignored
   verification inputs now fail closed and need a `[[verification_input]]`
   `materialize` or `acknowledge` declaration.
-- [ ] Cycle 1 COMPLETE (9 beads closed: m0a, m0b, m1a, m1b, m2a, m2b, prompt, bdro, rev1); `cargo test` passes 84 tests. Live ready queue (`bd ready`, 6 items): `undertake-m4a`/`undertake-m3a` (P1), `undertake-agy`/`undertake-m1c`/`undertake-m0c` (P2), `undertake-cov1` (P3). Routing fields are in bd metadata; every bead's Verify is its `verify_cmd`.
+- [ ] **v1 finish — the kernel cutover.** Spec: `phases/undertake-v1-finish-spec.md`
+  (2026-07-28). Diagnosis: there is no kernel. There are four independent engines
+  (`dispatch_cycle` 19,370 / `plan_job` 5,995 / `adversarial` 5,110 / a dead 989-line
+  `loop.rs` prototype) and no `consult` at all. Draft v1 of the plan assumed `loop.rs`
+  was a finished kernel needing wiring; adversarial review (GPT-5.6 Sol, REJECT) proved
+  otherwise and the direction was inverted — see the three `[2026-07-28]` ADRs.
+  **Landmines:** `loop.rs` requires an authenticated direct-child commit
+  (`loop.rs:346-359`), so read-only jobs can never pass it; `RunHandle::create` refuses
+  Plan runs (`run.rs:1021`); `job.rs`'s registry is never *constructed* because the TOML
+  spelling is `[[job]]` and `undertake.toml` has none; the dashboard has a **production**
+  dependency on `dispatch_cycle` (`dashboard/mod.rs:77`); `-D dead_code` must stay off
+  until Phase 6 or rollback gets harder.
 
 ### Next
-- [ ] M3 dry-run cycle has a human-verify tail (report renders on dashboard) — see `undertake-m3b` notes. `undertake-guildhall-dogfood` (lead, v1 integration proof) is now bd-blocked on `undertake-m3b` and carries its own human-verify tail (dry-run over 3+ real repos + dashboard spot-check; verify_cmd alone under-covers).
+- [ ] Chain: `pu5` + `y6kv` → `mkct` → `vd3y` → `bxb` → `eueb`/`utwq`/`ed12` → `sq4a` →
+  `qtfu` → `bnc`. Gate order is load-bearing: freeze a parity corpus before retiring
+  anything, break the all-Unknown bootstrap deadlock (`bxb`, the only P0) before
+  migrating jobs that would otherwise be undogfoodable, pass cutover gate 10 **before**
+  deleting the rollback engine, and quiesce every pending/implementing/reclaimable legacy
+  run first.
+- [ ] Human tails: apply the chezmoi `AGENTS.md` + guildhall-orchestration migration
+  before `cycle`/`dispatch` are deleted (Phase 6 prerequisite; never `chezmoi apply`
+  headless). Redefine `undertake-guildhall-dogfood` in kernel terms — its 2026-07-27
+  evidence (251 proposed / 0 dispatched) is at least partly the `bxb` deadlock, not a
+  clean propose-only result.
 
 ### Later
-- [ ] M3 dry-run cycle → M4 dispatch+verify (m4a→m4b→m4c) → `undertake-review` → M5 triage backfill → M6 ratchet. `undertake-review` bumped P2→P1 and now GATES v1-done (user decision 2026-07-02, ADR in guildhall decisions.md); still bd-blocked on m4c + m4b.
-- [ ] `undertake-cautionlight` set to deferred (self-labeled v1.5; not in the v1-done clause) — un-defer after undertake-m4c + cautionlight m3/m4/m6.
+- [ ] Cross-repo: Musterroll adds `model_family` to `roster@2` so `ao8` review-panel
+  diversity can be enforced by developer lineage rather than provider lane
+  (ADR `[2026-07-28]`).
+- [ ] Post-v1: the 11 deferred beads (scorecard-complete evidence `7hb`, Gauntlet corpus
+  fold, Managed Agents POC, native Codex app-server client, local Ollama admission,
+  quota-aware load spreading, legacy ledger retirement, gate-11 Fable panel `pzo`,
+  mixed-version lease fencing, fs4 migration, Cautionlight policy).
 - [ ] Post-v1 spikes: bd swarm/gate/mol evaluation; hermes-voice notification channel; SSE response push
 
 ## Milestones
