@@ -65,6 +65,11 @@ shipped this as a distinct gap); `consult` returns evidence-or-gaps.
 Terminal = Completed | Failed | Blocked { reason } | NeedsInput { reason } | Canceled
 ```
 
+This is not speculative: `PlanTerminalVerdict` (`run.rs:477-482`) already ships
+`Accepted | Rejected | Blocked | NeedsInput`, and `RunHandle::finish` already accepts
+`"canceled"`. The generic enum is that set with `Accepted → Completed` and
+`Rejected → Failed`. Adopt the existing vocabulary.
+
 Only `Completed` may close a Bead. `Blocked` and `NeedsInput` are **not** degraded
 success and must never be reported as shipped work.
 
@@ -87,11 +92,46 @@ they never retry the same profile. This is not theoretical — dispatching this 
 adversarial review hit `GoUsageLimitError` on `opencode-go` and required the
 `ollama-cloud` lane.
 
+Both existing engines already draw exactly this line, which is evidence the seam is in the
+right place: a reviewer slot answers `InvalidSchema` with a same-model repair and
+`ProcessFailed` with the next chain entry, mutually exclusive, at most two attempts
+(`adversarial.rs:1913-1951`); `plan` answers a schema failure with one same-author repair
+in a fresh worktree (`plan_job.rs:1744-1827`) and an eligibility loss by walking to the
+next pinned candidate. So `RetrySameCandidate` ≙ schema repair, `AdvanceCandidate` ≙
+process/eligibility failure.
+
+The union of abandon reasons the runner must express: process/spawn failure; schema or
+parse failure; eligibility loss mid-run; budget, revision, or attempt-cap exhaustion; and
+external-state drift since approval. Neither engine has a stale-claim reclaim concept —
+that is `work`-only and comes from `dispatch_cycle`.
+
 ### `Stage`
 
-A snake-case stage id plus its own pinned candidate pool and attempt budget. `work` has
-one stage; `review` has reviewer stages plus a judge stage; `plan` has author, peer_review,
-revision, second_opinion. Stages are how multi-call jobs fit one engine.
+A snake-case stage id plus its own pinned candidate pool, attempt budget, **concurrency**,
+and **isolation**. Stages are how multi-call jobs fit one engine.
+
+`plan` already models this durably and correctly — reuse it rather than inventing a
+parallel vocabulary: `PlanStage` (`run.rs:280-284`) is `Planner | PeerReview |
+SecondOpinion`, and `PlanProgress` (`run.rs:487-524`) is a tagged transition system
+`Blocked → Prepared → Authoring → AwaitingPeer → {Revising ⇄ AwaitingPeer} →
+AwaitingSecondOpinion → Terminal`. Generalize that shape; do not replace it.
+
+**Concurrency is not optional.** `review` runs its reviewer slots in thread-scoped batches
+(`adversarial.rs:998`, `parallel` default 3). A strictly sequential runner cannot host the
+review job. A stage therefore declares `concurrency: NonZeroUsize`; `work`, `plan`, and
+`consult` declare 1.
+
+**Isolation is per stage, not per job.** `plan` creates and destroys a worktree around each
+*author* invocation (`with_isolated_worktree:3047-3085` — `git worktree add --detach`, run,
+then unconditional `--force` removal), not across the run. `review` uses none. `work` uses
+none under D1. So a stage declares whether it runs in a disposable worktree.
+
+### `CallBudget`
+
+`review` enforces a per-run model-call ceiling with an atomic counter that fails closed
+once exhausted: `worst_case_calls = reviewer_count * (REPAIR_RETRIES + 1) + 1`
+(`adversarial.rs:158-189`). The runner owns this for every job; a stage's attempt budget
+alone does not bound total spend across a fan-out.
 
 ## The ports
 
@@ -148,7 +188,7 @@ The only per-job seam.
 ```
 job()                     -> RunJob
 posture()                 -> MutationPosture
-claims_bead()             -> bool
+claims_bead()             -> bool               // work only; verified neither plan nor review touches bd
 requires_pinned_roster()  -> bool               // false only for the bootstrap probe
 stages(progress)          -> Option<Stage>      // None ends the stage sequence
 prompt(stage, attempt)    -> SpawnRequest       // built from the pinned candidate
@@ -156,9 +196,15 @@ classify(stage, output)   -> Option<AttemptOutcome>  // job-specific reading; No
 terminal(evidence)        -> Terminal
 ```
 
-`plan`'s revision cap, `review`'s minority preservation, and `consult`'s evidence-or-gaps
-rule all live behind `stages` + `classify` + `terminal`. **If a policy needs to reach past
-these, that is a finding to surface — not a reason to keep a second engine.**
+A policy is **pure**: prompts in, classification and a verdict out. It never touches
+`RunHandle`, bd, git, or a process — the runner owns all of those. This is what lets
+`adversarial.rs` keep its self-enforced isolation invariant after migration (below).
+
+`plan`'s revision cap (`RevisionLimit` 0..=3, `run.rs:390-413`), `review`'s minority
+preservation and coverage invariants (`parse_judge_response:1372-1420`), and `consult`'s
+evidence-or-gaps rule all live behind `stages` + `classify` + `terminal`. **If a policy
+needs to reach past these, that is a finding to surface — not a reason to keep a second
+engine.**
 
 ### `Clock`
 
@@ -248,7 +294,45 @@ preflights both:
 Generic run creation must accept Plan before Phase 4c is possible. Resolve this in Phase
 1b, not at migration time.
 
-## Folded-in requirements
+## Migration hazard: `adversarial.rs` enforces its own isolation
+
+`adversarial.rs` **never touches `RunHandle`** — it has no `crate::run::` reference at all.
+Its durable event bookkeeping is bolted on externally by `cli.rs`
+(`record_adversarial_reviewer_events:1089`, `record_adversarial_terminal_events:1130`),
+which translates its in-memory `ReviewerAttempt` / `JudgeAttempt` into `AttemptStarted` /
+`AttemptFinished` / `CoverageGap` / `ReviewFinished` and calls `finish(...)`.
+
+This is enforced by a production-code string scan (`adversarial.rs:3172-3193`) asserting
+the module — excluding its test block — contains none of `"git worktree"`,
+`"Command::new("`, `"std::process::Command"`, `"crate::bd::"`, `"crate::cycle::"`,
+`"crate::dispatch_cycle::"`, `"crate::verify::"`.
+
+A naive migration either trips that test or silently drops the event bridge.
+
+**Resolution — the invariant gets stronger, not relaxed.** The runner owns *all* durable
+writes and *all* mutation authority. A `JobPolicy` is pure: it builds prompts, classifies
+output, and decides a terminal verdict. It never touches `RunHandle`, bd, git, or a
+process. So `adversarial.rs` becomes a policy that still satisfies its own scan, and
+`cli.rs`'s bridging layer is **deleted** rather than preserved — the runner emits those
+events natively and uniformly for all four jobs.
+
+Extend the forbidden list with `"crate::run::"` when the migration lands. If a policy ever
+needs one of those seams, that is a finding to surface, not a reason to widen the list.
+
+## Approval must be re-validated per stage
+
+The two engines disagree, and the resumable runner needs the stricter model.
+
+- `plan_job` re-validates on **every** `dispatch()` call, which is what makes it resumable
+  across stages: it re-checks target HEAD and status (`1573`), input sha256 (`1580`),
+  roster policy sha256 (`1592`), and scheduler policy digest (`1597`) before any model
+  call, plus a deck response strictly after the approval watermark (`2914`).
+- `adversarial` authorizes **once** in `authorize_approved_execution:942` and then runs to
+  completion in one process. There is no later re-check.
+
+The runner adopts plan's model for all jobs: re-validate the pinned approval and every
+policy digest at each stage boundary. Drift since approval is a fail-closed terminal, never
+a retry. `review` gains resumability it does not have today.
 
 Two beads were deferred as standalone items but their requirements land here:
 
