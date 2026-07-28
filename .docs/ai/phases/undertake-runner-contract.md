@@ -613,27 +613,75 @@ A workflow DSL. A plugin surface. A second telemetry store, lease implementation
 atomic-write helper — three of the last already exist. Redesigning `dispatch.rs`'s
 primitives, which are sound. Any per-job escape hatch past `JobPolicy`.
 
+## The genericity is not there yet — and that reorders Phase 1
+
+Five design questions were resolved and each adversarially verified against source. **All
+five resolutions failed verification**, with 61 defects and 53 citation corrections. They
+failed the *same way*, and that convergence is the finding:
+
+> Every resolution assumed the existing machinery is more generic than it is. It is not.
+> Below the process primitives, this codebase is four job-specific implementations.
+
+Verified instances:
+
+| Assumed generic | Actually | Evidence |
+|---|---|---|
+| `role_routing` is job-agnostic | It parses **plan manifests** — reads `job == "plan"` and `/details/state/progress/state == "terminal"` | `role_routing.rs:1335`, `1341-1343` |
+| Terminal reconciliation is generic | `reconcile_terminal_manifest` mutates only `RunDetails::Work` | `run.rs:2262-2288`, esp. `2272-2274` |
+| Spawn identity hooks exist for all attempts | `on_pre_spawn`/`on_spawn` fire **only** from `run_with_heartbeat` (the write path). `run_readonly` takes no hooks at all — so `review`, the one fan-out job, has no spawn identity | `dispatch.rs:544`, `568`, `490-511` |
+| Terminal write order is uniform | `work` writes event-then-manifest; **every** plan terminal path writes manifest-then-event, at six sites | `run.rs:1764`, `1863-1889`, `1971-1988`, `2008-2013`, `2022-2028`, `2039-2044` |
+| Invocation evidence can be generalized in place | `RunEvent` is `deny_unknown_fields` and `read_events` fails closed, so renaming `plan_invocation` makes **every existing plan journal permanently unresumable** | `run.rs:872`, `3162-3168` |
+| Attempt evidence already discriminates model calls | Only `plan` attaches it. `work` and `review` pass `..EventInput::default()`, so a reconstructed budget reads **0** for them | `dispatch_cycle.rs:6011-6019`, `cli.rs:1094-1102` |
+| Group liveness + PID-recycle check compose | `process_group_alive` succeeds if **any** member lives; `kernel_process_identity` probes only the leader. Orphaned descendants defeat the pairing | `quarantine.rs:969,978-989`, `dispatch.rs:1533-1569` |
+
+**Consequence: Phase 1b is not one extraction.** The genericity must be *built* first, and
+each piece is an independently verifiable refactor against the engines that exist today —
+far safer than discovering these while a half-built runner is in the tree.
+
+### Phase 1b-prep — sequenced before the extraction
+
+Each item stands alone, is verified by the existing suite plus the frozen parity corpus,
+and reintroduces no isolation (CASE owns that).
+
+1. **`undertake/event@3`.** Generic invocation evidence carrying stage, slot, attempt, and
+   retry lineage. `@2` journals must stay readable — a rename is not available under
+   `deny_unknown_fields`, so this is an additive `@3` with a compatibility read path.
+   Without it, fan-out attempts cannot be correlated after a crash and no budget can be
+   reconstructed.
+2. **Job-generic terminal reconciliation.** `reconcile_terminal_manifest` handles all four
+   `RunDetails`, and the terminal write order is unified. Today plan's six manifest-first
+   sites can leave `progress = Terminal` with `lifecycle = Running` and no terminal event,
+   which `open()` passes as resumable and nothing repairs (`run.rs:1317-1323`).
+3. **Spawn identity on the read-only path.** `run_readonly` gains the `WorkerHooks`
+   parameter and returns `DispatchResult`'s shape. This is the prerequisite for both
+   fan-out resume and read-only attempt classification.
+4. **Per-slot worker identity.** `WorkState.worker_pgid` (`run.rs:245-261`) becomes a set,
+   and reclaim requires **every** recorded group provably dead. Pair it with a
+   leader-vs-descendant-safe liveness rule, since the two current probes do not compose.
+5. **Decouple `role_routing` from plan.** It must stop parsing plan manifests before it can
+   serve a generic runner.
+
+Only then does `conductor-mkct` extract the runner onto genuinely generic substrate.
+
 ## Open questions — close these before `conductor-mkct` starts
 
 1. ~~D1's residual risk~~ — **CLOSED 2026-07-28 (user).** Isolation is out of Undertake's
    scope entirely; CASE owns containment. Undertake owes detection only. See
    `decisions.md [2026-07-28]` and § Isolation is CASE's scope.
-2. **Durable call budget (design).** `ReviewerCallBudget` is an in-memory `AtomicU32`
-   (`adversarial.rs:158-188`), so a crash resets it and a resumed run can exceed its
-   approved ceiling. Reservations must be durably recorded before spawn and reconstructed
-   from attempt-start records. Not yet specified.
-3. **The two-file commit (design).** Hash-pinning a mutable state file in the manifest is a
-   two-file transaction: state-first leaves the old hash failing closed after a crash;
-   manifest-first points a new hash at old state. `run.rs:1310-1329` reconciles only
-   terminal event/manifest skew, not arbitrary progress. Needs a stated write order and
-   replay rule — most likely: the append-only journal is the source of truth and the state
-   file is a rebuildable projection, mirroring the Afterfact SQLite posture.
+2. **Durable call budget.** Direction confirmed — reconstruct from durable
+   `AttemptStarted` records rather than persisting a counter, compared against the ceiling
+   already pinned in `RunLimits.max_attempts` (`run.rs:162`), which every job writes today
+   and no production code reads. Reserve-never-refund: after a crash you cannot know
+   whether the spawn happened, so over-counting is the only safe direction.
+   **Blocked on prep 1** — the discriminator does not exist until `work` and `review` also
+   attach invocation evidence.
+3. **The two-file commit.** Direction confirmed — the append-only journal is the source of
+   truth and mutable state is a rebuildable projection, mirroring the Afterfact SQLite
+   posture. **Blocked on prep 2** — the rule cannot be stated while plan writes
+   manifest-first at six sites and reconciliation handles only `Work`.
 
-Sol additionally listed event-schema fields (`RunEvent` has no stage, slot, attempt id, or
-lineage — `run.rs:873-892`, and only Plan has `PlanInvocationEvidence`) and per-slot process
-identity (`WorkState` stores one `worker_pgid` — `run.rs:245-261`). Both are real and both
-are resolved by the same fan-out correlation work; they are Phase 1b scope once (2) and (3)
-are settled, not open design questions.
+Both are now sequencing consequences rather than open design questions. The remaining
+genuine unknowns are inside the prep items above.
 
 ## Acceptance
 
