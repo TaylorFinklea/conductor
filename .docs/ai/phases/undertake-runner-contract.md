@@ -230,9 +230,19 @@ The **runner** calls these, inside its durable boundary. Jobs never touch bd.
 
 Implement over the existing `BdClient` (`bd.rs:154`) — do not write a second bd client.
 
-**`conductor-moe` applies here**: `release` currently runs `bd update --status open
---assignee ""` unconditionally (`bd.rs:235-238`), which reopens work an operator closed by
-hand mid-run. Release must be conditional on Undertake still holding the claim.
+**`conductor-moe` is FIXED (`b88da79`) and the gateway must inherit it.** `release` used to
+run `bd update --status open --assignee ""` unconditionally, silently reopening work an
+operator closed by hand mid-run. `BdClient::release_owned(repo, id, expected_assignee)` now
+re-fetches immediately before mutating, no-ops when already open+unassigned, and otherwise
+**fails closed** with a diagnostic naming expected vs observed state.
+
+`BeadGateway::release` must route through `release_owned`, never the raw primitive.
+Investigation proved bd 1.1.0 exposes **no** compare-and-swap: `bd update` has no
+conditional flag, `--claim` is atomic only in the claiming direction, `bd batch` cannot mix
+reads and writes, and `bd show` carries no version counter. So the residual window — two
+back-to-back `bd` subprocess calls with no intervening I/O — is irreducible at this layer.
+ADR in `decisions.md [2026-07-28]`. Do not attempt to close it with raw `bd sql`; that
+bypasses bd's audit trail and was explicitly rejected.
 
 ### `AttemptExecutor`
 
