@@ -126,6 +126,44 @@ review job. A stage therefore declares `concurrency: NonZeroUsize`; `work`, `pla
 then unconditional `--force` removal), not across the run. `review` uses none. `work` uses
 none under D1. So a stage declares whether it runs in a disposable worktree.
 
+### Stage constraints — how live recheck stays out of the policy
+
+The seam's hardest case: both engines re-check eligibility against **live** provider state
+at selection time, not just at approval time. `plan` calls `recheck_author` / `recheck`
+against a fresh Musterroll snapshot (`plan_job.rs:2931`); `review` re-walks its judge chain
+via `select_rechecked_judge` (`adversarial.rs:1224`) at synthesis time. If that logic lived
+in the policy, policies would need live roster access and would stop being pure.
+
+**Resolution: the pool is authorization, the recheck is eligibility, and both belong to the
+runner. The policy supplies only declarative constraints, carried as data on the `Stage`.**
+
+`plan` already has exactly the right vocabulary — reuse `PlanStageConstraints`
+(`run.rs:301-306`), generalized off `PlanStage`:
+
+```
+distinct_execution_from: Vec<StageId>   // this stage must not reuse those stages' executions
+tier_at_least:           Vec<StageId>   // must be >= those stages' tiers
+diversity:               None | CrossOrDegraded | PairwiseDistinct
+```
+
+The runner then: takes the stage's pinned candidate pool (authorization), filters by live
+eligibility (a fresh snapshot), applies the constraints, and picks in pinned order. First
+eligible wins — no re-scoring. `CrossOrDegraded` falls back to same-group only when no
+cross-group candidate is alive; `PairwiseDistinct` has **no** degraded path and ends
+`Blocked` when it cannot be satisfied (`run.rs:294-296`).
+
+### D2 applies here too — a second site
+
+`PlanProviderDiversity` (`run.rs:288-297`) is a **second** implementation of the
+provider-diversity rule that `decisions.md [2026-07-28]` amends, alongside
+`adversarial.rs:565-602`. A spec's author, peer, and second opinion must be pairwise
+distinct; under D2 that means pairwise-distinct **model families**, not provider lanes.
+
+`conductor-ao8` as filed names only the review panel. It must cover both sites, or `plan`
+keeps selecting `ollama-cloud/glm-5.2` as a "distinct" peer for an
+`opencode-go/glm-5.2` author. The constraint field is renamed accordingly, and both sites
+read family from the Musterroll `model_family` field — never by parsing `ProfileId`.
+
 ### `CallBudget`
 
 `review` enforces a per-run model-call ceiling with an atomic counter that fails closed
