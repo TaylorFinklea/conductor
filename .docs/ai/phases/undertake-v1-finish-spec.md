@@ -1,117 +1,128 @@
 # Undertake v1 finish — spec
 
-**Status**: draft, under adversarial review (Opus 5, 2026-07-27).
+**Status**: draft v2, revised after two adversarial reviews (Opus 5, 2026-07-28).
+Draft v1 was **rejected**; see § Adversarial review record. Direction inverted.
 Implements cutover gates 4 and 10 of `guildhall/.docs/ai/phases/undertake-core-consolidation-spec.md`.
 **Owner**: Opus (Lead) specs and adjudicates. Senior implements per phase.
 
 ## The diagnosis
 
-The approved architecture is *one kernel, four jobs, explicit targets*. The kernel
-exists and is tested. **It has never been turned on.**
+The approved architecture is *one kernel, four jobs, explicit targets*. Today there are
+**four independent engines** and no kernel.
 
-| Piece | Lines | State |
-|---|---|---|
-| `src/loop.rs` — native kernel | 989 | Complete state machine, 14 tests. Zero production adapters, zero CLI wiring. |
-| `src/job.rs` — closed four-job registry | 431 | Validates exactly `work\|review\|consult\|plan`. `config.rs:1568` builds it to validate, then keeps only the binding vec — **its authority is never used at runtime**. |
-| `Config.jobs` (`[[jobs]]` in `undertake.toml`) | — | Parsed and validated on every `config::load`, then discarded — zero readers outside `config.rs`. |
-| `src/dispatch_cycle.rs` — legacy fleet engine | 19,370 | The **only** live end-to-end mutating path. |
-| `plan` (`src/plan_job.rs`) | 5,995 | Live, wired, its own engine. |
-| `review` (`src/adversarial.rs`) | 5,110 | Live as `adversarial-review`. Tags its run `RunJob::Review` but is not a job. |
-| `consult` | 0 | Does not exist. `cycle.rs:268` writes a `RunJob::Consult` record purely as a dashboard breadcrumb. |
+| Engine | Lines | Job | State |
+|---|---|---|---|
+| `dispatch_cycle.rs` | 19,370 (8,237 prod / 11,133 test) | `work`, fleet-scoped | The only live, hardened, end-to-end mutating path. |
+| `plan_job.rs` | 5,995 | `plan` | Live. Own approval, weighted reservations, author/peer/revision/second-opinion stages, isolated worktrees, cancellation, recovery. |
+| `adversarial.rs` | 5,110 | `review` | Live as `adversarial-review`. Own N-reviewer panel, per-slot fallback, schema repair, anonymity, judge recheck. |
+| `loop.rs` | 989 (431 prod) | — | **Production-dead prototype.** Zero callers. |
+| `consult` | 0 | — | Does not exist. `cycle.rs:268` writes a breadcrumb record only. |
 
-`LoopHarness` (`loop.rs:126`) and `LoopClaim` (`loop.rs:132`) have **zero production
-implementors**. The kernel is a socket with nothing plugged in.
+Each hand-rolls "spawn → wait → classify → retry/fallback → terminal → close or release."
+Only the lowest-level process primitives in `dispatch.rs` are shared.
 
-The "spawn → wait → classify → retry or fall back → record terminal → close or release"
-arc is hand-rolled **four times**: `dispatch_cycle` (`run_worker_chain:5823`), `loop`
-(`LoopKernel::run:257`, dead), `plan_job` (`dispatch:1549`), `adversarial`
-(`run_reviewers:973`).
+### Why draft v1 was wrong
 
-### Why it went unnoticed
+Draft v1 assumed `loop.rs` was a finished kernel needing only wiring. Verified against
+source, it is not:
 
-**22 modules carry a blanket `#![allow(dead_code)]`** — reachability lint is globally
-off. `roster_drift.rs` (1,017 lines) is retired at `cli.rs:1764` (prints "roster drift is
-retired", exits 2, never calls the module) and still compiles clean. `ratchet.rs` (1,101
-lines) is disconnected: `cycle.rs:194` passes `HashMap::new()` where ratchet state
-belongs, so `autonomy = "propose"` and the entire `[ratchet]` table accept operator input
-with **zero runtime effect**. Not one warning.
+- **It cannot run read-only jobs.** `loop.rs:346-359` unconditionally requires the worker
+  to produce an authenticated direct-child commit; without one it calls `fail_attempt`.
+  `review` and `consult` produce no commit and can therefore never succeed.
+- **It cannot run `plan` at all.** `LoopKernel::start` calls `RunHandle::create`, which
+  returns `Err("plan runs require explicit structural PlanRunDetails and are not
+  activated")` (`run.rs:1021-1025`).
+- **It hardcodes `RunJob::Work` and `WorkState`** (`loop.rs:214-245`).
+- **Its terminal model is only `Completed | Failed`** (`loop.rs:137-141`) — no `blocked`,
+  `needs_input`, or `canceled`, all of which the approved plan/consult contracts require.
+- **`LoopClaim` cannot claim.** Only `release` and `close` (`loop.rs:133-135`). Claiming
+  outside the kernel puts a mutation before its durable boundary and leaves resume unable
+  to prove ownership.
+- **`loop.json` is neither fsynced nor integrity-bound** (`loop.rs:537-546`). A forged
+  `terminal=completed` is trusted at `loop.rs:288-290` and would close a bead with no
+  attempt — a direct violation of the fail-closed artifact-hash invariant.
+- **Resume is not resumable.** It refuses on any `worker_pgid` without checking liveness
+  (`loop.rs:291-295`), and if a worker committed but crashed before verification it resets
+  to `Ready` and reruns the worker instead of verifying the existing commit
+  (`loop.rs:296-308`). `validate_run_target` (`loop.rs:515-523`) binds neither profile,
+  attempts, timeout, nor original authorization — a resume can dispatch a profile the
+  manifest never approved.
 
-Restoring that lint is not hygiene. It is the instrument that makes Phase 4 safe.
+**`job.rs` is not merely unconsumed — it is never constructed.** The accepted TOML
+spelling is `[[job]]`, not `[[jobs]]` (`config.rs:1471-1477`), and `undertake.toml`
+contains **zero** `[[job]]` tables. `parse_native_jobs` returns an empty vec and
+`JobRegistry::new` is never called in production.
+
+### The real signal problem
+
+**19 modules carry a blanket `#![allow(dead_code)]`** (not 22 — that figure counted files
+with any dead-code allowance, including legitimate `cfg_attr` gates). Reachability lint is
+off across the crate. `roster_drift.rs` (1,017 lines) is production-retired at
+`cli.rs:1764` and still compiles clean. `ratchet.rs` is operationally disconnected —
+`cycle.rs:193-205` passes an empty map — so `autonomy = "propose"` and the entire
+`[ratchet]` table accept operator input with no runtime effect.
+
+But restoring `-D dead_code` proves *symbol reachability, not behavioral parity*, and
+flipping it early would force deletion of recovery and artifact APIs the moment their only
+caller dies — making rollback harder. It belongs at the **end**, not the start.
+
+### The one genuine P0
+
+`conductor-bxb`: when every provider is `Unknown`, dry-run proposes zero work and no
+Undertake call can produce the evidence that would make a provider known. **This is why
+the 2026-07-27 dogfood cycle reported 251 proposed / 0 dispatched** — recorded as a clean
+propose-only run.
 
 ## Locked decisions (user, 2026-07-27)
 
 | Decision | Value |
 |---|---|
-| v1 target | Wire the kernel. All four jobs through one `LoopKernel`. |
-| Dashboard | **In v1.** User-requested and in use. Same verification bar as the kernel. |
-| Legacy fleet surface | **Deleted as part of v1** — gated on demonstrated parity (Phase 4). |
+| v1 target | All four jobs through one kernel. |
+| Dashboard | **In v1.** Same verification bar as the kernel. |
+| Legacy fleet surface | **Deleted as part of v1** — now gated far more strictly (Phase 6). |
 
-## Decision D1 — `work` runs in the repository, not in an attempt checkout
+## Direction: extract from the proven engine, do not promote the prototype
 
-**This is the highest-leverage call in the plan.** It decides how much of
-`dispatch_cycle` is a requirement versus an artifact.
+Draft v1 proposed growing `loop.rs` to parity. Rejected. Growing a 431-line prototype to
+match 8,237 lines of hardened behavior means rewriting nearly all of it while carrying its
+wrong assumptions (commit-required, work-only, forgeable state).
 
-`dispatch_cycle` runs each worker in an isolated `AttemptCheckout`
-(`dispatch_cycle.rs:5961`) and then promotes the commit
-(`promote_attempt_commit:1775`). That single design choice is the root of:
+**Instead: extract a generic durable attempt runner from the proven
+`dispatch.rs` / `run.rs` / `quarantine.rs` machinery, migrate one job at a time onto it,
+and delete `loop.rs`.**
 
-- verification-input materialization (`materialize_declared_verification_inputs:1285`) —
-  needed *only* because a fresh checkout lacks gitignored files the verifier requires
-- `undertake supersede` (1,492 lines, `de954c8`) — terminalizing failed **promoted** runs
-- promotion recovery records (beads `1ls`, `8hz`)
-- rollback survivor paths (bead `jum`)
-- three of the four resume state machines (`resume_promoted_work:4492`,
-  `resume_unauthenticated_implementing_work:5172`, `resume_finished_promoted_work:3986`)
+Salvage from `loop.rs` as design input, not code: fresh-context-per-iteration, durable
+phase checkpoints, and the bead/artifact target distinction.
 
-**Decision: v1 `work` writes the target repository directly.**
+The generic boundary must carry what two engines already prove they need — and what the
+prototype has no slot for:
 
-Grounds: the consolidation spec states the native loop "preserves Ralph's earned
-behavior"; Ralph works in-repo. Its `work` row reads "Repo writes allowed inside approved
-scope." Its loop requirement 7 is "worker identity plus exclusive repo lease" — a lease
-and an identity check, **not** worktree isolation. `loop.rs` is already built this shape.
+```
+job + stage identity            immutable selection + pinned approval
+total item deadline             durable attempt lifecycle (start/finish/retry lineage)
+output + artifact capture       mutation posture (read-only vs repo-write)
+process hooks (heartbeat)       terminal states beyond Completed|Failed
+bead terminal actions           candidate pool + fallback + 429 classification
+```
 
-Consequence: the promotion subsystem and everything above is **not ported**. It is
-deleted. Four deferred beads and one two-day-old subsystem stop being requirements.
+## Open decisions for the user
 
-Cost, stated plainly: a failed worker can leave the working tree dirty, and **the kernel
-does not currently guard against it** — `loop.rs` reads `head` before spawning but never
-`is_clean`, and it never calls `quarantine`. The mitigations exist but are unwired:
-`quarantine.rs` dirty-tree capture, `RepoLease` (already acquired at `loop.rs:274`), and
-the identity check that stops an unrelated commit counting as success. Phase 1 must add
-the `is_clean` preflight and quarantine adoption, or D1 ships a real safety regression
-against `dispatch_cycle`, which preflights both.
+**D1 — attempt isolation.** `dispatch_cycle` runs each worker in an isolated
+`AttemptCheckout` (`5961`) and promotes the commit (`1775`). That choice is the root of
+verification-input materialization, `undertake supersede` (1,492 lines), promotion
+recovery records, and three of four resume state machines. Dropping it (ralph-style
+in-repo execution, which the consolidation spec's `work` row permits) removes all of that
+as v1 work — but costs failed-attempt quarantine, clean fallback checkouts, and the
+post-verify HEAD/tree rechecks. **Not decided here.** See § Questions.
 
-A second downgrade to accept: on retry, `dispatch_cycle` hands the next attempt a
-`prior_capture` with patch path and hash; the kernel hands it plain text in
-`LoopIteration.feedback`. Weaker, acceptable for v1, recorded here so it is a choice.
-
-**If a reviewer can show in-repo execution is unsafe for this operator, D1 flips and
-Phase 1 roughly doubles.** It is called out as a decision, not assumed.
-
-## What the kernel actually lacks
-
-My first draft called Phase 1 "adapters over existing primitives." That was wrong.
-Verified against source:
-
-| Capability | Legacy location | v1 call |
-|---|---|---|
-| **Claim a bead** | `dispatch_cycle.rs:2468` | **Port.** `LoopClaim` has only `release` and `close` — there is no `claim`. The kernel assumes a pre-claimed bead. |
-| **Provider fallback chain** | `fallback_chain:7610` | **Port.** `LoopRequest` carries a single `profile_id`. No candidate pool, no fallback. |
-| **429 / retryable classification** | `classify_retryable_failure:7719`, `contains_contextual_429:7893` | **Port.** Not speculative: dispatching this very review hit `GoUsageLimitError` on the opencode-go lane and required the ollama-cloud fallback. |
-| **Backend auth classification** | bead `5p8`, `c9dd390` | **Port.** Prevents claiming a bead and then failing on auth. |
-| **Worker resource containment** | `write_worker_sandbox_profile:1364` | **Port.** Real containment, cheap to carry. |
-| **Qualitative review stage** | `verify.rs` `run_review_stage_until` etc. | **Port.** Kernel hardcodes `qualitative: None` and `review_resume_budget_secs: None` (`loop.rs:222-223`). The `review` job is v1 scope; the trait shape cannot currently express a review panel. |
-| **Issue fetch (`bd.show`)** | `dispatch_one:2196` | **Port.** The worker prompt needs the bead body. `LoopClaim` cannot fetch it. |
-| **Clean-tree preflight** | `dispatch_one` ~2380 | **Port.** `loop.rs` reads `head` but never `is_clean` before spawning. Under D1 this is the guard that makes in-repo execution safe. |
-| **Heartbeat / live progress** | `dispatch.rs:513 run_with_heartbeat` | **Port.** The kernel writes no heartbeat. The dashboard is in v1 and its `live`/`abandoned` split is keyed on heartbeat freshness (`dashboard/mod.rs:71-77`). |
-| Attempt checkout + commit promotion | `5961`, `promote_attempt_commit:1775` | **Drop** per D1. |
-| Verification-input materialization | `1285` | **Drop** — exists only to serve the checkout. |
-| Supersession | `run_supersession:3915` | **Drop** — only meaningful for promoted runs. |
-
-Phase 1 is therefore *extend the kernel's contract and port eight bounded capabilities*,
-not *write two adapters*. Still far smaller than porting `dispatch_cycle` wholesale,
-because D1 deletes the majority of what makes that file large — but it is design work,
-not wiring, and the spec should not pretend otherwise.
+**D2 — review-panel diversity.** `conductor-ao8` wants panel independence by model family.
+The consolidation spec says diversity compares exact `ProviderId`
+(`undertake-core-consolidation-spec.md:93-97`), and the code correctly implements that
+(`adversarial.rs:565-602`) — so `ollama-cloud/glm-5.2` and `opencode-go/glm-5.2` are
+"diverse" today. But the user's own `AGENTS.md` requires reviewers of a *"different model
+family (developer lineage, not inference provider)."* The spec and the operator policy
+disagree. This is a contract change needing an explicit model-family identity, not a bug
+fix. **Not decided here.**
 
 ## Scope test
 
@@ -122,311 +133,231 @@ A change enters v1 only if it is required to make this sentence true:
 
 ## Phases
 
-Each phase is independently shippable, ends in one commit, and has a runnable Verify.
+### Phase 0 — Freeze the corpus, close what is already fixed
 
-### Phase 0 — Restore signal
+The consolidation spec requires a golden/parity corpus **before** an implementation
+retires (`undertake-core-consolidation-spec.md:489-490`). Draft v1 omitted this.
 
-- Remove all 22 blanket `#![allow(dead_code)]`. Keep only the legitimate
-  `#[cfg_attr(not(feature = "tui"), allow(dead_code))]` gates (`sanitize.rs:31`,
-  `process.rs:136`). `loop.rs`/`job.rs` keep theirs until Phase 1 closes.
-- Delete confirmed-dead: `roster_drift.rs` (1,017); the 11 orphaned non-deadline wrappers
-  in `verify.rs` (`run:199`, `run_with_review:208`, `run_with_backoff:225`,
-  `run_with_review_backoff:235`, `run_with_optional_review_backoff:246`,
-  `run_mechanical:266`, `run_review_stage:298`, `run_review_stage_deferred:329`,
-  `run_mechanical_with_backoff:456`, `review_or_pass:874`, `run_review:1002` — each
-  superseded by a live `_until`/`_deadline` sibling); orphaned `dispatch.rs`
-  `run`/`spawn_request`/`prepare_worker_lineage_lease`;
-  `dispatch_cycle.rs:7715 is_retryable_worker_stderr`; the unused Cautionlight polling
-  stack in `dashboard/services.rs`.
-- Collapse the 3× duplicated `FakeBdClient`, `FakeChild`, `FakeCommits` into one
-  `src/test_support.rs`.
-- Re-verify `conductor-1qj` before acting. **`cargo test` is green today — 873 passed, 0
-  failed, 8 ignored, measured 2026-07-27.** The bead's "test rejects approved Codex
-  terminal fallbacks" claim is stale or conditional. Close it as stale or fix it; do not
-  carry an unexamined red-build claim into v1.
+- Freeze `dispatch_cycle`'s 11,133 test lines as the named behavioral parity corpus for
+  `work`. Every later phase re-runs it; deletion is gated on it.
+- Delete `roster_drift.rs` (1,017) and its `main.rs` mod declaration. Uncontroversially
+  retired, zero callers.
+- **Close three beads as stale, not deferred** — their premises are already fixed:
+  `3ce` (stable-guard inode + kernel lock make reclamation single-winner,
+  `quarantine.rs:542-574`), `t7q` (manifest writes already use fsynced durable
+  replacement, `run.rs:3500-3579`), `4wq` (liveness uses the `nix::kill` syscall, not
+  shell argv, `quarantine.rs:978-988`). Re-verify each before closing.
+- **Do not** flip `-D dead_code`, prune `verify.rs` wrappers, or consolidate test fakes.
+  The fakes have genuinely different state and failure seams; merging them is unrelated
+  refactoring that increases coupling before a risky cutover.
 
-**Verify**: `cargo test && cargo clippy --all-targets -- -D warnings -D dead_code`
-**Tier**: senior/M — mechanical. Sonnet 5.
+**Verify**: `cargo test && cargo clippy --all-targets -- -D warnings`
+**Tier**: junior/S–senior/S. Sonnet 5.
 
-### Phase 1 — Design the binding→kernel contract, then turn on the kernel
+### Phase 1 — Design and extract the generic attempt runner
 
-**Phase 1a — the contract (lead, design).** `JobBinding` (`job.rs:61`) carries
-`profile_ids` + `fallback_profile_ids`, `mutation`, `limits`, `verifier` (mechanical
-**and** qualitative), `approval_required`, `role_policy`. `LoopRequest` (`loop.rs:83`)
-has slots for none of them. Making `JobRegistry` authoritative therefore requires
-extending the kernel — **not** a policy-bearing adapter, which would be a fifth engine
-and violate invariant 1.
+**1a — contract design (lead).** Pin the boundary listed above before any code moves.
+Name explicitly: where `bd.claim` and `bd.show` happen relative to the durable boundary;
+how the candidate pool and fallback are expressed on retry; where approval fails closed;
+how mutation posture is enforced; the full terminal-state enum.
 
-The contract to design and pin before any implementation:
+**1b — extraction (senior/L).** Lift the generic runner out of the proven machinery —
+`dispatch.rs:513 run_with_heartbeat`, `classify_retryable_failure:7719`,
+`contains_contextual_429:7893`, the `5p8` auth classifier, `SpawnRequest`'s existing
+`sandbox_profile` / `worker_resource_limits` fields, `run.rs`'s durable event journal,
+`quarantine`'s leases and capture. Extraction, not reimplementation.
 
-```
-LoopRequest  gains: candidates: Vec<ProfileId>   (pool + fallback, ordered)
-                    mutation:   MutationPosture
-                    approval:   Option<ApprovalRef>   (fails closed when required)
-                    verifier:   RunVerifier           (mechanical + optional qualitative)
-LoopClaim    gains: show(repo, target) -> Issue       (worker prompt needs the bead)
-                    claim(repo, target, owner)
-LoopHarness  gains: reviewer(iteration, stage) -> Option<SpawnRequest>
-```
+**Verify**: the frozen corpus still passes with `work` routed through the extracted runner.
+**Tier**: 1a lead, 1b senior/L. **This is the whole bet.**
 
-Kernel loop order, pinned: backend-auth preflight (fail closed **before** claim) →
-`is_clean` preflight → claim → per attempt: select next candidate, spawn, heartbeat while
-running → on failure classify (429 / quota / session / other) and either retry the same
-candidate or advance the pool → mechanical verify → optional qualitative → terminal close
-or release.
+### Phase 2 — Migrate `work`; delete the prototype
 
-**Phase 1b — implementation.** Port the eight capabilities named above. Reuse existing
-primitives rather than rewriting: `dispatch.rs:513 run_with_heartbeat`,
-`classify_retryable_failure:7719`, `contains_contextual_429:7893`, the `5p8` auth
-classifier, `SpawnRequest`'s existing `sandbox_profile` / `worker_resource_limits` fields
-(the kernel simply never populates them). Implement production `LoopHarness` / `LoopClaim`
-over `BdClient`, `Exec`/`SpawnRequest`/`ChildProcess`, `RunHandle`. Add
-`undertake work --repo <path> --bead <id> [--config <path>]`.
+Route `undertake work --repo <path> --bead <id>` through the extracted runner. Delete
+`loop.rs` and `job.rs`'s unused authority, or wire `job.rs` properly — but stop shipping a
+registry that is never constructed. Add a real `[[job]]` block to `undertake.toml`.
 
-**Enforce `MutationPosture`.** `job.rs:49` declares `Work => RepositoryWrite`,
-`Review|Consult|Plan => ReadOnly` and nothing enforces it. Mirror the post-review
-HEAD/index/worktree check from `8a8f1fe`.
+**Verify**: frozen corpus green + an integration test driving the CLI against a sandbox
+git repo with a **scripted local backend** (not the live roster — see Phase 3).
+**Tier**: senior/L.
 
-**Verify**: `cargo test loop && cargo test job && cargo test cli`, plus an integration
-test driving `undertake work` against a sandbox git repo the test creates: bead claimed →
-worker spawned → commit appears → `verify_cmd` runs → bead closed. Not fake-only.
+### Phase 3 — Break the bootstrap deadlock (moved earlier)
 
-**The test uses a scripted local backend, not the live roster.** If the live roster is
-all-`Unknown` (the Phase 3 deadlock), a live-provider test cannot pass before Phase 3
-exists. The live-roster proof is Phase 4 gate item 1, deliberately after Phase 3.
+Draft v1 put this after all job migrations. Wrong: with an all-`Unknown` roster, no
+migrated job can be live-dogfooded. Bootstrap belongs immediately after generic profile
+selection exists.
 
-**Tier**: 1a lead. 1b senior/L. **This phase is the whole bet** — it ships `work` alone
-and proves the kernel's shape before Phase 2 commits three more jobs to it.
+Minimum that breaks the cycle: a bounded, tools-disabled, non-repo-cwd probe targeting
+**only** `Unknown` **and** enabled profiles; one approval covering probe set plus target;
+validated probes append exact-scope evidence via Musterroll, re-snapshot and re-hash the
+roster, continue only if normal eligibility now passes; anything unexpected stops before
+bead claim or repo mutation. A probe is a preflight phase, never a fifth `JobKind`.
 
-### Phase 2 — Move the other three jobs onto the kernel
-
-- **`review`** — route `adversarial.rs` through `JobKind::Review` without weakening
-  artifact hashing, immutable approval, read-only execution, schema repair, anonymous
-  synthesis, or minority preservation. Keep `adversarial-review` as a warning-free alias.
-  (`conductor-adversarial-job`, ready, senior/M)
-- **`consult`** — fold Envoy's read-only evidence-or-gaps envelope into a `consult` job.
-  (`conductor-consult-job`, ready, senior/M)
-- **`plan`** — re-home `plan_job` onto the kernel's attempt/event lifecycle. Its
-  peer-review / second-opinion stage machine stays **job policy, not a second engine**.
-- Fold in `conductor-pzo` (Fable 5 + provider-diverse review fallbacks) as review-job
-  config binding, and `conductor-ao8` with it.
-
-**`conductor-ao8` is v1, not deferrable.** Review-panel independence is computed per
-provider *lane*, so `ollama-cloud/glm-5.2` and `opencode-go/glm-5.2` count as two
-independent reviewers. That is the same model twice, and the user's real roster contains
-exactly that pair. A review job whose diversity guarantee is false is not shippable.
-
-**Verify**: `cargo test job && cargo test adversarial && cargo test plan_job && cargo test
-consult`; all four jobs observably dispatch through one `LoopKernel::run`.
-**Tier**: senior/M per job — three separable Sonnet 5 items.
-
-### Phase 3 — Break the bootstrap deadlock
-
-`conductor-bxb` (P0) is a real, twice-reproduced deadlock: when every provider is
-`Unknown`, dry-run proposes zero work and no Undertake call can produce the evidence that
-would make a provider known. **This is why the 2026-07-27 dogfood cycle reported 251
-proposed / 0 dispatched** — recorded as a successful propose-only run, at least partly
-this bug.
-
-Minimum that breaks the cycle:
-
-- A bounded, tools-disabled, non-repo-cwd probe targeting **only** `Unknown` **and**
-  enabled profiles. Exhausted, deferred, disabled, invalid, stale-config: ineligible.
-- One approval covers the probe set plus the original bounded target.
-- A validated probe appends exact-scope evidence via Musterroll, re-snapshots and
-  re-hashes the roster, continues only if normal eligibility now passes.
-- Anything unexpected — failure, timeout, no output, schema mismatch, changed profile,
-  failed append — stops before bead claim or repo mutation.
-- A probe is a preflight phase, never a fifth `JobKind`.
-
-**De-scoped from the bead as written**: cut cost-posture pinning, TTL policy, replay
-tests, and full scorecard coupling. Retain only "a probe emits a canonical attempt
-record," which `run.rs` already provides.
-
-**Verify**: `cargo test loop && cargo test job && cargo test musterroll` covering
-all-Unknown bootstrap, mixed providers, partial success, crash-resume without re-approval.
+**De-scoped** from the bead as written: cost-posture pinning, TTL policy, replay tests,
+full scorecard coupling.
 **Tier**: senior/M (down from lead/L).
 
-### Phase 4 — Parity, then delete
+### Phase 4 — Migrate `review`, `consult`, `plan` one at a time
 
-**Ordering is not negotiable.** `dispatch_cycle.rs` is today the only working end-to-end
-path. Deleting it before the kernel does real work leaves a product that cannot do
-anything.
+Not three Senior/M items — two are full engine migrations and one is new construction.
 
-**Gate — all must hold before one line is deleted:**
+- **`review`** (`adversarial.rs`): N reviewers, per-slot fallback, schema repair,
+  anonymity, immutable approval, judge recheck, minority preservation. Preserve every one.
+  Keep `adversarial-review` as a warning-free alias. senior/L.
+- **`plan`** (`plan_job.rs`): preparation/approval, weighted durable reservations,
+  author/peer/revision/second-opinion stages, schema validation, isolated worktrees,
+  cancellation, recovery. Its stage machine becomes job *policy* on the shared runner.
+  **Requires `RunHandle::create` to stop refusing Plan runs.** lead-specced senior/L.
+- **`consult`**: no implementation exists. Import Envoy's prompt, evidence-or-gaps schema,
+  validator, and fixtures. senior/M.
 
-1. The kernel has verifier-closed at least one **real** bead in a real repo.
-2. All four jobs dispatch through `LoopKernel::run` (Phase 2 complete).
-3. The bootstrap probe works against the live roster (Phase 3 complete).
-4. `conductor-guildhall-dogfood` is redefined in kernel terms. It currently *means*
-   `cycle --dry-run`, a command about to stop existing.
+Each migration defines its own CLI front door — `undertake review|consult|plan --repo
+<path> --target <...>` — including how two-step human approval maps onto one invocation.
+Draft v1 never specified these.
 
-**Delete** (~26,400 lines): `dispatch_cycle.rs` (19,370), `cycle.rs` (1,973), `scan.rs`
-(1,128), `ratchet.rs` (1,101), `plan.rs` (1,021), and the fleet-only bulk of `triage.rs`
-(~1,800 of 1,836). Remove the config that dies with them: `autonomy`, `[ratchet]`,
-`[scan]`, fleet-only `[budgets]` knobs.
+### Phase 5 — Adapt the dashboard, then pass gate 10 *before* deleting anything
 
-**Retained from the original deletion list** — corrections found while verifying:
+Draft v1 deleted the rollback engine and *then* attempted the installed smoke. Inverted.
 
-- **`fields.rs` (579) survives.** The kernel needs routing-field extraction to read
-  `tier_floor` / `complexity` / `verify_cmd` from a bead. Listing it for deletion was an
-  error.
-- **`triage.rs` survives in part.** `route.rs:417` uses `CandidateRejection` /
-  `candidate_rejection`. Keep that slice or drop `route explain` deliberately.
-- **`verify.rs` (3,589) needs a decision.** Its only consumers are `dispatch_cycle` (6
-  refs) and `adversarial` (1). The kernel currently runs its verifier directly via
-  `LoopHarness::verifier() -> SpawnRequest`, bypassing `verify.rs` entirely. Either the
-  kernel adopts `verify.rs` (and its review stages per D2) or most of it dies with
-  `dispatch_cycle`. **Do not discover this mid-deletion.**
-- **`state.rs`** migrate paths reference `ratchet` (5), `plan`, `triage` — prune with the
-  legacy state they migrate.
+- **Dashboard compile breaks** (draft v1 wrongly called this "verified" decoupled):
+  `dashboard/mod.rs:72-77` → `dispatch_cycle::STALE_CLAIM_THRESHOLD`;
+  `run_source.rs:1282-1319` → `deck::report_run_dir`;
+  `run_source.rs:1221-1225,1377-1381` → `quarantine::{process_alive,process_group_alive}`.
+  Relocate the const; the other two are survivors.
+- The dashboard's `live`/`abandoned` split is keyed on heartbeat freshness. The runner must
+  emit heartbeats or that view goes static — an accepted, stated regression, not a
+  surprise.
+- **Gate 10**: `scripts/smoke-installed-loop-product.sh --isolated --no-metered` — the
+  installed binary, isolated state roots, Musterroll → Undertake → Afterfact →
+  Cautionlight, verifying every artifact hash and schema boundary. Neither the script nor
+  `scripts/` exists. This is substantially more than senior/M.
 
-**Compile breaks in surviving modules — every one must be resolved in the same commit.**
-An earlier draft of this spec claimed the dashboard was "unaffected… verified, not
-assumed." That was wrong, and the error is recorded rather than quietly fixed:
+### Phase 6 — Quiesce, migrate guidance, then delete
 
-| Survivor | Broken reference | Resolution |
-|---|---|---|
-| `dashboard/mod.rs:77` | `crate::dispatch_cycle::STALE_CLAIM_THRESHOLD` — **production** `pub(crate) const` | Relocate the const (60s, `dispatch_cycle.rs:7035`) to a survivor and re-point. |
-| `route.rs:416` | `use crate::fields::RoutingFields` | `fields.rs` survives — resolved by the retention above. |
-| `route.rs:417` | `use crate::triage::{CandidateRejection, candidate_rejection}` | Keep that slice of `triage.rs`, or delete `route explain` deliberately and add it to the disappearing-commands list. |
-| `state.rs:117` | `copy_typed_file::<crate::ratchet::RatchetStore>` — **production** | Prune the ratchet leg of legacy-state migration. |
-| `state.rs:763-890` | `ratchet`, `plan::CyclePlan::from_triage`, `triage::Plan` (tests) | Prune with the tests they cover. |
-| `cli.rs:347, 1422` | `crate::fields::Triage` / `extract`, `RoutingFields` | Survives via `fields.rs` retention; re-check after the command removals. |
-| `main.rs:8-28` | `mod` declarations for every deleted module | Mechanical. `mod roster_drift;` must also go in **Phase 0**. |
+**Prerequisites, all mandatory** — draft v1 had none of the first two:
 
-**Not breaks** (verified, listed so they are not re-flagged): `adversarial.rs:3180-3181`
-are *string literals* inside a module-isolation deny-list test. Matches on `cycle::` in
-`quarantine.rs` / `run.rs` are substrings of `RunLifecycle::`.
+1. **Legacy quiescence.** The architecture requires quiescing cycle/dispatch and resolving
+   every pending, implementing, or reclaimable legacy run before deployment
+   (`undertake-core-consolidation-spec.md:175-178`). Without it, deletion strands claims,
+   promoted commits, pending reviews, and recovery receipts.
+2. **Operator guidance migrated.** `AGENTS.md` and the `guildhall-orchestration` skill
+   still invoke `cycle`/`dispatch`. They live in chezmoi and are **human-applied**. Either
+   retain warning shims until that lands, or make the human migration a hard prerequisite.
+   Producing an unapplied diff and deleting anyway guarantees a broken operator.
+3. Frozen parity corpus green against the new runner. Gate 10 passed.
+4. `conductor-guildhall-dogfood` redefined in kernel terms.
 
-**The dashboard needs more than a const move.** Its `live`/`abandoned` split is keyed on
-heartbeat freshness (`dashboard/mod.rs:71-77`). The kernel writes no heartbeat. Phase 1
-ports `run_with_heartbeat`; if that slips, the dashboard's liveness view goes static and
-that must be an accepted, stated regression — not a surprise.
+**Then delete** (~27,000 lines): `dispatch_cycle.rs`, `cycle.rs`, `scan.rs`, `ratchet.rs`,
+`plan.rs`, and the fleet-only bulk of `triage.rs`.
 
-**Consequences to accept, not discover:**
+**Retained** — corrections found while verifying: `fields.rs` (579) survives; `cli.rs:340-369`
+(bead-backed plan input) and `cli.rs:1417-1429` (`route explain`) need it. `triage::candidate_rejection`
+survives for `route.rs:415-417`. `ratchet::RatchetStore` survives for `migrate state`
+(`state.rs:113-120`) or its schema moves. **Either `route explain` and `migrate state` join
+the disappearing-commands list, or these pieces are extracted first.**
 
-- Five commands disappear: `scan`, `cycle`, `dispatch`, `supersede`, and `status` in its
-  journal-reading form.
-- `AGENTS.md` and the `guildhall-orchestration` skill document the
-  `undertake cycle` / `undertake dispatch` flow. Both live in chezmoi and are
-  **human-applied**. This phase produces a proposed diff; it never applies it.
-- `undertake supersede` (1,492 lines, `de954c8`, two days old) loses its reason to exist
-  under D1. Stated plainly rather than discovered mid-deletion.
+Removing `dispatch_cycle` also orphans most of `verify.rs` (its only production consumers
+are `dispatch_cycle` ×6 and `adversarial` ×1), with fallout in `run.rs`, `quarantine.rs`,
+`dispatch.rs`, `ledger.rs`, `config.rs`, `state.rs`, `cli.rs`, `main.rs`.
 
-**Verify**: `cargo test && cargo clippy --all-targets -- -D warnings -D dead_code`;
-`undertake --help` advertises only kernel commands; the dashboard renders a
-kernel-produced run.
-**Tier**: senior/M mechanical; **lead reviews the gate**, not the diff.
+**Not breaks** (verified, so they are not re-flagged): `adversarial.rs:3180-3181` are
+string literals in a module-isolation deny-list test; `cycle::` matches in
+`quarantine.rs`/`run.rs` are substrings of `RunLifecycle::`.
 
-### Phase 5 — The v1 gate
-
-- `scripts/smoke-installed-loop-product.sh --isolated --no-metered`: the **installed**
-  binary, isolated state roots, Musterroll → Undertake → Afterfact → Cautionlight,
-  verifying every artifact hash and schema boundary. (Cutover gate 10. Neither the script
-  nor `scripts/` exists yet.)
-- Real CLI integration tests under `tests/`. Today `cli::run` is called **only from
-  `main.rs`** — 986 tests and the front door is untested. The single file in `tests/`
-  is a static template check.
-- Close `conductor-bnc`.
-
-**Verify**: the bead's own `verify_cmd`.
-**Tier**: senior/M.
+**Only now** enable `-D dead_code` and prune the resulting fallout.
 
 ## Backlog surgery
 
-Two dependency edges cut, with justification:
+**Cut two dependency edges**: `7hb → bxb` (scorecard completeness is Afterfact parity; a
+probe needs only to emit an attempt record, which `run.rs` already does) and
+`plan-review-eval-fold → bnc` (test-infra, does not gate the kernel).
 
-- **`conductor-7hb` → `conductor-bxb`**: 7hb is scorecard completeness for Afterfact
-  (evidence/reporting). A bootstrap probe needs to *emit* an attempt record — `run.rs`
-  already does that — not to complete Afterfact parity. Cut; fold the one-line
-  requirement into Phase 3.
-- **`conductor-plan-review-eval-fold` → `conductor-bnc`**: importing the corrected
-  Gauntlet corpus into plan/review test expectations is test-infra. It does not gate the
-  kernel running four jobs.
+**Promoted to v1 — reachable single-operator, contra draft v1:**
 
-**Deferred wholesale — 9 robustness-speculative beads** (29% of the open backlog):
-`038` (lease races during mid-upgrade binary replacement), `8hz`, `1ls` (power-loss
-fsync), `3ce` (two concurrent lease reclaimers), `2bh` (fs2→fs4 + non-macOS semantics),
-`47p` (PID reuse), `t7q` (power-loss fsync ordering), `4wq` (portable `kill -0 -PGID` on
-platforms not run here), `moe` (sub-second TOCTOU between a human's manual `bd close` and
-Undertake's release).
+- `47p` — lease ownership stores and checks **PID only** (`quarantine.rs:651-666`). One
+  crash plus later PID reuse by any unrelated process wedges resume permanently. No
+  concurrency required. This directly contradicts the v1 resumability claim.
+- `moe` — the operator manually closes a bead while a run finishes; `bd.release`
+  unconditionally runs `bd update --status open --assignee ""` (`bd.rs:235-238`),
+  reopening completed work. A repo lease cannot serialize a human `bd` command.
+- `8hz` — crash between durable promotion Intent and `merge --ff-only` wedges exactly
+  recoverable work. **Moot if D1 drops isolation**; a parity requirement if it does not.
 
-Each requires a second concurrent Undertake process on one repo, a literal mid-upgrade
-binary swap, an OS this machine does not run, or a crash landing in a several-instruction
-window. Single-operator macOS. Note that `1ls`, `8hz`, and `jum` additionally lose their
-subject matter under D1.
+**Closed as stale** (Phase 0): `3ce`, `t7q`, `4wq`. `1ls` split — parent-directory fsync is
+already implemented (`dispatch_cycle.rs:952-971`); only integrity-binding of
+`promotion.json` remains, and only if promotion survives D1.
 
-**Also deferred**: `eel` (Managed Agents POC), `2d4` (native Codex app-server client),
-`88v` (local Ollama admission), `tdj` (quota-aware load spreading), `7hb`,
-`plan-review-eval-fold`, `7rs` (legacy ledger retirement — gated on Afterfact parity).
+**Deferred**: `038` (address via the Phase 6 quiesce gate rather than mixed-version lease
+support), `2bh` (macOS-only v1), `eel`, `2d4`, `88v`, `tdj`, `7hb`,
+`plan-review-eval-fold`, `7rs`. `pzo` is **gate 11** work
+(`undertake-core-consolidation-spec.md:507`), not gates 4/10 — keep only the generic
+review-job selection.
 
-**Kept, small, real**: `blv` (relative state dir breaks worker-cwd artifact paths), `jum`
-(survivor filenames glob-interpreted by `git apply --exclude`; breaks on `src/[id].ts` —
-**re-check under D1**, it may vanish). Both senior/S. `dpo` and `74d` die with the legacy
-path.
+**Kept, small**: `blv`, `jum` (re-check `jum` under D1).
 
 ## Invariants
 
 1. **One kernel.** A new execution path is a defect, not a feature.
-2. Deletion is gated on demonstrated parity, never on confidence.
-3. One writer per repo.
-4. Every execution starts from an explicit target and immutable maximum scope.
-5. Unknown roster, provider, schema, artifact hash, verifier, or approval state fails closed.
-6. Read-only jobs cannot mutate their repo; a mutation is an infrastructure failure.
-7. No push, no `chezmoi apply`.
+2. Deletion is gated on a frozen parity corpus and a passed gate 10, never on confidence.
+3. Legacy runs are quiesced and resolved before their engine is removed.
+4. One writer per repo.
+5. Every execution starts from an explicit target and immutable maximum scope.
+6. Unknown roster, provider, schema, artifact hash, verifier, or approval state fails closed.
+7. Read-only jobs cannot mutate their repo; a mutation is an infrastructure failure.
+8. No push, no `chezmoi apply`.
 
 ## Non-goals
 
 A fifth job kind; a workflow DSL; reviving the ratchet or fleet-wide unattended cycling;
-any new abstraction over the four job engines beyond the kernel; any hardening in the
-deferred bucket; applying the chezmoi diff.
-
-## Risks
-
-- **Phase 1 is the whole bet.** If the kernel's traits are the wrong shape for real
-  adapters, Phase 1 becomes a redesign. Mitigated by shipping `work` alone first.
-- **D1 is load-bearing.** If in-repo execution is judged unsafe, the promotion subsystem
-  must be ported and Phase 1 roughly doubles.
-- **Phase 4 is irreversible in practice.** Git recovers the code, not the context.
-- **`plan` may resist re-homing.** If it cannot sit on the kernel without distorting the
-  kernel, that is a finding to surface, not route around.
+test-double consolidation; wholesale lint cleanup before migration; applying the chezmoi
+diff.
 
 ## Adversarial review record
 
-**Reviewer 1 — GLM 5.2 (Zhipu family, via ollama-cloud), 2026-07-28. Verdict: SHIP WITH
-CHANGES.** The opencode-go lane returned a live `GoUsageLimitError` (monthly limit, resets
-in ~15 days); the ollama-cloud fallback carried it. Adjudicated against source by the
-author; **all three mandatory findings accepted and folded in above**:
+Draft v1 went to two Lead-tier reviewers of different model families from the author
+(Opus 5 / Anthropic).
 
-1. *Dashboard is a production dependency on `dispatch_cycle`* — **accepted, verified.**
-   `dashboard/mod.rs:77` is a `pub(crate) const` (test module starts line 79). The
-   draft's "verified, not assumed" was the opposite of true. Also surfaced the deeper
-   heartbeat gap.
-2. *`route.rs` and `state.rs` break on deletion* — **accepted, verified.**
-   `state.rs:117` is production. Break table added to Phase 4.
-3. *Phase 1 is a redesign, not wiring* — **accepted.** `LoopRequest` has no slot for
-   pool, fallback, approval, posture, or qualitative verifier; `LoopClaim` has no `claim`
-   and no `show`. Phase 1 split into 1a (contract design) and 1b (implementation).
+**GLM 5.2 (Zhipu, via ollama-cloud) — SHIP WITH CHANGES.** The opencode-go lane returned a
+live `GoUsageLimitError`; the ollama-cloud fallback carried it. Three mandatory findings,
+all verified against source and accepted: the dashboard is a *production* dependency on
+`dispatch_cycle` (draft v1's "verified, not assumed" was the opposite of true);
+`route.rs` and `state.rs:117` are production compile breaks; Phase 1 was a redesign
+mislabeled as wiring.
 
-Also accepted: the missing `is_clean` preflight, the `prior_capture` → text-feedback
-downgrade, "never consumed" softened, `mod roster_drift;` removal added to Phase 0,
-Phase 3 ordering tension resolved by pinning Phase 1's test to a scripted local backend.
+**GPT-5.6 Sol (OpenAI, via omp at `max`) — REJECT.** Sol authored much of the current
+codebase and was told the draft criticized that work; it was asked to rebut on evidence.
+Its review was the stronger of the two and its central finding is **accepted**: `loop.rs`
+is a work-only, commit-requiring prototype structurally incapable of hosting read-only
+review/consult or staged plan, with a forgeable state file and non-functional resume.
+Draft v1's premise — "the kernel is built, just turn it on" — was false. Verified
+independently at `loop.rs:346-359`, `run.rs:1021-1025`, and the absent `[[job]]` table.
 
-Rejected: none. One correction to the reviewer — its `fields.rs` break is already
-resolved by this spec retaining `fields.rs`; its line-count arithmetic (27,008) assumed
-`fields.rs` deletion.
+Also accepted from Sol: parity corpus before retirement; gate 10 before deletion; the
+legacy quiescence gate; bootstrap moved earlier; `-D dead_code` moved to the end; three
+beads closed as stale rather than deferred; `47p`/`moe` promoted to v1; `pzo` reclassified
+as gate 11; test-fake consolidation dropped; corrected counts (19 blanket allows, not 22;
+`job.rs` never *constructed*, not merely unconsumed).
 
-**Reviewer 2 — GPT-5.6 Sol (OpenAI family, via omp at `max`)**: dispatched, still
-running at time of writing. Sol authored much of the current codebase state and was told
-so, and asked to rebut the overengineering criticism on evidence. Its findings must be
-adjudicated and folded in before this spec is executed.
+**Partially rejected — D2.** Sol argues `ao8` contradicts the approved `ProviderId`
+diversity rule (`undertake-core-consolidation-spec.md:93-97`) and is therefore not a v1
+bug. Correct as to the spec. But the user's `AGENTS.md` requires reviewers of a *different
+model family (developer lineage, not inference provider)*, which the spec's rule does not
+deliver. The spec and the operator's standing policy conflict. Recorded as decision D2 for
+the user rather than settled by either reviewer.
 
-## Verified facts (measured 2026-07-27, re-check before relying)
+**Not adopted**: Sol's claim that deleting `dispatch_cycle` destroys 11,000 lines of
+irreplaceable specification is directionally right but overstated — much of that corpus is
+~20 bespoke `Exec` fakes shaped around one god-function and will not transfer verbatim.
+Freezing it as a parity corpus (Phase 0) captures the value without blocking the
+architecture change.
+
+## Verified facts (measured 2026-07-27/28, re-check before relying)
 
 - `cargo test`: 873 passed, 0 failed, 8 ignored.
 - `src/` totals 87,148 lines; 39,878 (45.8%) inside `#[cfg(test)]`; 986 `#[test]` fns.
-- `tests/` contains one file, a static template assertion. `cli::run` has no test caller.
-- 22 modules with blanket `#![allow(dead_code)]`.
+- `tests/` contains one file, a static template assertion. No test drives `cli::run`, the
+  installed binary, real `bd`, and a real worker subprocess end to end.
+- 19 modules with blanket `#![allow(dead_code)]`.
+- `undertake.toml` contains zero `[[job]]` tables.
 - Dispatching this spec's own review hit a live provider quota limit on opencode-go,
-  requiring the ollama-cloud fallback lane.
+  requiring the ollama-cloud fallback — evidence that candidate-pool fallback belongs in
+  the kernel, which the prototype could not express.
