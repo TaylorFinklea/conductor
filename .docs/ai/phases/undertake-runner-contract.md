@@ -146,13 +146,14 @@ Posture-selected. The mutating half exists; the read-only half needs widening.
 The only per-job seam.
 
 ```
-job()                   -> RunJob
-posture()               -> MutationPosture
-claims_bead()           -> bool
-stages(progress)        -> Option<Stage>        // None ends the stage sequence
-prompt(stage, attempt)  -> SpawnRequest         // built from the pinned candidate
-classify(stage, output) -> Option<AttemptOutcome>  // job-specific reading; None = runner default
-terminal(evidence)      -> Terminal
+job()                     -> RunJob
+posture()                 -> MutationPosture
+claims_bead()             -> bool
+requires_pinned_roster()  -> bool               // false only for the bootstrap probe
+stages(progress)          -> Option<Stage>      // None ends the stage sequence
+prompt(stage, attempt)    -> SpawnRequest       // built from the pinned candidate
+classify(stage, output)   -> Option<AttemptOutcome>  // job-specific reading; None = runner default
+terminal(evidence)        -> Terminal
 ```
 
 `plan`'s revision cap, `review`'s minority preservation, and `consult`'s evidence-or-gaps
@@ -207,9 +208,18 @@ Requirements:
 4. `conductor-47p` is in scope here: lease ownership stores and checks PID only
    (`quarantine.rs:651-666`), so one crash plus later PID reuse wedges resume forever.
    Owners bind to a process generation, not a bare PID.
-5. Missing approval or roster snapshot when required is a **fail-closed refusal**. Today
-   `RunHandle` emits a `musterroll_roster_artifact_unavailable` coverage gap and proceeds
-   (`run.rs:1120-1130`); that is failing open.
+5. Missing approval or roster snapshot when required is a **fail-closed refusal**. Verified:
+   `RunHandle::create` currently appends a `CoverageGap` event with outcome
+   `musterroll_roster_artifact_unavailable` and then returns `Ok(handle)`
+   (`run.rs:1119-1131`) — it proceeds.
+
+   **Do not fix this by making `RunHandle::create` refuse unconditionally.** The Phase 3
+   bootstrap probe (`conductor-bxb`) exists precisely to run when roster eligibility cannot
+   yet be established; a blanket refusal would make the deadlock permanent. The refusal
+   belongs in the **runner**, conditioned on `JobPolicy`: a policy declares whether a
+   pinned roster snapshot is required, and the runner refuses when a requiring policy lacks
+   one. The probe's policy declares it is not required, and its coverage gap stays a
+   coverage gap.
 
 ## D1 obligations
 
