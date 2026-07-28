@@ -468,10 +468,23 @@ preflights both:
 `plan` keeps its disposable isolated worktree — the consolidation spec assigns it one
 ("Disposable isolated worktree; no target mutation"). D1 governs `work` only.
 
-### What D1 gives up — stated precisely, because an earlier draft oversold it
+### Isolation is CASE's scope, not Undertake's (user, 2026-07-28)
 
-Sol's review established that the three controls above buy **detection and fail-closed
-refusal**, not isolation and rollback. The honest accounting:
+Adversarial review established that the three controls above buy **detection and
+fail-closed refusal**, not isolation and rollback. An earlier draft called them sufficient;
+they are not. The resolution is a scope boundary, not a stronger control set: **containment
+belongs to CASE** (the Controlled Autonomy Safety Engine, `~/git/case`). See
+`decisions.md [2026-07-28]`.
+
+Undertake therefore owes **detection only**, and must not grow a containment layer back
+under another name:
+
+- a durable **pre-attempt HEAD checkpoint** written before spawn;
+- on resume, canonical HEAD moved without a matching durable receipt ⇒ **fail closed**.
+  Undertake declines to touch the repository and surfaces it for human resolution;
+- clean-tree preflight and quarantine adoption of *uncommitted* work.
+
+What Undertake does **not** attempt, and no Phase 1b design may reintroduce:
 
 1. **An unauthenticated canonical commit has no recovery path.** A worker can commit and
    the parent can crash before the receipt and `AttemptFinished` checkpoint are durable.
@@ -492,16 +505,12 @@ refusal**, not isolation and rollback. The honest accounting:
    path and hash and explicitly does not require the next worker to use it
    (`dispatch_cycle.rs:6827-6851`).
 
-**The mitigation, and why this may still be the right trade.** The runner records the
-pre-attempt HEAD durably before spawn; on resume, a canonical HEAD that moved without a
-matching durable receipt is a **fail-closed refusal** — Undertake will not touch the repo
-and surfaces it for a human `git reset`. That is strictly more than Ralph offers, and
-Ralph — which the operator runs daily — has this exact risk profile with no detection at
-all. D1 is therefore not a novel hazard; it matches the tool already in daily use.
-
-**This is a user decision and it is recorded as open** (§ Open questions). If the residual
-risk is unacceptable, D1 reverses, `work` regains the attempt checkout, and Phase 1b grows
-the promotion seam.
+**Accepted residual, stated plainly.** CASE is unfrozen and unimplemented, so this gap is
+unowned *today*, not merely delegated. Until CASE ships, a crash between a worker's commit
+and its durable receipt can leave an unprovable commit on the branch that Undertake will
+refuse to touch, resolved by hand. Ralph — in daily use — has the same exposure with **no
+detection at all**, so this is not a new hazard and Undertake is strictly ahead of the
+status quo. Closed as a scope decision; revisit only if CASE's scope changes.
 
 ## Plan creation — an earlier draft got this backwards
 
@@ -606,9 +615,9 @@ primitives, which are sound. Any per-job escape hatch past `JobPolicy`.
 
 ## Open questions — close these before `conductor-mkct` starts
 
-1. **D1's residual risk (user).** Is "a crash mid-attempt can leave an unprovable commit on
-   your branch that Undertake refuses to touch, resolved by hand" acceptable? See § What D1
-   gives up. Reversing D1 restores the attempt checkout and roughly doubles Phase 1b.
+1. ~~D1's residual risk~~ — **CLOSED 2026-07-28 (user).** Isolation is out of Undertake's
+   scope entirely; CASE owns containment. Undertake owes detection only. See
+   `decisions.md [2026-07-28]` and § Isolation is CASE's scope.
 2. **Durable call budget (design).** `ReviewerCallBudget` is an in-memory `AtomicU32`
    (`adversarial.rs:158-188`), so a crash resets it and a resumed run can exceed its
    approved ceiling. Reservations must be durably recorded before spawn and reconstructed
