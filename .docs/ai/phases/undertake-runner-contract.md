@@ -1,9 +1,13 @@
 # The generic attempt runner — contract
 
-**Status**: draft for review (Opus 5, 2026-07-28). Bead `conductor-y6kv` (v1 Phase 1a).
-Implements the design half of `undertake-v1-finish-spec.md` Phase 1. `conductor-mkct`
-(Phase 1b) implements it; a Senior should be able to build from this without further
-design decisions.
+**Status**: draft 3 — **NOT YET BUILDABLE**. Bead `conductor-y6kv` (v1 Phase 1a).
+Design half of `undertake-v1-finish-spec.md` Phase 1; `conductor-mkct` implements it.
+
+Two adversarial reviews (GLM 5.2: SHIP WITH CHANGES; GPT-5.6 Sol: **REJECT**) agree the
+extraction direction is right and the seam is not yet implementable. Draft 3 fixes every
+verified factual error and the seam holes both reviewers named. **Three questions remain
+open** (§ Open questions) and one is the user's. Do not start `conductor-mkct` until they
+close.
 
 ## What is actually missing
 
@@ -108,13 +112,22 @@ they never retry the same profile. This is not theoretical — dispatching this 
 adversarial review hit `GoUsageLimitError` on `opencode-go` and required the
 `ollama-cloud` lane.
 
-Both existing engines already draw exactly this line, which is evidence the seam is in the
-right place: a reviewer slot answers `InvalidSchema` with a same-model repair and
-`ProcessFailed` with the next chain entry, mutually exclusive, at most two attempts
-(`adversarial.rs:1913-1951`); `plan` answers a schema failure with one same-author repair
-in a fresh worktree (`plan_job.rs:1744-1827`) and an eligibility loss by walking to the
-next pinned candidate. So `RetrySameCandidate` ≙ schema repair, `AdvanceCandidate` ≙
-process/eligibility failure.
+**The mapping is per stage and slot, never global.** An earlier draft asserted
+`AdvanceCandidate ≙ process/eligibility failure` as shared behavior. It is not:
+
+- `review`: process failure takes the slot's fallback (`adversarial.rs:1943-1951`), and
+  alternatives must stay inside the slot's **approved provider envelope**
+  (`adversarial.rs:2093-2112`). So a provider-wide 429 must not blindly advance — the next
+  entry may sit on the same dead provider, and leaving the envelope violates the approved
+  panel.
+- `plan`: process failure returns immediately **without** advancing
+  (`plan_job.rs:1727-1741`, `1973-1988`, `2350-2366`). Author fallback happens only on
+  *pre-call* eligibility loss (`1663-1685`), and a **bound** peer losing eligibility ends
+  the run `Blocked` (`1915-1922`), never a fallback.
+
+So the runner supplies the four actions; the *stage* declares which outcome maps to which,
+including whether advancing is legal at all. A global rule would silently change both
+engines' behavior. `RetrySameCandidate` ≙ schema repair is the one mapping both share.
 
 The union of abandon reasons the runner must express: process/spawn failure; schema or
 parse failure; eligibility loss mid-run; budget, revision, or attempt-cap exhaustion; and
@@ -137,10 +150,12 @@ AwaitingSecondOpinion → Terminal`. Generalize that shape; do not replace it.
 review job. A stage therefore declares `concurrency: NonZeroUsize`; `work`, `plan`, and
 `consult` declare 1.
 
-**Isolation is per stage, not per job.** `plan` creates and destroys a worktree around each
-*author* invocation (`with_isolated_worktree:3047-3085` — `git worktree add --detach`, run,
-then unconditional `--force` removal), not across the run. `review` uses none. `work` uses
-none under D1. So a stage declares whether it runs in a disposable worktree.
+**Isolation is per stage, not per job.** `plan` wraps a disposable worktree around **every**
+model invocation — authoring (`plan_job.rs:1717`), its repair (`1779`), peer review
+(`1958`, `2019`), revision (`2147`, `2202`), and second opinion (`2337`, `2395`), all via
+`with_isolated_worktree:3047` (`git worktree add --detach`, run, unconditional `--force`
+removal). Eight call sites, not the author alone, as an earlier draft claimed. `review` and
+`consult` use none; `work` uses none under D1.
 
 ### Stage constraints — how live recheck stays out of the policy
 
@@ -255,11 +270,40 @@ revalidation_digests()    -> &[DigestKind]      // which digests this job re-che
 call_budget(stage_plan)   -> CallBudget         // worst-case model calls for the whole run
 
 next_stage(ledger)        -> Option<Stage>      // None ends the sequence
-prompt(ctx)               -> SpawnRequest
+prompt(ctx)               -> PromptMaterial     // NOT SpawnRequest -- see below
 classify_attempt(ctx, output) -> Option<AttemptOutcome>   // None = runner default
 aggregate_stage(stage, slot_results) -> StageOutcome
+transition(ledger, stage_outcome) -> Transition // durable progress; the reducer
 terminal(ledger)          -> Terminal
 ```
+
+**`prompt` must not return `SpawnRequest`.** `SpawnRequest` (`dispatch.rs:240-250`) carries
+`cwd`, `env`, `stdout_path`, `stderr_path`, `sandbox_profile`, `worker_resource_limits`,
+and `commit_receipt_socket`. Handing a policy that struct hands it process authority and
+lets it bypass runner-enforced posture — directly contradicting the purity rule. The policy
+returns **prompt and schema material only**; the `AttemptExecutor` constructs the trusted
+spawn envelope from the candidate, the stage's target kind, and runner-owned paths.
+
+**`transition` is the missing reducer.** `classify_attempt` returns an outcome and
+`terminal` returns a verdict, but nothing turned `(progress, accepted output)` into new
+*durable* progress. Plan needs exactly this: persist the peer's findings, move
+`AwaitingPeer → Revising`, feed those findings plus the prior artifact to the same
+immutable author, and return to peer review (`plan_job.rs:2104-2155`). Doing that by
+mutating inside a policy would be neither durable nor pure. The policy computes the
+transition; the runner persists it.
+
+**`AttemptOutput` must carry a payload.** An `AttemptOutcome` alone cannot express what a
+successful attempt produced: a Plan output is canonicalized and captured as JSON and
+Markdown (`plan_job.rs:1829-1862`); a review stage retains typed `ReviewerResponse`s,
+anonymizes them, and builds the judge prompt from them (`adversarial.rs:1160-1221`). The
+output channel carries canonical bytes plus their `ArtifactRef`, and the runner hashes and
+captures before the policy sees them.
+
+**Domain verdict is not execution failure.** `ReviewerVerdict::NoGo` is a *valid result*,
+and `review` stays `Complete` when synthesis is valid (`adversarial.rs:216-263`,
+`1122-1129`); a rejected plan document is likewise a real verdict. An earlier draft listed
+`VerdictRejected` as an `AttemptOutcome`, conflating the two. Attempt outcomes describe
+*execution*; verdicts live in the payload and reach `Terminal` through `transition`.
 
 **`AttemptContext` is the fix for the seam's biggest hole.** A first draft had
 `prompt(stage, attempt)`, which cannot build the two prompts that matter most: the judge
@@ -395,10 +439,14 @@ Requirements:
    **Do not fix this by making `RunHandle::create` refuse unconditionally.** The Phase 3
    bootstrap probe (`conductor-bxb`) exists precisely to run when roster eligibility cannot
    yet be established; a blanket refusal would make the deadlock permanent. The refusal
-   belongs in the **runner**, conditioned on `JobPolicy`: a policy declares whether a
-   pinned roster snapshot is required, and the runner refuses when a requiring policy lacks
-   one. The probe's policy declares it is not required, and its coverage gap stays a
-   coverage gap.
+   belongs in the **runner**, conditioned on the *invocation*, not on a `JobPolicy`.
+
+   **The probe cannot be a policy at all.** `RunJob` has exactly four variants
+   (`run.rs:81-86`), the v1 spec states the probe is a preflight and never a fifth job, and
+   it must append Musterroll evidence and re-snapshot the roster — mutations a pure policy
+   may not perform. An earlier draft's `JobPolicy::requires_pinned_roster()` therefore had
+   no legal implementation. The probe is a **runner preflight phase** with its own
+   authorization, and `requires_pinned_roster` is a property of that phase.
 
 ## D1 obligations
 
@@ -420,12 +468,72 @@ preflights both:
 `plan` keeps its disposable isolated worktree — the consolidation spec assigns it one
 ("Disposable isolated worktree; no target mutation"). D1 governs `work` only.
 
-## Blocking prerequisite for `plan`
+### What D1 gives up — stated precisely, because an earlier draft oversold it
 
-`RunHandle::create` refuses Plan runs outright: `run.rs:1021-1025` returns
-`Err("plan runs require explicit structural PlanRunDetails and are not activated")`.
-Generic run creation must accept Plan before Phase 4c is possible. Resolve this in Phase
-1b, not at migration time.
+Sol's review established that the three controls above buy **detection and fail-closed
+refusal**, not isolation and rollback. The honest accounting:
+
+1. **An unauthenticated canonical commit has no recovery path.** A worker can commit and
+   the parent can crash before the receipt and `AttemptFinished` checkpoint are durable.
+   Canonical HEAD is then advanced by an unprovable commit. Dirty-tree quarantine refuses
+   whenever HEAD moved from `before_head` (`quarantine.rs:357-365`), so it cannot capture
+   this.
+2. **Quarantine captures only uncommitted work** (`quarantine.rs:337-344`). Failed but
+   *committed* work is detected after the fact and not restored.
+3. **No isolation during execution.** Transient, unverified changes are visible to the
+   human, editors, watchers, and builds. `RepoLease` is advisory among cooperating
+   Undertake processes only; foreign Git activity is discovered after both actors have
+   touched the tree.
+4. **Ignored files are unprotected.** `CommitProbe::is_clean` runs
+   `git status --porcelain --untracked-files=normal`, which does not see ignored-file
+   changes. The isolated path copied only *declared* verification inputs; direct execution
+   exposes every ignored file in the tree.
+5. **"Patch reference" is evidence, not adoption.** The existing carry-forward records a
+   path and hash and explicitly does not require the next worker to use it
+   (`dispatch_cycle.rs:6827-6851`).
+
+**The mitigation, and why this may still be the right trade.** The runner records the
+pre-attempt HEAD durably before spawn; on resume, a canonical HEAD that moved without a
+matching durable receipt is a **fail-closed refusal** — Undertake will not touch the repo
+and surfaces it for a human `git reset`. That is strictly more than Ralph offers, and
+Ralph — which the operator runs daily — has this exact risk profile with no detection at
+all. D1 is therefore not a novel hazard; it matches the tool already in daily use.
+
+**This is a user decision and it is recorded as open** (§ Open questions). If the residual
+risk is unacceptable, D1 reverses, `work` regains the attempt checkout, and Phase 1b grows
+the promotion seam.
+
+## Plan creation — an earlier draft got this backwards
+
+Draft 1 called `RunHandle::create`'s Plan refusal (`run.rs:1022`) a blocking prerequisite
+and proposed making generic creation accept Plan. **Both halves were wrong.**
+
+`RunHandle::create_plan(NewPlanRun)` already exists (`run.rs:1147`) and production uses it
+(`plan_job.rs:752`). The generic refusal is a *guard*, not a gap: `NewRun` carries no
+`PlanRunDetails`, approval, roster snapshot, or input bytes, so a Plan run built through it
+would be structurally incomplete. Weakening the guard would discard required state.
+
+**Retain and abstract `create_plan`.** The runner's creation seam admits a job-specific
+constructor; it does not flatten four jobs into one `NewRun`.
+
+## Target kinds — not every job has a repository
+
+The runner pseudocode's unconditional `RepoLease` and `CommitProbe::is_clean` cannot host
+`review`, which is **artifact-targeted**: `cli.rs:1004` puts `artifact_source_path()` into
+`RunTarget.repo`. That field is a target label, not necessarily a Git working tree.
+
+A `Stage` declares its target kind, and the runner conditions on it:
+
+| Target kind | Repo lease | `is_clean` preflight | Git postcheck | Jobs |
+|---|---|---|---|---|
+| `GitWorkingTree` | yes | yes | yes | `work` |
+| `GitWorktreeIsolated` | yes, on the parent | no (fresh checkout) | no | `plan` |
+| `ArtifactOnly` | **no** | no | no | `review`, `consult` |
+
+Taking a repo lease for artifact-only review would needlessly serialize unrelated
+read-only work *and* contradict `adversarial.rs`'s no-git invariant. An earlier draft
+required it globally while simultaneously claiming that invariant survives; those cannot
+both hold.
 
 ## Migration hazard: `adversarial.rs` enforces its own isolation
 
@@ -495,6 +603,28 @@ Two beads were deferred as standalone items but their requirements land here:
 A workflow DSL. A plugin surface. A second telemetry store, lease implementation, or
 atomic-write helper — three of the last already exist. Redesigning `dispatch.rs`'s
 primitives, which are sound. Any per-job escape hatch past `JobPolicy`.
+
+## Open questions — close these before `conductor-mkct` starts
+
+1. **D1's residual risk (user).** Is "a crash mid-attempt can leave an unprovable commit on
+   your branch that Undertake refuses to touch, resolved by hand" acceptable? See § What D1
+   gives up. Reversing D1 restores the attempt checkout and roughly doubles Phase 1b.
+2. **Durable call budget (design).** `ReviewerCallBudget` is an in-memory `AtomicU32`
+   (`adversarial.rs:158-188`), so a crash resets it and a resumed run can exceed its
+   approved ceiling. Reservations must be durably recorded before spawn and reconstructed
+   from attempt-start records. Not yet specified.
+3. **The two-file commit (design).** Hash-pinning a mutable state file in the manifest is a
+   two-file transaction: state-first leaves the old hash failing closed after a crash;
+   manifest-first points a new hash at old state. `run.rs:1310-1329` reconciles only
+   terminal event/manifest skew, not arbitrary progress. Needs a stated write order and
+   replay rule — most likely: the append-only journal is the source of truth and the state
+   file is a rebuildable projection, mirroring the Afterfact SQLite posture.
+
+Sol additionally listed event-schema fields (`RunEvent` has no stage, slot, attempt id, or
+lineage — `run.rs:873-892`, and only Plan has `PlanInvocationEvidence`) and per-slot process
+identity (`WorkState` stores one `worker_pgid` — `run.rs:245-261`). Both are real and both
+are resolved by the same fan-out correlation work; they are Phase 1b scope once (2) and (3)
+are settled, not open design questions.
 
 ## Acceptance
 
