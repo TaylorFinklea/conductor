@@ -105,24 +105,54 @@ process hooks (heartbeat)       terminal states beyond Completed|Failed
 bead terminal actions           candidate pool + fallback + 429 classification
 ```
 
-## Open decisions for the user
+## Resolved decisions
 
-**D1 — attempt isolation.** `dispatch_cycle` runs each worker in an isolated
-`AttemptCheckout` (`5961`) and promotes the commit (`1775`). That choice is the root of
-verification-input materialization, `undertake supersede` (1,492 lines), promotion
-recovery records, and three of four resume state machines. Dropping it (ralph-style
-in-repo execution, which the consolidation spec's `work` row permits) removes all of that
-as v1 work — but costs failed-attempt quarantine, clean fallback checkouts, and the
-post-verify HEAD/tree rechecks. **Not decided here.** See § Questions.
+### D1 — `work` writes the repository directly (user, 2026-07-28)
 
-**D2 — review-panel diversity.** `conductor-ao8` wants panel independence by model family.
-The consolidation spec says diversity compares exact `ProviderId`
-(`undertake-core-consolidation-spec.md:93-97`), and the code correctly implements that
-(`adversarial.rs:565-602`) — so `ollama-cloud/glm-5.2` and `opencode-go/glm-5.2` are
-"diverse" today. But the user's own `AGENTS.md` requires reviewers of a *"different model
-family (developer lineage, not inference provider)."* The spec and the operator policy
-disagree. This is a contract change needing an explicit model-family identity, not a bug
-fix. **Not decided here.**
+Attempt isolation is dropped. `dispatch_cycle` runs each worker in an isolated
+`AttemptCheckout` (`5961`) and promotes the commit (`1775`); v1 does not.
+
+Grounds: the consolidation spec's `work` row reads "Repo writes allowed inside approved
+scope," its loop requirement 7 is "worker identity plus exclusive repo lease" — a lease
+and an identity check, not worktree isolation — and it states the native loop "preserves
+Ralph's earned behavior." Ralph works in-repo.
+
+**Removed from v1 scope entirely**: attempt checkout, commit promotion, verification-input
+materialization (`1285` — it exists *only* because a fresh checkout lacks gitignored
+files), `undertake supersede` (1,492 lines, `de954c8` — it terminalizes failed *promoted*
+runs, and there are none), promotion recovery records, and three of four resume state
+machines (`resume_promoted_work:4492`, `resume_unauthenticated_implementing_work:5172`,
+`resume_finished_promoted_work:3986`).
+
+**Required in exchange — these are not optional.** The runner must add, and Phase 1's
+contract must pin:
+
+- a **clean-tree preflight** before spawn (fail closed on a dirty target);
+- **quarantine adoption** of a failed attempt's partial work, carried into the next
+  attempt as a patch reference rather than the prototype's plain-text feedback;
+- retention of the post-verify HEAD/tree/claim recheck, which currently lives in the
+  promotion path.
+
+Without all three, D1 ships a real safety regression against `dispatch_cycle`, which
+preflights both.
+
+### D2 — review-panel diversity is by model family (user, 2026-07-28)
+
+`conductor-ao8` stays in v1. This **amends** the approved architecture: the consolidation
+spec compares exact `ProviderId` (`undertake-core-consolidation-spec.md:93-97`) and
+`adversarial.rs:565-602` implements that faithfully, so `ollama-cloud/glm-5.2` and
+`opencode-go/glm-5.2` count as two independent reviewers today. They are the same weights
+behind two resellers.
+
+The operator policy in `AGENTS.md` — reviewers of a *"different model family (developer
+lineage, not inference provider)"* — governs. Record as an ADR in `decisions.md`; it is a
+contract amendment, not a bug fix.
+
+**Cross-repo dependency**: Musterroll owns profile identity, so a `model_family` (developer
+lineage) field must be added to `musterroll/roster@2` and populated before Undertake can
+enforce it. That work is Musterroll's, and `review`-job diversity enforcement is gated on
+it. Do not infer family by parsing `ProfileId` — the spec forbids deriving execution
+coordinates from the opaque label (`undertake-core-consolidation-spec.md:116-117`).
 
 ## Scope test
 
@@ -279,12 +309,19 @@ probe needs only to emit an attempt record, which `run.rs` already does) and
 - `moe` — the operator manually closes a bead while a run finishes; `bd.release`
   unconditionally runs `bd update --status open --assignee ""` (`bd.rs:235-238`),
   reopening completed work. A repo lease cannot serialize a human `bd` command.
-- `8hz` — crash between durable promotion Intent and `merge --ff-only` wedges exactly
-  recoverable work. **Moot if D1 drops isolation**; a parity requirement if it does not.
 
-**Closed as stale** (Phase 0): `3ce`, `t7q`, `4wq`. `1ls` split — parent-directory fsync is
-already implemented (`dispatch_cycle.rs:952-971`); only integrity-binding of
-`promotion.json` remains, and only if promotion survives D1.
+- `jum` — **promoted, and D1 raises its severity.** The glob-interpreted `--exclude` is in
+  `quarantine.rs:321`, not the promotion path: it is quarantine's transactional recovery
+  reapplying a captured dirty-tree patch while excluding survivors. D1 makes quarantine
+  capture/adoption a hard requirement, so this path is now load-bearing. A survivor named
+  `src/[id].ts` breaks it. senior/S.
+
+**Closed as moot under D1** — their subject matter no longer exists: `8hz` (crash between
+promotion Intent and `merge --ff-only`) and `1ls` (integrity-binding `promotion.json`;
+its fsync premise was already stale per `dispatch_cycle.rs:952-971`). Confirm each is
+genuinely promotion-only before closing.
+
+**Closed as stale** (Phase 0): `3ce`, `t7q`, `4wq` — premises already fixed in source.
 
 **Deferred**: `038` (address via the Phase 6 quiesce gate rather than mixed-version lease
 support), `2bh` (macOS-only v1), `eel`, `2d4`, `88v`, `tdj`, `7hb`,
@@ -292,7 +329,8 @@ support), `2bh` (macOS-only v1), `eel`, `2d4`, `88v`, `tdj`, `7hb`,
 (`undertake-core-consolidation-spec.md:507`), not gates 4/10 — keep only the generic
 review-job selection.
 
-**Kept, small**: `blv`, `jum` (re-check `jum` under D1).
+**Kept, small**: `blv` (a relative state dir yields artifact paths a worker cannot resolve
+from its cwd).
 
 ## Invariants
 

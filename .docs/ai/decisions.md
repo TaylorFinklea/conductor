@@ -331,3 +331,71 @@ Retention: the `supersession.json` receipt is kept indefinitely alongside the so
 durable evidence (`promotion.json`, `events.jsonl`) — it is the only record proving why a Bead
 with a `failed` terminal run outcome is nonetheless closed, and deleting it would make that
 closure unauditable.
+
+## [2026-07-28] v1 extracts a kernel from the proven engine instead of promoting the loop prototype
+
+**Context.** The approved architecture requires all four jobs on one kernel (cutover gate
+4). `src/loop.rs` was read as a finished kernel awaiting CLI wiring. It is not: it
+unconditionally requires an authenticated direct-child commit (`loop.rs:346-359`), so
+read-only `review`/`consult` can never succeed; `RunHandle::create` refuses Plan runs
+outright (`run.rs:1021-1025`); it hardcodes `RunJob::Work`; its terminal model is only
+`Completed|Failed`; `LoopClaim` cannot claim; `loop.json` is neither fsynced nor
+integrity-bound, so a forged `terminal=completed` closes a Bead with no attempt; and
+resume neither checks worker liveness nor binds the approved profile. Separately,
+`job.rs`'s registry is never constructed — the accepted spelling is `[[job]]` and
+`undertake.toml` contains none.
+
+**Decision.** Extract a generic durable attempt runner from the proven
+`dispatch.rs`/`run.rs`/`quarantine.rs` machinery, migrate one job at a time onto it, and
+delete `loop.rs`. Do not grow the 431-line prototype to match 8,237 lines of hardened
+behavior. Salvage the prototype's fresh-context-per-iteration model, durable phase
+checkpoints, and bead/artifact target distinction as design input only.
+
+**Consequences.** Freeze `dispatch_cycle`'s test corpus as a named parity corpus before
+anything retires (required by the consolidation spec). Pass cutover gate 10's installed
+vertical smoke *before* deleting the rollback engine, not after. Quiesce and resolve every
+pending/implementing/reclaimable legacy run before removing its engine. Defer `-D
+dead_code` to the end, since it would otherwise force removal of recovery APIs the moment
+their only caller dies. Reviewed adversarially by GPT-5.6 Sol (reject, adopted) and GLM
+5.2 (ship-with-changes); both adjudicated against source.
+
+## [2026-07-28] v1 `work` writes the repository directly; attempt isolation is dropped
+
+**Context.** `dispatch_cycle` runs each worker in an isolated `AttemptCheckout` and
+promotes the resulting commit. That one choice is the root of verification-input
+materialization, `undertake supersede`, promotion recovery records, and three of four
+resume state machines — a large majority of the engine's complexity.
+
+**Decision.** v1 `work` writes the target repository directly, Ralph-style. The
+consolidation spec permits it ("Repo writes allowed inside approved scope"), its loop
+requirement is "worker identity plus exclusive repo lease" rather than worktree isolation,
+and it states the native loop preserves Ralph's earned behavior.
+
+**Consequences.** Attempt checkout, commit promotion, verification-input materialization,
+`undertake supersede` (1,492 lines), promotion recovery, and three resume state machines
+leave v1 scope; Beads `8hz` and `1ls` close as moot. In exchange the runner MUST add a
+clean-tree preflight before spawn, quarantine adoption of a failed attempt's partial work
+carried forward as a patch reference, and retention of the post-verify HEAD/tree/claim
+recheck. Without all three this is a safety regression, because `dispatch_cycle`
+preflights both. Quarantine becomes load-bearing, which raises the severity of `jum`
+(glob-interpreted `--exclude` at `quarantine.rs:321`) rather than retiring it.
+
+## [2026-07-28] Review-panel diversity is by model family, amending the ProviderId rule
+
+**Context.** The consolidation spec compares exact `ProviderId` for reviewer diversity,
+and `adversarial.rs:565-602` implements that faithfully. Consequently
+`ollama-cloud/glm-5.2` and `opencode-go/glm-5.2` count as two independent reviewers while
+being the same weights behind two resellers. The operator policy in `AGENTS.md` requires
+reviewers of a "different model family (developer lineage, not inference provider)." The
+two conflict. This was observed live: dispatching this cycle's own review hit a quota
+limit on opencode-go and fell back to ollama-cloud for the same model.
+
+**Decision.** Model family governs. `conductor-ao8` stays in v1 as a contract amendment,
+not a bug fix.
+
+**Consequences.** Musterroll owns profile identity, so a `model_family` field must be added
+to `musterroll/roster@2` and populated before Undertake can enforce this; `review`-job
+diversity enforcement is cross-repo gated on that. Family must never be inferred by
+parsing `ProfileId` — the spec forbids deriving execution coordinates from the opaque
+label. `conductor-pzo`'s specific Fable-plus-provider panel remains cutover gate 11 work,
+outside gates 4/10.
