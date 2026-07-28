@@ -1,6 +1,6 @@
 # current-state.md — undertake
 
-Branch: `main` at `b88da79`; 26 commits ahead of `origin/main`, not pushed.
+Branch: `main` at `bf44828`; 28 commits ahead of `origin/main`, not pushed.
 
 ## Plan
 
@@ -13,16 +13,16 @@ Chain: `pu5` + four prep beads → `mkct` → `vd3y` → `bxb` → `eueb`/`utwq`
 - [ ] `conductor-44hc` — prep 2: terminal reconciliation + write order (senior/M) — ready
 - [ ] `conductor-0yxz` — prep 3: read-only spawn identity (senior/M) — ready
 - [ ] `conductor-q6b6` — prep 5: decouple `role_routing` from plan (senior/M) — ready
-- [ ] `conductor-gtgf` — prep 4: per-slot identity — blocked on `47p`
+- [x] `conductor-gtgf` — prep 4 done (`bf44828`); `worker_slots` set, any-alive-or-inconclusive refuses reclaim
 - [x] `conductor-pu5` — Phase 0 done (`f5e1c0a`); parity selector = `cargo test --bin undertake dispatch_cycle::tests::` = 123 tests
 - [x] `conductor-jum` — done (`9c90c5c`); wildmatch escaping, 4 real-git tests
 - [x] `conductor-moe` — done (`b88da79`); `release_owned` fails closed, no bd CAS exists
-- [x] `conductor-47p` — done; owners bind to (pid, process generation) via `sysinfo`
-  start time, not bare pid — see `decisions.md [2026-07-28]`
+- [x] `conductor-47p` — done (`5224787`); owners bind to (pid, process generation)
 
 ## Blockers
 
-- None. Four prep beads plus Phase 0 are ready in parallel.
+- None. Four prep beads remain, all ready: `8nth`, `44hc`, `0yxz`, `q6b6`.
+- Suite green at 874 passed / 0 failed / 3 ignored; clippy clean.
 
 ## Open questions
 
