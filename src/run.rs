@@ -221,6 +221,24 @@ pub(crate) struct TerminalTransition {
     pub(crate) comment: Option<String>,
 }
 
+/// A `(pgid, generation)` worker-group identity recorded for one
+/// concurrently in-flight attempt slot, tagged by its zero-based slot index.
+/// `work`, `plan`, and `consult` dispatch exactly one slot and continue to
+/// record it via the legacy `worker_pgid`/`worker_pgid_generation` pair on
+/// [`WorkState`]; a stage that fans out several concurrent workers — the
+/// `review` job's reviewer panel — records one entry per slot in
+/// [`WorkState::worker_slots`] instead. See
+/// [`quarantine::worker_slots_authenticated_live`](crate::quarantine::worker_slots_authenticated_live)
+/// for the composed reclaim check: every entry must be provably dead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkerSlotIdentity {
+    pub(crate) slot: u32,
+    pub(crate) pgid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) generation: Option<u64>,
+}
+
 /// Work-only progress persisted inside the canonical run manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -282,6 +300,22 @@ pub(crate) struct WorkState {
     /// pre-generation behavior, never inventing liveness or death.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) worker_pgid_generation: Option<u64>,
+    /// Per-slot worker-group identities for a stage that dispatches more
+    /// than one concurrent worker — additive to, and never written
+    /// alongside, `worker_pgid`/`worker_pgid_generation` above. A single-slot
+    /// job (`work`, `plan`, `consult`) leaves this empty and keeps recording
+    /// its one identity through the legacy pair, exactly as before this
+    /// field existed; a multi-slot job records one [`WorkerSlotIdentity`]
+    /// per slot here and leaves the legacy pair `None`. Empty on every
+    /// manifest written before this field existed. See
+    /// [`WorkState::effective_worker_slots`] for the read-side rule that
+    /// reconciles the two representations, and
+    /// `quarantine::worker_slots_authenticated_live` for the reclaim
+    /// composition: every recorded entry, from whichever representation is
+    /// in use, must be provably dead before a stranded run's identity can be
+    /// treated as gone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) worker_slots: Vec<WorkerSlotIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) worker_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -294,6 +328,32 @@ pub(crate) struct WorkState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) review_resume_budget_secs: Option<u64>,
     pub(crate) stage: WorkStage,
+}
+
+impl WorkState {
+    /// The effective per-slot worker-group identity set for this run's
+    /// current attempt: `worker_slots` verbatim when it has any entries,
+    /// otherwise the legacy `worker_pgid`/`worker_pgid_generation` pair
+    /// reinterpreted as a single slot 0 (or empty when neither has ever been
+    /// recorded). This is the one place the two representations are
+    /// reconciled — every caller that needs "the worker identity/identities
+    /// recorded for this run" reads through here rather than choosing
+    /// between the fields itself, so a caller can never accidentally check
+    /// only one representation and miss the other.
+    pub(crate) fn effective_worker_slots(&self) -> Vec<WorkerSlotIdentity> {
+        if !self.worker_slots.is_empty() {
+            return self.worker_slots.clone();
+        }
+        self.worker_pgid
+            .map(|pgid| {
+                vec![WorkerSlotIdentity {
+                    slot: 0,
+                    pgid,
+                    generation: self.worker_pgid_generation,
+                }]
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// The only durable plan-routing stages. The serde spelling is shared by
@@ -4043,6 +4103,7 @@ mod tests {
             owner_pid_generation: None,
             worker_pgid: None,
             worker_pgid_generation: None,
+            worker_slots: Vec::new(),
             worker_profile: None,
             worker_commit: None,
             mechanical: None,
@@ -4135,6 +4196,7 @@ mod tests {
             owner_pid_generation: None,
             worker_pgid: None,
             worker_pgid_generation: None,
+            worker_slots: Vec::new(),
             worker_profile: None,
             worker_commit: None,
             mechanical: None,
@@ -4615,6 +4677,7 @@ mod tests {
             owner_pid_generation: None,
             worker_pgid,
             worker_pgid_generation: None,
+            worker_slots: Vec::new(),
             worker_profile: None,
             worker_commit: None,
             mechanical: None,
@@ -4800,6 +4863,76 @@ mod tests {
         assert!(err.to_string().contains("finished run"));
     }
 
+    fn work_state_with_identity(
+        worker_pgid: Option<u32>,
+        worker_pgid_generation: Option<u64>,
+        worker_slots: Vec<WorkerSlotIdentity>,
+    ) -> WorkState {
+        WorkState {
+            cycle_id: "cycle-1".to_string(),
+            authorization_sha256: "b".repeat(64),
+            before_head: None,
+            owner_pid: None,
+            owner_pid_generation: None,
+            worker_pgid,
+            worker_pgid_generation,
+            worker_slots,
+            worker_profile: None,
+            worker_commit: None,
+            mechanical: None,
+            stage: WorkStage::Implementing,
+            review_resume_budget_secs: None,
+        }
+    }
+
+    #[test]
+    fn effective_worker_slots_is_empty_when_no_identity_has_ever_been_recorded() {
+        let work = work_state_with_identity(None, None, Vec::new());
+        assert_eq!(
+            work.effective_worker_slots(),
+            Vec::new(),
+            "a run with no recorded worker identity has nothing to reclaim against"
+        );
+    }
+
+    #[test]
+    fn effective_worker_slots_falls_back_to_the_legacy_single_pgid_as_slot_zero() {
+        // Every manifest written before per-slot identities existed -- and
+        // every single-slot `work`/`plan`/`consult` run going forward --
+        // records only `worker_pgid`/`worker_pgid_generation`. That legacy
+        // pair must keep behaving exactly as it does today: reinterpreted as
+        // one slot 0 entry, nothing invented.
+        let work = work_state_with_identity(Some(111), Some(42), Vec::new());
+        assert_eq!(
+            work.effective_worker_slots(),
+            vec![WorkerSlotIdentity {
+                slot: 0,
+                pgid: 111,
+                generation: Some(42),
+            }]
+        );
+    }
+
+    #[test]
+    fn effective_worker_slots_prefers_the_recorded_set_over_the_legacy_pair() {
+        // A multi-slot record is authoritative once it has any entries; the
+        // legacy pair is never consulted alongside it.
+        let recorded = vec![
+            WorkerSlotIdentity {
+                slot: 0,
+                pgid: 111,
+                generation: Some(1),
+            },
+            WorkerSlotIdentity {
+                slot: 1,
+                pgid: 222,
+                generation: Some(2),
+            },
+        ];
+        let work = work_state_with_identity(Some(999), Some(999), recorded.clone());
+        assert_eq!(work.effective_worker_slots(), recorded);
+    }
+
     #[test]
     fn run_event_cross_process_same_second_creation_is_exclusive() {
         const STATE_ENV: &str = "UNDERTAKE_RUN_TEST_CHILD_STATE";
@@ -4897,6 +5030,7 @@ mod tests {
                 owner_pid_generation: None,
                 worker_pgid: None,
                 worker_pgid_generation: None,
+                worker_slots: Vec::new(),
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,
@@ -4951,6 +5085,7 @@ mod tests {
                 owner_pid_generation: None,
                 worker_pgid: Some(456),
                 worker_pgid_generation: None,
+                worker_slots: Vec::new(),
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,
@@ -5027,6 +5162,7 @@ mod tests {
                 owner_pid_generation: None,
                 worker_pgid: None,
                 worker_pgid_generation: None,
+                worker_slots: Vec::new(),
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,

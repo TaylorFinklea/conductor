@@ -3848,6 +3848,7 @@ mod tests {
                     owner_pid_generation: None,
                     worker_pgid: None,
                     worker_pgid_generation: None,
+                    worker_slots: Vec::new(),
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,

@@ -5304,12 +5304,20 @@ fn resume_unauthenticated_implementing_work<B: BdClient + ?Sized, C: CommitProbe
                 "retained owner pid {owner_pid} is still alive or ambiguous"
             )));
         }
-        let worker_pgid = work.worker_pgid.ok_or_else(|| {
-            unauthenticated_recovery_failure("retained worker process-group identity is missing")
-        })?;
-        if quarantine::worker_group_authenticated_live(worker_pgid, work.worker_pgid_generation) {
+        let worker_slots = work.effective_worker_slots();
+        if worker_slots.is_empty() {
+            return Err(unauthenticated_recovery_failure(
+                "retained worker process-group identity is missing",
+            ));
+        }
+        if quarantine::worker_slots_authenticated_live(&worker_slots) {
+            let worker_pgids = worker_slots
+                .iter()
+                .map(|slot| slot.pgid.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             return Err(unauthenticated_recovery_failure(format!(
-                "retained worker group {worker_pgid} is still alive or ambiguous"
+                "retained worker group(s) {worker_pgids} still alive or ambiguous"
             )));
         }
     }
@@ -6428,6 +6436,7 @@ fn create_work_run(
                 owner_pid_generation: quarantine::process_generation(std::process::id()),
                 worker_pgid: None,
                 worker_pgid_generation: None,
+                worker_slots: Vec::new(),
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,
@@ -7223,13 +7232,18 @@ fn reclaim_stale_claim<B: BdClient + ?Sized, C: CommitProbe + ?Sized>(
             if quarantine::owner_pid_authenticated_live(owner_pid, work.owner_pid_generation) {
                 return Ok(None);
             }
-            let Some(worker_pgid) = work.worker_pgid else {
-                return Ok(None);
-            };
-            if quarantine::worker_group_authenticated_live(worker_pgid, work.worker_pgid_generation)
-            {
+            let worker_slots = work.effective_worker_slots();
+            if worker_slots.is_empty() {
                 return Ok(None);
             }
+            if quarantine::worker_slots_authenticated_live(&worker_slots) {
+                return Ok(None);
+            }
+            let worker_pgids = worker_slots
+                .iter()
+                .map(|slot| slot.pgid.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             if !run_has_durable_worker_isolation(run_artifacts.dir(), repo_path, state_dir) {
                 // Compatibility for pre-isolation runs: only their inherited
                 // FIFO can prove an escaped descendant is gone. New runs use
@@ -7256,7 +7270,7 @@ fn reclaim_stale_claim<B: BdClient + ?Sized, C: CommitProbe + ?Sized>(
                     issue_id,
                     &format!(
                         "undertake: {cycle_id} {issue_id} dispatch --resume found a dead owner \
-                         (pid {owner_pid}) and worker group (pgid {worker_pgid}) but the \
+                         (pid {owner_pid}) and worker group(s) (pgid {worker_pgids}) but the \
                          repository has moved past run {run_id}'s before_head ({expected_head}) or \
                          is dirty; refusing to adopt unreviewed state, manual recovery required"
                     ),
@@ -7277,8 +7291,8 @@ fn reclaim_stale_claim<B: BdClient + ?Sized, C: CommitProbe + ?Sized>(
                 issue_id,
                 &format!(
                     "undertake: {cycle_id} {issue_id} dispatch --resume reclaimed a stale claim \
-                     from confirmed-dead owner pid {owner_pid} and worker group pgid \
-                     {worker_pgid} (no heartbeat since {last_seen}); issue reopened for a fresh \
+                     from confirmed-dead owner pid {owner_pid} and worker group(s) pgid \
+                     {worker_pgids} (no heartbeat since {last_seen}); issue reopened for a fresh \
                      attempt"
                 ),
             );
@@ -8274,6 +8288,7 @@ mod tests {
         ApprovalScope, ApprovalScopeKind, CyclePlan, ItemAuthorizationRecord, ProposalEntry,
         ProviderCandidateRecord, ProviderRouteRecord, ScopeSelector, item_authorization_hash,
     };
+    use crate::run::WorkerSlotIdentity;
 
 
     fn test_worker_resource_limits() -> dispatch::WorkerResourceLimits {
@@ -8921,6 +8936,7 @@ provider = "anthropic"
                     owner_pid_generation: None,
                     worker_pgid: None,
                     worker_pgid_generation: None,
+                    worker_slots: Vec::new(),
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -13750,6 +13766,7 @@ provider = "opencode-go"
                 owner_pid_generation: None,
                 worker_pgid,
                 worker_pgid_generation: None,
+                worker_slots: Vec::new(),
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,
@@ -14576,6 +14593,88 @@ provider = "opencode-go"
                 &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
             )
             .expect("resume reclaims once the worker group is confirmed gone");
+        assert_eq!(fixture.bd.release_count(), 1);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(recovered.verified, 1);
+    }
+
+    #[test]
+    fn resume_refuses_reclaim_while_any_recorded_slot_in_a_multi_slot_worker_group_survives() {
+        // Prep for the fan-out runner: `review` will one day dispatch several
+        // concurrent reviewer slots and record one `worker_slots` entry per
+        // slot instead of the legacy single `worker_pgid`. Reclaim must
+        // require every recorded slot provably dead -- one live survivor
+        // anywhere in the set still blocks it, exactly like the single-slot
+        // path above.
+        let fixture = ResumeFixture::new("multi-slot-worker-group");
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "undertake")
+            .expect("simulate a prior dispatch claiming the bead");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let dead_owner = spawn_dead_pid();
+        let dead_slot_pgid = spawn_dead_pid();
+        let (live_worker, live_slot_pgid) = spawn_live_worker_group();
+
+        let mut request = implementing_run_request(
+            &fixture.cycle_id,
+            canonical_repo,
+            Some(&before_head),
+            Some(dead_owner),
+            None,
+        );
+        request.work.as_mut().expect("work state").worker_slots = vec![
+            WorkerSlotIdentity {
+                slot: 0,
+                pgid: dead_slot_pgid,
+                generation: None,
+            },
+            WorkerSlotIdentity {
+                slot: 1,
+                pgid: live_slot_pgid,
+                generation: None,
+            },
+        ];
+        let stale_run = RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            request,
+            Utc::now() - ChronoDuration::seconds(120),
+        )
+        .expect("simulate a stranded run recorded with per-slot worker identities");
+        create_inactive_worker_lineage_lease(&stale_run);
+
+        let blocked = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume must not error while any recorded slot survives");
+        assert_eq!(
+            blocked.dispatched, 0,
+            "one live slot among several recorded ones must still block reclaim"
+        );
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 0);
+
+        // Once every recorded slot is provably dead, the same stranded run is
+        // safely reclaimable.
+        kill_worker_group(live_worker, live_slot_pgid);
+        let recovered = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume reclaims once every recorded slot is confirmed dead");
         assert_eq!(fixture.bd.release_count(), 1);
         assert_eq!(exec.worker_spawns(), 1);
         assert_eq!(recovered.verified, 1);
@@ -15612,6 +15711,7 @@ provider = "codex"
                     owner_pid_generation: None,
                     worker_pgid: None,
                     worker_pgid_generation: None,
+                    worker_slots: Vec::new(),
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -15886,6 +15986,7 @@ dispatch_id = "fake-worker"
                     owner_pid_generation: None,
                     worker_pgid: None,
                     worker_pgid_generation: None,
+                    worker_slots: Vec::new(),
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,

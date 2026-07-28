@@ -219,6 +219,7 @@ impl LoopKernel {
             owner_pid_generation: crate::quarantine::process_generation(std::process::id()),
             worker_pgid: None,
             worker_pgid_generation: None,
+            worker_slots: Vec::new(),
             worker_profile: None,
             worker_commit: None,
             mechanical: None,

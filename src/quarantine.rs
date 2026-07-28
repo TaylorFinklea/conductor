@@ -26,7 +26,7 @@ use fs2::FileExt as _;
 use sha2::{Digest, Sha256};
 
 use crate::dispatch::CommitProbe;
-use crate::run::{ArtifactRef, RunHandle, RunJob, RunLifecycle, RunManifest};
+use crate::run::{ArtifactRef, RunHandle, RunJob, RunLifecycle, RunManifest, WorkerSlotIdentity};
 
 pub(crate) type Result<T> = std::result::Result<T, QuarantineError>;
 
@@ -1114,6 +1114,22 @@ pub(crate) fn worker_group_authenticated_live(pgid: u32, recorded_generation: Op
     generation_authenticated_live(pgid, recorded_generation, true)
 }
 
+/// Authenticates a full per-slot worker-group identity set — see
+/// [`crate::run::WorkState::effective_worker_slots`] for how that set is
+/// derived from either a single legacy `worker_pgid` or a multi-slot
+/// `worker_slots` record. Composes [`worker_group_authenticated_live`]
+/// across every entry: reclaim is legal only when **every** slot is
+/// provably dead, so any slot that is alive, or whose liveness is
+/// inconclusive, makes the whole set report live. An empty set proves
+/// nothing on its own and must never be read as "all dead" — callers still
+/// need at least one recorded identity before reclaiming, exactly as the
+/// single-slot `worker_pgid` path always required.
+pub(crate) fn worker_slots_authenticated_live(slots: &[WorkerSlotIdentity]) -> bool {
+    slots
+        .iter()
+        .any(|slot| worker_group_authenticated_live(slot.pgid, slot.generation))
+}
+
 fn generation_authenticated_live(id: u32, recorded_generation: Option<u64>, group: bool) -> bool {
     let alive = if group {
         process_group_alive(id)
@@ -2075,6 +2091,7 @@ mod tests {
                     owner_pid_generation: None,
                     worker_pgid: None,
                     worker_pgid_generation: None,
+                    worker_slots: Vec::new(),
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -2488,6 +2505,7 @@ mod tests {
                     owner_pid_generation: None,
                     worker_pgid: None,
                     worker_pgid_generation: None,
+                    worker_slots: Vec::new(),
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -2534,6 +2552,7 @@ mod tests {
                     owner_pid_generation: None,
                     worker_pgid: None,
                     worker_pgid_generation: None,
+                    worker_slots: Vec::new(),
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -2589,6 +2608,7 @@ mod tests {
                     owner_pid_generation: None,
                     worker_pgid: None,
                     worker_pgid_generation: None,
+                    worker_slots: Vec::new(),
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -3506,6 +3526,176 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+
+    /// Spawns a `sleep 30` leading its own process group, for the per-slot
+    /// worker-identity tests below that need a genuinely live group leader.
+    fn spawn_live_slot_group() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+
+        Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn a live process group for a worker slot")
+    }
+
+    fn kill_slot_group(mut child: std::process::Child, pgid: u32) {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pgid}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn worker_slots_authenticated_live_reclaims_only_once_every_slot_is_dead() {
+        // Three concurrently in-flight slots (as `review`'s panel will one
+        // day record): two already dead, one still genuinely running. Every
+        // slot must be provably dead before reclaim is legal — one live
+        // survivor anywhere in the set blocks the whole run, exactly as a
+        // single live `worker_pgid` does today.
+        let dead_a = spawn_dead_pid();
+        let dead_b = spawn_dead_pid();
+        let live = spawn_live_slot_group();
+        let live_pgid = live.id();
+        let live_generation =
+            process_generation(live_pgid).expect("freshly spawned group leader has a generation");
+
+        let slots = vec![
+            WorkerSlotIdentity {
+                slot: 0,
+                pgid: dead_a,
+                generation: None,
+            },
+            WorkerSlotIdentity {
+                slot: 1,
+                pgid: dead_b,
+                generation: None,
+            },
+            WorkerSlotIdentity {
+                slot: 2,
+                pgid: live_pgid,
+                generation: Some(live_generation),
+            },
+        ];
+        assert!(
+            worker_slots_authenticated_live(&slots),
+            "one live slot among several dead ones must still refuse reclaim"
+        );
+
+        kill_slot_group(live, live_pgid);
+        assert!(
+            !worker_slots_authenticated_live(&slots),
+            "once every recorded slot is provably dead, reclaim must be allowed"
+        );
+    }
+
+    #[test]
+    fn worker_slots_authenticated_live_refuses_when_one_slot_is_inconclusive() {
+        // One slot's leader has died but orphaned a descendant that keeps
+        // its group alive (the leader-vs-descendant composition tested
+        // above for a single owner) -- the same ambiguity, now surfacing as
+        // one entry among several recorded slots. Inconclusive liveness for
+        // even one slot must refuse the whole set, never be outvoted by the
+        // other slots being provably dead.
+        use std::os::unix::process::CommandExt;
+
+        let dead = spawn_dead_pid();
+        let mut orphaning_leader = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30 & exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn a leader that orphans a descendant in its own group");
+        let orphan_pgid = orphaning_leader.id();
+        orphaning_leader
+            .wait()
+            .expect("reap the leader once it exits, freeing its own pid slot");
+        assert!(
+            process_group_alive(orphan_pgid),
+            "the orphaned descendant must keep the group alive"
+        );
+
+        let slots = vec![
+            WorkerSlotIdentity {
+                slot: 0,
+                pgid: dead,
+                generation: None,
+            },
+            WorkerSlotIdentity {
+                slot: 1,
+                pgid: orphan_pgid,
+                generation: Some(1),
+            },
+        ];
+        assert!(
+            worker_slots_authenticated_live(&slots),
+            "an inconclusive slot (orphaned descendant, leader unresolved) must fail closed as \
+             live even though the only other slot is provably dead"
+        );
+
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{orphan_pgid}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    #[test]
+    fn worker_slots_authenticated_live_treats_a_recycled_pid_slot_as_dead_among_mixed_generations() {
+        // Simulates ordinary pid recycling landing on exactly one slot out
+        // of several with otherwise unrelated (mixed) generations: slot B's
+        // pgid is genuinely alive right now, but the generation recorded for
+        // it no longer matches -- proof the original owner of that slot is
+        // gone and an unrelated later group now happens to reuse the
+        // number, mirroring `process_identity_owner_pid_authenticated_live_
+        // treats_a_generation_mismatch_as_a_dead_owner` but composed across
+        // several slots instead of a single owner.
+        let dead_a = spawn_dead_pid();
+        let recycled = spawn_live_slot_group();
+        let recycled_pgid = recycled.id();
+        let real_generation = process_generation(recycled_pgid)
+            .expect("freshly spawned group leader has a generation");
+        let recorded_wrong_generation = real_generation.wrapping_add(1);
+        let dead_c = spawn_dead_pid();
+
+        let slots = vec![
+            WorkerSlotIdentity {
+                slot: 0,
+                pgid: dead_a,
+                generation: None,
+            },
+            WorkerSlotIdentity {
+                slot: 1,
+                pgid: recycled_pgid,
+                generation: Some(recorded_wrong_generation),
+            },
+            WorkerSlotIdentity {
+                slot: 2,
+                pgid: dead_c,
+                generation: Some(999),
+            },
+        ];
+        assert!(
+            !worker_slots_authenticated_live(&slots),
+            "a live pgid whose recorded generation no longer matches must compose as dead, \
+             exactly like a single recycled worker_pgid, even mixed among slots with unrelated \
+             recorded generations"
+        );
+
+        kill_slot_group(recycled, recycled_pgid);
     }
 
     #[test]
