@@ -242,6 +242,18 @@ pub(crate) struct WorkState {
     /// not as proof of death (mirrors `before_head`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) owner_pid: Option<u32>,
+    /// The kernel-reported process generation (start time) `owner_pid` had
+    /// when it was recorded — see `quarantine::process_generation`. A bare
+    /// pid cannot tell "the owner I recorded is still running" apart from
+    /// "the OS has since handed this pid number to an unrelated process
+    /// after the owner crashed"; binding a generation closes that hole.
+    /// Absent on manifests written before this field existed, or when the
+    /// owner's own generation could not be determined at creation — either
+    /// way, authentication conservatively treats the pid alone as it did
+    /// before this field existed (mirrors `before_head`/`owner_pid`), it
+    /// never invents liveness or death from a missing generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owner_pid_generation: Option<u64>,
     /// Process-group id of the currently dispatched worker, recorded via
     /// [`RunHandle::record_worker_group`] immediately after each worker is
     /// spawned (workers lead their own process group, so the group id equals
@@ -259,6 +271,17 @@ pub(crate) struct WorkState {
     /// identity as unprovable and fails closed rather than reclaiming.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) worker_pgid: Option<u32>,
+    /// The kernel-reported process generation `worker_pgid`'s leader had
+    /// when the group was recorded (see `owner_pid_generation` for why a
+    /// bare pgid alone cannot authenticate a recorded owner). Cleared and
+    /// re-bound in lockstep with `worker_pgid` by
+    /// [`RunHandle::invalidate_worker_group`] and
+    /// [`RunHandle::record_worker_group`]. Absent on manifests written
+    /// before this field existed, or when the leader's generation could not
+    /// be determined at spawn time — authentication then falls back to the
+    /// pre-generation behavior, never inventing liveness or death.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_pgid_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) worker_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1349,10 +1372,22 @@ impl RunHandle {
         self.work().and_then(|work| work.owner_pid)
     }
 
+    /// The process generation `owner_pid` had when it was recorded, if any
+    /// (see [`WorkState::owner_pid_generation`]).
+    pub(crate) fn owner_pid_generation(&self) -> Option<u64> {
+        self.work().and_then(|work| work.owner_pid_generation)
+    }
+
     /// The process-group id of the most recently spawned worker, if one has
     /// been recorded yet (see [`WorkState::worker_pgid`]).
     pub(crate) fn worker_pgid(&self) -> Option<u32> {
         self.work().and_then(|work| work.worker_pgid)
+    }
+
+    /// The process generation `worker_pgid`'s leader had when the group was
+    /// recorded, if any (see [`WorkState::worker_pgid_generation`]).
+    pub(crate) fn worker_pgid_generation(&self) -> Option<u64> {
+        self.work().and_then(|work| work.worker_pgid_generation)
     }
 
     /// Durably names the one commit hook the next worker attempt may execute.
@@ -1426,6 +1461,7 @@ impl RunHandle {
             ));
         }
         work.worker_pgid = None;
+        work.worker_pgid_generation = None;
         self.manifest.updated_at = Utc::now().to_rfc3339();
         self.write_manifest()
     }
@@ -1440,12 +1476,18 @@ impl RunHandle {
     /// persisted so the recorded identity always tracks the latest live
     /// worker. Only valid while the run is still implementing — a worker is
     /// only ever spawned in that stage — and never on a finished run.
+    ///
+    /// Also captures the leader's process generation at this instant (see
+    /// [`WorkState::worker_pgid_generation`]) — probing it here, immediately
+    /// after the spawn this method is documented to follow, is race-free:
+    /// the pid cannot yet have been recycled.
     pub(crate) fn record_worker_group(&mut self, pgid: u32) -> Result<()> {
         if matches!(self.manifest.lifecycle, RunLifecycle::Finished) {
             return Err(RunError::new(
                 "cannot record a worker group on a finished run",
             ));
         }
+        let generation = crate::quarantine::process_generation(pgid);
         let work = self.work_mut("recording a worker group")?;
         if work.stage != WorkStage::Implementing {
             return Err(RunError::new(
@@ -1453,6 +1495,7 @@ impl RunHandle {
             ));
         }
         work.worker_pgid = Some(pgid);
+        work.worker_pgid_generation = generation;
         self.manifest.updated_at = Utc::now().to_rfc3339();
         self.write_manifest()
     }
@@ -3997,7 +4040,9 @@ mod tests {
             authorization_sha256: "b".repeat(64),
             before_head: Some("d".repeat(40)),
             owner_pid: None,
+            owner_pid_generation: None,
             worker_pgid: None,
+            worker_pgid_generation: None,
             worker_profile: None,
             worker_commit: None,
             mechanical: None,
@@ -4087,7 +4132,9 @@ mod tests {
             authorization_sha256: "b".repeat(64),
             before_head: Some("d".repeat(40)),
             owner_pid: None,
+            owner_pid_generation: None,
             worker_pgid: None,
+            worker_pgid_generation: None,
             worker_profile: None,
             worker_commit: None,
             mechanical: None,
@@ -4565,7 +4612,9 @@ mod tests {
             authorization_sha256: "b".repeat(64),
             before_head: None,
             owner_pid: None,
+            owner_pid_generation: None,
             worker_pgid,
+            worker_pgid_generation: None,
             worker_profile: None,
             worker_commit: None,
             mechanical: None,
@@ -4845,7 +4894,9 @@ mod tests {
                 authorization_sha256: "b".repeat(64),
                 before_head: None,
                 owner_pid: None,
+                owner_pid_generation: None,
                 worker_pgid: None,
+                worker_pgid_generation: None,
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,
@@ -4897,7 +4948,9 @@ mod tests {
                 authorization_sha256: "b".repeat(64),
                 before_head: Some("d".repeat(40)),
                 owner_pid: Some(123),
+                owner_pid_generation: None,
                 worker_pgid: Some(456),
+                worker_pgid_generation: None,
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,
@@ -4971,7 +5024,9 @@ mod tests {
                 authorization_sha256: "b".repeat(64),
                 before_head: None,
                 owner_pid: None,
+                owner_pid_generation: None,
                 worker_pgid: None,
+                worker_pgid_generation: None,
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,

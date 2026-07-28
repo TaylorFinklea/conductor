@@ -502,3 +502,61 @@ zero — but a human would have to land a `bd close` in the literal gap between 
 CLI invocations, rather than at any point during a worker's run. If `bd` ever adds a
 compare-and-swap/conditional-update primitive, `release_owned` should be revisited to use it
 directly instead of the re-fetch-then-compare pattern.
+
+## [2026-07-28] Lease and recovery owners bind to (pid, process generation), not bare pid
+
+**Context.** `conductor-47p`: `RepoLease` and `WorkState.owner_pid`/`worker_pgid` stored and
+checked a bare pid (`kill(pid, 0)` / `kill(-pgid, 0)`). After an ordinary crash, once the OS
+reuses that pid number for an unrelated process, liveness reports the old owner alive
+forever — no concurrency required, just one crash plus normal pid recycling. Review promoted
+this P3 → P1 because it directly contradicts the resumability the product claims.
+
+**Decision.** Bind every recorded pid/pgid to a process generation — the kernel-reported
+process start time (`sysinfo::Process::start_time()`, the same signal
+`dispatch::kernel_process_identity` already uses to authenticate commit-receipt peers) — and
+add `quarantine::process_generation`, `owner_pid_authenticated_live`, and
+`worker_group_authenticated_live` as the composed liveness+identity check. A pid that is
+alive but whose *current* generation no longer matches what was recorded proves the original
+owner is gone (the OS handed the number to someone else), so it authenticates as dead exactly
+like an `ESRCH` pid — closing the hole a bare `kill(pid, 0)` cannot see. A recorded generation
+that still matches keeps the owner live. Absent generation (legacy record, or the writer's own
+generation was unreadable at write time) falls back to the pre-existing bare-pid behavior —
+conservatively presumed live, never invented as dead either way, with the pre-existing
+"still held" diagnostic as the actionable signal.
+
+**The leader-vs-descendant composition.** `process_group_alive(pgid)` (`quarantine.rs`)
+succeeds if *any* member of the group lives; `kernel_process_identity(pid)`
+(`dispatch.rs`) only ever probes the one pid numerically equal to `pgid` (the group leader,
+since workers lead their own group). These do not compose safely on their own: if the leader
+dies but an orphaned descendant survives, the leader's pid slot resolves to nothing, and
+naively reading that as "leader gone ⇒ reclaim" would discard a group still doing real work.
+The resolved rule: the group is provably dead only when `process_group_alive` itself says so
+(unchanged). When the group has a live member, checking the leader-pid slot's generation is
+allowed to *convert* an apparent "still held" into "reclaimable" only when that slot resolves
+to a *different* generation than recorded — never when it resolves to nothing. That asymmetry
+is not mere caution: the kernel never reissues a number as a live pid while any process still
+holds it as a process-group id, so an empty leader-pid slot with the group still alive can
+only be the original group's own orphaned descendant, never an unrelated later group reusing
+the number. A mismatched-but-present occupant, by the same invariant, proves the opposite —
+the original group, leader and every descendant, is fully gone.
+
+**Legacy records.** `WorkState` gained `owner_pid_generation`/`worker_pgid_generation`
+(`Option<u64>`, `#[serde(default)]`) alongside the existing `owner_pid`/`worker_pgid`; the
+`RepoLease` owner-file format gained an optional `pid_generation=` line under the existing
+`lease_version=2` schema (no version bump — an unknown-to-old-readers extra line is inert to
+them, and old records simply parse with the field absent). Every record written before this
+change, or written by a process whose own generation could not be read, has no generation on
+file. Those are handled exactly as before this change — presumed live — never reclassified as
+dead purely for lacking a generation.
+
+**Out of scope.** Kept to what conductor-47p asked for: the binding, the composition rule, and
+every dispatch_cycle.rs recovery-owner check that reads `WorkState.owner_pid`/`worker_pgid`
+(finished-promoted-owner, retained-unauthenticated, pending-review, and the stale-claim
+reclaim path). Left untouched: `PromotionRecoveryRecord.owner_pid` (a separate, promotion-only
+schema slated for deletion per the `[2026-07-28]` "Attempt isolation is out of Undertake's
+scope" ADR above) and every in-process, same-lifetime liveness probe on a just-spawned child
+(`dispatch.rs`/`process.rs` monitoring code) — those never cross a crash/restart boundary, so
+they carry no pid-recycling exposure. `loop.rs`'s own resume path still blanket-refuses on any
+`worker_pgid` without checking liveness at all (`undertake-runner-contract.md` "Resume" items
+1-3, 5) — a separate, larger prep-4/`gtgf` deliverable that consumes this binding but was not
+itself in scope here.

@@ -17,7 +17,8 @@ Chain: `pu5` + four prep beads → `mkct` → `vd3y` → `bxb` → `eueb`/`utwq`
 - [x] `conductor-pu5` — Phase 0 done (`f5e1c0a`); parity selector = `cargo test --bin undertake dispatch_cycle::tests::` = 123 tests
 - [x] `conductor-jum` — done (`9c90c5c`); wildmatch escaping, 4 real-git tests
 - [x] `conductor-moe` — done (`b88da79`); `release_owned` fails closed, no bd CAS exists
-- [ ] `conductor-47p` — last promoted correctness bug; blocks prep 4 (`gtgf`)
+- [x] `conductor-47p` — done; owners bind to (pid, process generation) via `sysinfo`
+  start time, not bare pid — see `decisions.md [2026-07-28]`
 
 ## Blockers
 

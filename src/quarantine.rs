@@ -670,29 +670,39 @@ impl RepoLease {
             }
         };
 
-        let holder_pid = if owner_exists {
-            Some(
-                parse_lease_owner(&holder, lease_identity)
-                    .ok_or_else(|| lease_held_error(canonical_repo, &holder))?
-                    .pid,
-            )
+        let (holder_pid, holder_pid_generation) = if owner_exists {
+            let owner = parse_lease_owner(&holder, lease_identity)
+                .ok_or_else(|| lease_held_error(canonical_repo, &holder))?;
+            (Some(owner.pid), owner.pid_generation)
         } else if holder.trim().is_empty() {
-            None
+            (None, None)
         } else {
-            Some(
-                parse_lease_pid(&holder)
-                    .ok_or_else(|| lease_held_error(canonical_repo, &holder))?,
+            (
+                Some(
+                    parse_lease_pid(&holder)
+                        .ok_or_else(|| lease_held_error(canonical_repo, &holder))?,
+                ),
+                None,
             )
         };
-        if holder_pid.is_some_and(process_alive) {
+        // A legacy (pre-generation) owner record with no `pid_generation`
+        // falls through to `owner_pid_authenticated_live`'s conservative
+        // default: presumed live, same as the bare `process_alive` check
+        // this replaces. Binding a generation only ever narrows an existing
+        // false "still held" into a correct "provably reclaimable" — it
+        // never turns a genuinely live holder into a reclaimable one.
+        if holder_pid.is_some_and(|pid| owner_pid_authenticated_live(pid, holder_pid_generation)) {
             return Err(lease_held_error(canonical_repo, &holder));
         }
 
         remove_stale_pending_owner(&pending_path)?;
         let generation = lease_generation(lease_identity, holder_run_id);
+        let self_pid = std::process::id();
+        let pid_generation_line = process_generation(self_pid)
+            .map(|value| format!("pid_generation={value}\n"))
+            .unwrap_or_default();
         let contents = format!(
-            "lease_version=2\ngeneration={generation}\nrun_id={holder_run_id}\npid={}\nrepo={lease_identity}\n",
-            std::process::id()
+            "lease_version=2\ngeneration={generation}\nrun_id={holder_run_id}\npid={self_pid}\n{pid_generation_line}repo={lease_identity}\n",
         );
         if let Err(error) = write_pending_owner(&pending_path, &contents) {
             let _ = std::fs::remove_file(&pending_path);
@@ -832,6 +842,11 @@ impl Drop for RepoLease {
 struct LeaseOwner {
     pid: u32,
     generation: String,
+    /// The holder's kernel-reported process generation (start time) at the
+    /// moment it wrote this record, if it could be determined. Absent on
+    /// records written before generation binding existed, or when the
+    /// writer's own generation was unreadable — see `process_generation`.
+    pid_generation: Option<u64>,
 }
 
 fn parse_lease_owner(contents: &str, canonical_repo: &str) -> Option<LeaseOwner> {
@@ -848,9 +863,11 @@ fn parse_lease_owner(contents: &str, canonical_repo: &str) -> Option<LeaseOwner>
     {
         return None;
     }
+    let pid_generation = lease_field(contents, "pid_generation").and_then(|value| value.parse().ok());
     Some(LeaseOwner {
         pid,
         generation: generation.to_string(),
+        pid_generation,
     })
 }
 
@@ -1008,6 +1025,111 @@ fn signal_target_alive(id: u32, group: bool) -> bool {
     };
     let target = if group { -raw } else { raw };
     !matches!(kill(Pid::from_raw(target), None), Err(Errno::ESRCH))
+}
+
+/// A process generation: the kernel-reported start time of the process
+/// currently occupying `pid`. `kill(pid, 0)` alone cannot tell "the process I
+/// recorded is still running" apart from "the OS has since handed this pid
+/// number to an unrelated process" — a crashed process and its pid-recycled
+/// successor both report success. Pairing a recorded pid with the generation
+/// it had when recorded closes that hole: a live pid whose *current*
+/// generation no longer matches proves the recorded process is gone.
+///
+/// `Some` only when the kernel unambiguously reports `pid` as a live,
+/// non-zombie process with a nonzero start time; `None` for every other case
+/// (absent, zombie/dead, unreadable, or platform unsupported). `None` must
+/// never be read as proof of either liveness or death on its own — callers
+/// combine it with [`process_alive`]/[`process_group_alive`], which already
+/// carry that proof, via [`owner_pid_authenticated_live`] or
+/// [`worker_group_authenticated_live`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn process_generation(pid: u32) -> Option<u64> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
+
+    let mut system = System::new();
+    let target = [Pid::from_u32(pid)];
+    let updated = system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&target),
+        true,
+        ProcessRefreshKind::nothing().without_tasks(),
+    );
+    if updated != 1 {
+        return None;
+    }
+    let process = system.process(target[0])?;
+    if matches!(
+        process.status(),
+        ProcessStatus::Zombie | ProcessStatus::Dead
+    ) {
+        return None;
+    }
+    let start_time = process.start_time();
+    (start_time != 0).then_some(start_time)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn process_generation(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Authenticates a recorded `(pid, generation)` owner against the process
+/// currently occupying `pid`. `recorded_generation` absent means a legacy
+/// record written before generation binding existed: handled the same as
+/// before this authentication existed — conservatively presumed live,
+/// **never** invented as dead — so callers that need to distinguish that
+/// case for diagnostics should check `recorded_generation.is_none()`
+/// themselves rather than infer it from this return value alone.
+pub(crate) fn owner_pid_authenticated_live(pid: u32, recorded_generation: Option<u64>) -> bool {
+    generation_authenticated_live(pid, recorded_generation, false)
+}
+
+/// Authenticates a recorded `(pgid, generation)` worker-group owner against
+/// the process currently occupying the group leader's pid slot — workers
+/// lead their own process group, so pgid and the leader's pid are the same
+/// number (see `WorkState::worker_pgid`).
+///
+/// This is the leader-vs-descendant composition: [`process_group_alive`]
+/// alone proves only "at least one member remains", and a bare kernel lookup
+/// of the leader pid alone cannot tell "leader dead, descendant orphaned but
+/// still working" apart from "this pgid number was fully freed and later
+/// reissued to an unrelated group". The two must be composed, not queried
+/// independently:
+///
+/// - The group is provably dead only when [`process_group_alive`] itself
+///   reports no member remains (unchanged from before generation binding).
+/// - When the group has a live member and the leader pid slot resolves to a
+///   *different* generation than recorded, the original group is provably
+///   gone: the kernel never reissues a number as a live pid while any
+///   process still holds it as a process group id, so a mismatched occupant
+///   proves every member of the old group — including any orphaned
+///   descendant — is gone too, and the live member just observed belongs to
+///   a distinct, later group that happens to reuse the number.
+/// - When the group has a live member but the leader pid slot resolves to
+///   *no* process at all, that is the orphaned-descendant case: the leader
+///   died but a descendant remains, and by the same kernel invariant this
+///   number cannot yet have been reissued to anything unrelated. This fails
+///   closed as live — it is not merely cautious, it is the only case the
+///   evidence actually supports.
+pub(crate) fn worker_group_authenticated_live(pgid: u32, recorded_generation: Option<u64>) -> bool {
+    generation_authenticated_live(pgid, recorded_generation, true)
+}
+
+fn generation_authenticated_live(id: u32, recorded_generation: Option<u64>, group: bool) -> bool {
+    let alive = if group {
+        process_group_alive(id)
+    } else {
+        process_alive(id)
+    };
+    if !alive {
+        return false;
+    }
+    let Some(recorded) = recorded_generation else {
+        return true;
+    };
+    match process_generation(id) {
+        Some(current) => current == recorded,
+        None => true,
+    }
 }
 
 /// Scans every run recorded under `state_dir` for another run — one whose
@@ -1950,7 +2072,9 @@ mod tests {
                     authorization_sha256: "a".repeat(64),
                     before_head: Some("b".repeat(40)),
                     owner_pid: None,
+                    owner_pid_generation: None,
                     worker_pgid: None,
+                    worker_pgid_generation: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -2361,7 +2485,9 @@ mod tests {
                     authorization_sha256: "a".repeat(64),
                     before_head: before_head.map(str::to_string),
                     owner_pid: None,
+                    owner_pid_generation: None,
                     worker_pgid: None,
+                    worker_pgid_generation: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -2405,7 +2531,9 @@ mod tests {
                     authorization_sha256: "a".repeat(64),
                     before_head: Some("d".repeat(40)),
                     owner_pid: None,
+                    owner_pid_generation: None,
                     worker_pgid: None,
+                    worker_pgid_generation: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -2458,7 +2586,9 @@ mod tests {
                     authorization_sha256: "a".repeat(64),
                     before_head: Some("c".repeat(40)),
                     owner_pid: None,
+                    owner_pid_generation: None,
                     worker_pgid: None,
+                    worker_pgid_generation: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -2968,6 +3098,132 @@ mod tests {
             .expect_err("the live replacement identity must remain fail-closed");
     }
 
+    #[test]
+    fn repo_lease_acquire_records_its_own_process_generation() {
+        let temp = TempDir::new("lease-records-generation");
+        let identity = "/repo/musterroll";
+        let lease =
+            RepoLease::acquire(temp.path(), identity, "owned-run").expect("acquire lease");
+        let (_, owner_path, _) = lease_artifact_paths(temp.path(), identity);
+        let owner = std::fs::read_to_string(&owner_path).expect("read owner record");
+        let expected = process_generation(std::process::id())
+            .expect("this test process has a generation")
+            .to_string();
+        assert_eq!(
+            lease_field(&owner, "pid_generation"),
+            Some(expected.as_str()),
+            "acquire must durably record the acquiring process's own generation"
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn repo_lease_refuses_reclaim_of_a_live_holder_whose_recorded_generation_still_matches() {
+        // A live, same-generation holder must remain held — including across
+        // what looks like a "restart" attempt by a fresh caller using the
+        // same recorded identity.
+        let temp = TempDir::new("lease-live-generation-match");
+        let identity = "/repo/musterroll";
+        let mut holder = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a live process to stand in for the current holder");
+        let holder_pid = holder.id();
+        let holder_generation =
+            process_generation(holder_pid).expect("live holder has a generation");
+
+        let (guard_path, owner_path, _) = lease_artifact_paths(temp.path(), identity);
+        std::fs::create_dir_all(guard_path.parent().expect("lease parent"))
+            .expect("mkdir leases");
+        std::fs::write(&guard_path, b"").expect("write stable guard");
+        std::fs::write(
+            &owner_path,
+            format!(
+                "lease_version=2\ngeneration={}\nrun_id=live-run\npid={holder_pid}\npid_generation={holder_generation}\nrepo={identity}\n",
+                "a".repeat(64)
+            ),
+        )
+        .expect("write live owner record");
+
+        RepoLease::acquire(temp.path(), identity, "new-run")
+            .expect_err("a live holder whose generation still matches must not be reclaimed");
+
+        holder.kill().expect("kill live holder");
+        holder.wait().expect("reap live holder");
+    }
+
+    #[test]
+    fn repo_lease_reclaims_a_live_pid_whose_recorded_generation_no_longer_matches() {
+        // Simulates the exact defect: the recorded pid is alive (the OS
+        // reused it after the original holder crashed), but the generation
+        // it was recorded with no longer matches the process now occupying
+        // that pid slot. A bare `kill(pid, 0)` check would report this
+        // holder alive forever and permanently block reclaim.
+        let temp = TempDir::new("lease-pid-reuse-reclaim");
+        let identity = "/repo/musterroll";
+        let mut recycler = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a live process to stand in for a recycled pid");
+        let recycled_pid = recycler.id();
+        let real_generation =
+            process_generation(recycled_pid).expect("live process has a generation");
+        let stale_generation = real_generation.wrapping_add(1);
+        assert_ne!(real_generation, stale_generation);
+
+        let (guard_path, owner_path, _) = lease_artifact_paths(temp.path(), identity);
+        std::fs::create_dir_all(guard_path.parent().expect("lease parent"))
+            .expect("mkdir leases");
+        std::fs::write(&guard_path, b"").expect("write stable guard");
+        std::fs::write(
+            &owner_path,
+            format!(
+                "lease_version=2\ngeneration={}\nrun_id=stale-run\npid={recycled_pid}\npid_generation={stale_generation}\nrepo={identity}\n",
+                "a".repeat(64)
+            ),
+        )
+        .expect("write stale owner record with a mismatched generation");
+
+        let lease = RepoLease::acquire(temp.path(), identity, "run-new").expect(
+            "a live pid whose recorded generation no longer matches must be treated as a dead \
+             holder and reclaimed, not blocked forever",
+        );
+        drop(lease);
+
+        recycler.kill().expect("kill live process");
+        recycler.wait().expect("reap live process");
+    }
+
+    #[test]
+    fn repo_lease_refuses_reclaim_of_a_live_legacy_holder_with_no_recorded_generation() {
+        // Pre-generation (`lease_version=2` with no `pid_generation`) owner
+        // records must keep behaving exactly as before this change: a live
+        // holder stays held. No liveness is invented in either direction.
+        let temp = TempDir::new("lease-live-legacy-no-generation");
+        let identity = "/repo/musterroll";
+        let (guard_path, owner_path, _) = lease_artifact_paths(temp.path(), identity);
+        std::fs::create_dir_all(guard_path.parent().expect("lease parent"))
+            .expect("mkdir leases");
+        std::fs::write(&guard_path, b"").expect("write stable guard");
+        std::fs::write(
+            &owner_path,
+            format!(
+                "lease_version=2\ngeneration={}\nrun_id=live-run\npid={}\nrepo={identity}\n",
+                "a".repeat(64),
+                std::process::id()
+            ),
+        )
+        .expect("write live legacy owner record");
+
+        RepoLease::acquire(temp.path(), identity, "new-run")
+            .expect_err("a live legacy holder with no recorded generation must stay held");
+    }
 
     #[test]
     fn process_alive_reports_live_and_reaped_processes_and_survives_eperm() {
@@ -3032,6 +3288,224 @@ mod tests {
             !process_group_alive(pgid),
             "an emptied worker group must read as gone"
         );
+    }
+
+    #[test]
+    fn process_identity_matches_the_current_process_to_its_own_generation() {
+        let generation =
+            process_generation(std::process::id()).expect("this test process has a generation");
+        assert_eq!(
+            process_generation(std::process::id()),
+            Some(generation),
+            "a live process's generation must be stable across repeated probes"
+        );
+        assert!(owner_pid_authenticated_live(
+            std::process::id(),
+            Some(generation)
+        ));
+    }
+
+    #[test]
+    fn process_identity_is_absent_for_a_reaped_dead_pid() {
+        let dead_pid = spawn_dead_pid();
+        assert_eq!(
+            process_generation(dead_pid),
+            None,
+            "a provably dead pid must never resolve to a generation"
+        );
+    }
+
+    #[test]
+    fn process_identity_owner_pid_authenticated_live_treats_a_dead_pid_as_dead_regardless_of_generation()
+     {
+        let dead_pid = spawn_dead_pid();
+        assert!(
+            !owner_pid_authenticated_live(dead_pid, None),
+            "a dead pid must reclaim exactly as it did with no generation recorded"
+        );
+        assert!(
+            !owner_pid_authenticated_live(dead_pid, Some(1)),
+            "a dead pid must reclaim even with a recorded generation that can no longer be checked"
+        );
+    }
+
+    #[test]
+    fn process_identity_owner_pid_authenticated_live_treats_a_generation_mismatch_as_a_dead_owner() {
+        // Simulates ordinary PID recycling after a crash: `pid` is genuinely
+        // alive (so a bare `kill(pid, 0)` would report it alive forever), but
+        // the process now occupying that pid slot is not the one that was
+        // recorded — its real generation differs from what a stale record
+        // would claim. Undertake never actually invents a wrong generation;
+        // this stands in for "the OS reused this pid for someone else".
+        let mut worker = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a live process to stand in for a recycled pid");
+        let pid = worker.id();
+        let real_generation = process_generation(pid).expect("live process has a generation");
+        let wrong_generation = real_generation.wrapping_add(1);
+
+        assert!(
+            owner_pid_authenticated_live(pid, Some(real_generation)),
+            "a matching generation must authenticate the live pid as the same owner"
+        );
+        assert!(
+            !owner_pid_authenticated_live(pid, Some(wrong_generation)),
+            "a live pid whose generation no longer matches must be treated as a dead owner, \
+             exactly as if a crashed process's pid had been recycled by the OS"
+        );
+        assert!(
+            owner_pid_authenticated_live(pid, None),
+            "a legacy record with no recorded generation stays conservatively live, unchanged \
+             from before generation binding existed"
+        );
+
+        worker.kill().expect("kill live process");
+        worker.wait().expect("reap live process");
+    }
+
+    #[test]
+    fn process_identity_owner_pid_authenticated_live_fails_closed_on_an_unreadable_generation() {
+        // A zombie is alive from `kill(pid, 0)`'s perspective (its pid table
+        // entry still exists, so ESRCH is never returned) but the kernel
+        // refuses to report usable process info for it — the same kind of
+        // ambiguity EPERM produces for `process_alive` on a root-owned pid.
+        // A recorded generation must never be treated as proof of death
+        // just because it cannot currently be checked.
+        let mut zombie = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a process that exits immediately");
+        let pid = zombie.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let stat = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("probe process state via ps");
+            if String::from_utf8_lossy(&stat.stdout).contains('Z') {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process never reached zombie state before reaping"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            process_alive(pid),
+            "a zombie's pid table entry must still read as alive to kill(pid, 0)"
+        );
+        assert_eq!(
+            process_generation(pid),
+            None,
+            "a zombie must never resolve to a usable generation"
+        );
+        assert!(
+            owner_pid_authenticated_live(pid, Some(1)),
+            "an unreadable generation for an alive-but-zombie pid must fail closed as live, \
+             never be misread as a generation mismatch proving death"
+        );
+
+        zombie.wait().expect("reap zombie");
+    }
+
+    #[test]
+    fn process_identity_worker_group_authenticated_live_treats_a_generation_mismatch_as_dead() {
+        use std::os::unix::process::CommandExt;
+
+        let mut worker = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn worker in its own process group");
+        let pgid = worker.id();
+        let real_generation = process_generation(pgid).expect("live leader has a generation");
+        let wrong_generation = real_generation.wrapping_add(1);
+
+        assert!(worker_group_authenticated_live(pgid, Some(real_generation)));
+        assert!(
+            !worker_group_authenticated_live(pgid, Some(wrong_generation)),
+            "a live group whose leader generation no longer matches must be treated as dead, \
+             exactly as if the pgid number had been recycled by the OS after the original \
+             leader crashed"
+        );
+
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pgid}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        worker.wait().expect("reap worker");
+    }
+
+    #[test]
+    fn process_identity_worker_group_stays_live_when_only_the_leader_dies_and_a_descendant_remains()
+     {
+        // The leader-vs-descendant landmine: `process_group_alive` succeeds
+        // because a descendant is still running, but the leader's own pid
+        // slot (== pgid, since workers lead their own group) is now
+        // genuinely empty rather than occupied by a mismatched generation.
+        // Naively treating "leader pid not found" as proof of death would
+        // reclaim a group that is still doing real work. `sh -c 'sleep 30 &
+        // exit 0'` backgrounds a descendant under the shell's own process
+        // group (no `setsid`) and then the shell itself exits, orphaning the
+        // descendant inside the same still-live pgid.
+        use std::os::unix::process::CommandExt;
+
+        let mut leader = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30 & exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn a leader that orphans a descendant in its own group");
+        let pgid = leader.id();
+        leader
+            .wait()
+            .expect("reap the leader once it exits, freeing its own pid slot");
+
+        assert_eq!(
+            process_generation(pgid),
+            None,
+            "the leader's pid slot must be fully gone once reaped"
+        );
+        assert!(
+            process_group_alive(pgid),
+            "the orphaned descendant must keep the group alive"
+        );
+        assert!(
+            worker_group_authenticated_live(pgid, Some(1)),
+            "a live group whose leader pid cannot be resolved must fail closed as live — the \
+             kernel never reissues a number as a pid while any process still holds it as a \
+             pgid, so this can only be the original group's own orphaned descendant, never an \
+             unrelated later group"
+        );
+        assert!(
+            worker_group_authenticated_live(pgid, None),
+            "the same fail-closed result must hold for a legacy record with no generation"
+        );
+
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pgid}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 
     #[test]

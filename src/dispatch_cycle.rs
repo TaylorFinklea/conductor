@@ -3144,7 +3144,7 @@ fn authenticate_finished_promoted_owner(
             "finished promoted owner identity is missing; refusing recovery",
         )
     })?;
-    if quarantine::process_alive(owner_pid) {
+    if quarantine::owner_pid_authenticated_live(owner_pid, run_artifacts.owner_pid_generation()) {
         return Err(DispatchCycleError::message(format!(
             "finished promoted owner pid {owner_pid} is still alive or ambiguous"
         )));
@@ -5299,7 +5299,7 @@ fn resume_unauthenticated_implementing_work<B: BdClient + ?Sized, C: CommitProbe
         let owner_pid = work.owner_pid.ok_or_else(|| {
             unauthenticated_recovery_failure("retained owner identity is missing")
         })?;
-        if quarantine::process_alive(owner_pid) {
+        if quarantine::owner_pid_authenticated_live(owner_pid, work.owner_pid_generation) {
             return Err(unauthenticated_recovery_failure(format!(
                 "retained owner pid {owner_pid} is still alive or ambiguous"
             )));
@@ -5307,7 +5307,7 @@ fn resume_unauthenticated_implementing_work<B: BdClient + ?Sized, C: CommitProbe
         let worker_pgid = work.worker_pgid.ok_or_else(|| {
             unauthenticated_recovery_failure("retained worker process-group identity is missing")
         })?;
-        if quarantine::process_group_alive(worker_pgid) {
+        if quarantine::worker_group_authenticated_live(worker_pgid, work.worker_pgid_generation) {
             return Err(unauthenticated_recovery_failure(format!(
                 "retained worker group {worker_pgid} is still alive or ambiguous"
             )));
@@ -5708,7 +5708,7 @@ fn authenticate_pending_review_owner(
     let owner_pid = run_artifacts.owner_pid().ok_or_else(|| {
         DispatchCycleError::message("pending-review owner identity is missing; refusing recovery")
     })?;
-    if quarantine::process_alive(owner_pid) {
+    if quarantine::owner_pid_authenticated_live(owner_pid, run_artifacts.owner_pid_generation()) {
         return Err(DispatchCycleError::message(format!(
             "pending-review owner pid {owner_pid} is still alive"
         )));
@@ -6425,7 +6425,9 @@ fn create_work_run(
                 authorization_sha256: item.authorization_sha256.clone(),
                 before_head: before_head.map(str::to_string),
                 owner_pid: Some(std::process::id()),
+                owner_pid_generation: quarantine::process_generation(std::process::id()),
                 worker_pgid: None,
+                worker_pgid_generation: None,
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,
@@ -7028,11 +7030,13 @@ fn recover_terminal_claim_transition<B: BdClient + ?Sized>(
 /// A work run's heartbeat must go quiet for at least this long before its bd
 /// claim is even considered for reclaim. This is a minimum-quiescence grace
 /// window, not the primary safety signal — proof of death is
-/// [`quarantine::process_alive`]/[`quarantine::process_group_alive`] on the
-/// run's recorded owner pid and worker process group, which stay accurate
-/// through worker execution, mechanical verification, and qualitative review
-/// regardless of how long any single stage takes (heartbeat ticks only happen
-/// during worker execution).
+/// [`quarantine::owner_pid_authenticated_live`]/[`quarantine::worker_group_authenticated_live`]
+/// on the run's recorded owner pid and worker process group (each bound to
+/// the process generation it was recorded with, so a crashed owner or worker
+/// whose pid the OS later recycles is never mistaken for still alive), which
+/// stay accurate through worker execution, mechanical verification, and
+/// qualitative review regardless of how long any single stage takes
+/// (heartbeat ticks only happen during worker execution).
 /// `pub(crate)` so the read-only dashboard classifies a quiet run exactly as
 /// recovery does; two independently declared 60-second thresholds would drift
 /// into the dashboard calling a run live that recovery already treats as
@@ -7216,13 +7220,14 @@ fn reclaim_stale_claim<B: BdClient + ?Sized, C: CommitProbe + ?Sized>(
             let Some(owner_pid) = work.owner_pid else {
                 return Ok(None);
             };
-            if quarantine::process_alive(owner_pid) {
+            if quarantine::owner_pid_authenticated_live(owner_pid, work.owner_pid_generation) {
                 return Ok(None);
             }
             let Some(worker_pgid) = work.worker_pgid else {
                 return Ok(None);
             };
-            if quarantine::process_group_alive(worker_pgid) {
+            if quarantine::worker_group_authenticated_live(worker_pgid, work.worker_pgid_generation)
+            {
                 return Ok(None);
             }
             if !run_has_durable_worker_isolation(run_artifacts.dir(), repo_path, state_dir) {
@@ -8913,7 +8918,9 @@ provider = "anthropic"
                     authorization_sha256: "a".repeat(64),
                     before_head: None,
                     owner_pid: None,
+                    owner_pid_generation: None,
                     worker_pgid: None,
+                    worker_pgid_generation: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -13740,7 +13747,9 @@ provider = "opencode-go"
                 authorization_sha256: "a".repeat(64),
                 before_head: before_head.map(str::to_string),
                 owner_pid,
+                owner_pid_generation: None,
                 worker_pgid,
+                worker_pgid_generation: None,
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,
@@ -13830,6 +13839,142 @@ provider = "opencode-go"
             .stderr(Stdio::null())
             .status();
         let _ = child.wait();
+    }
+
+    /// Patches a durable run manifest's `owner_pid_generation` after
+    /// creation. `implementing_run_request` has no generation parameters —
+    /// the great majority of resume tests intentionally exercise the legacy
+    /// (no generation recorded) path — so tests that need a specific
+    /// recorded generation patch it in directly, mirroring
+    /// `set_run_owner_at`.
+    fn set_owner_pid_generation_at(run_dir: &Path, generation: u64) {
+        let manifest_path = run_dir.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
+        manifest["details"]["state"]["owner_pid_generation"] = serde_json::json!(generation);
+        let mut bytes = serde_json::to_vec_pretty(&manifest).expect("serialize manifest");
+        bytes.push(b'\n');
+        std::fs::write(&manifest_path, bytes).expect("write manifest");
+    }
+
+    #[test]
+    fn resume_reclaims_a_live_owner_pid_whose_recorded_generation_no_longer_matches() {
+        // Simulates ordinary PID recycling after a crash: the recorded
+        // owner pid is genuinely alive (a live process stands in for
+        // whatever the OS later assigned that pid number to), but its
+        // *current* generation no longer matches what was recorded when the
+        // run was created. A bare `kill(pid, 0)` liveness check would
+        // misread this as the original owner still running and block
+        // reclaim forever — exactly the conductor-47p defect.
+        let fixture = ResumeFixture::new("owner-pid-generation-mismatch");
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "undertake")
+            .expect("simulate a prior dispatch claiming the bead");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+
+        let mut recycler = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a live process to stand in for a recycled owner pid");
+        let recycled_pid = recycler.id();
+        let real_generation = quarantine::process_generation(recycled_pid)
+            .expect("live process has a generation");
+        let stale_generation = real_generation.wrapping_add(1);
+
+        let stale_run = RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(
+                &fixture.cycle_id,
+                canonical_repo,
+                Some(&before_head),
+                Some(recycled_pid),
+                Some(spawn_dead_pid()),
+            ),
+            Utc::now() - ChronoDuration::seconds(120),
+        )
+        .expect("simulate a run whose owner pid was later reassigned by the OS");
+        set_owner_pid_generation_at(stale_run.dir(), stale_generation);
+        create_inactive_worker_lineage_lease(&stale_run);
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect(
+                "resume reclaims a live pid whose recorded generation no longer matches, \
+                 exactly as if the process it names were dead",
+            );
+        assert_eq!(fixture.bd.release_count(), 1);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(resumed.verified, 1);
+
+        recycler.kill().expect("kill live process");
+        recycler.wait().expect("reap live process");
+    }
+
+    #[test]
+    fn resume_refuses_a_live_owner_pid_whose_recorded_generation_still_matches() {
+        let fixture = ResumeFixture::new("owner-pid-generation-match");
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "undertake")
+            .expect("simulate an active dispatch claiming the bead");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let real_generation = quarantine::process_generation(std::process::id())
+            .expect("this test process has a generation");
+
+        let stranded = RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(
+                &fixture.cycle_id,
+                canonical_repo,
+                Some(&before_head),
+                Some(std::process::id()),
+                None,
+            ),
+            Utc::now() - ChronoDuration::seconds(120),
+        )
+        .expect("simulate a run mid heartbeat-silent verification with a live owner");
+        set_owner_pid_generation_at(stranded.dir(), real_generation);
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume must not error when the owner is still alive");
+        assert_eq!(
+            resumed.dispatched, 0,
+            "a live owner whose recorded generation still matches must never be reclaimed"
+        );
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 0);
     }
 
     #[test]
@@ -15464,7 +15609,9 @@ provider = "codex"
                     authorization_sha256: "a".repeat(64),
                     before_head: None,
                     owner_pid: None,
+                    owner_pid_generation: None,
                     worker_pgid: None,
+                    worker_pgid_generation: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -15736,7 +15883,9 @@ dispatch_id = "fake-worker"
                     authorization_sha256: "a".repeat(64),
                     before_head: None,
                     owner_pid: None,
+                    owner_pid_generation: None,
                     worker_pgid: None,
+                    worker_pgid_generation: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
