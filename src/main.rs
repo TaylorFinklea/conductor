@@ -19,7 +19,6 @@ mod process;
 mod quarantine;
 mod ratchet;
 mod role_routing;
-mod roster_drift;
 mod route;
 mod run;
 mod sanitize;

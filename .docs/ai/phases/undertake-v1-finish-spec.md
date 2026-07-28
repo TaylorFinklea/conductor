@@ -170,6 +170,15 @@ retires (`undertake-core-consolidation-spec.md:489-490`). Draft v1 omitted this.
 
 - Freeze `dispatch_cycle`'s 11,133 test lines as the named behavioral parity corpus for
   `work`. Every later phase re-runs it; deletion is gated on it.
+  - **Named selector**: `cargo test --bin undertake dispatch_cycle::tests::` (bin-only
+    crate, no `lib.rs` — `--bin undertake` is required, `--lib` will not find it). The
+    `dispatch_cycle::tests::` substring matches every `#[test]` fn in the file's single
+    flat `mod tests` block (`src/dispatch_cycle.rs:8238`–EOF) and nothing outside it.
+  - **Measured 2026-07-28**: 123 tests, `123 passed; 0 failed; 0 ignored` (729 filtered
+    out of the crate's 852 total). Confirmed via `#[test]` grep count in that line range
+    matching the `--list` count exactly.
+  - This selector must pass unchanged (same 123, all green) before the legacy engine
+    (`dispatch_cycle.rs`) may be deleted — that deletion is Phase 6.
 - Delete `roster_drift.rs` (1,017) and its `main.rs` mod declaration. Uncontroversially
   retired, zero callers.
 - **Close three beads as stale, not deferred** — their premises are already fixed:
