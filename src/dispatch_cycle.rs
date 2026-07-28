@@ -2471,11 +2471,12 @@ fn dispatch_one<
     {
         Ok(extracted) => extracted,
         Err(reason) => {
-            bd.release(&repo_path, &item.issue_id).map_err(|error| {
-                DispatchCycleError::message(format!(
-                    "authorization changed after claim and release failed: {error}"
-                ))
-            })?;
+            bd.release_owned(&repo_path, &item.issue_id, "undertake")
+                .map_err(|error| {
+                    DispatchCycleError::message(format!(
+                        "authorization changed after claim and release failed: {error}"
+                    ))
+                })?;
             record_replan_required(report_path, item, &reason)?;
             return Ok(DispatchOneResult {
                 decision: None,
@@ -2489,7 +2490,7 @@ fn dispatch_one<
         None => match commits.head(&repo_path) {
             Ok(head) => head,
             Err(error) => {
-                bd.release(&repo_path, &item.issue_id)
+                bd.release_owned(&repo_path, &item.issue_id, "undertake")
                     .map_err(|release_error| {
                         DispatchCycleError::message(format!(
                             "git head before worker and claim release failed: {release_error}"
@@ -2514,7 +2515,7 @@ fn dispatch_one<
     ) {
         Ok(run) => run,
         Err(error) => {
-            bd.release(&repo_path, &item.issue_id)
+            bd.release_owned(&repo_path, &item.issue_id, "undertake")
                 .map_err(|release_error| {
                     DispatchCycleError::message(format!(
                         "run artifact failed and claim release failed: {release_error}"
@@ -3359,7 +3360,7 @@ fn finish_promotion_recovery_failure<B: BdClient + ?Sized>(
             "promotion recovery failed but its terminal evidence could not be persisted ({error}); claim retained"
         ))
     })?;
-    bd.release(repo_path, issue_id).map_err(|error| {
+    bd.release_owned(repo_path, issue_id, "undertake").map_err(|error| {
         DispatchCycleError::recovery_required(format!(
             "promotion recovery evidence records failure but claim release failed: {error}"
         ))
@@ -5406,9 +5407,12 @@ fn resume_unauthenticated_implementing_work<B: BdClient + ?Sized, C: CommitProbe
             dispatches: 0,
         });
     }
-    bd.release(repo_path, &item.issue_id).map_err(|error| {
-        unauthenticated_recovery_failure(format!("release quarantined Undertake claim: {error}"))
-    })?;
+    bd.release_owned(repo_path, &item.issue_id, "undertake")
+        .map_err(|error| {
+            unauthenticated_recovery_failure(format!(
+                "release quarantined Undertake claim: {error}"
+            ))
+        })?;
     let _ = bd.comment(
         repo_path,
         &item.issue_id,
@@ -6976,11 +6980,12 @@ fn apply_terminal_transition<B: BdClient + ?Sized>(
                         ))
                     })?;
             }
-            bd.release(repo_path, issue_id).map_err(|error| {
-                DispatchCycleError::recovery_required(format!(
-                    "terminal release after durable run evidence failed: {error}"
-                ))
-            })?;
+            bd.release_owned(repo_path, issue_id, "undertake")
+                .map_err(|error| {
+                    DispatchCycleError::recovery_required(format!(
+                        "terminal release after durable run evidence failed: {error}"
+                    ))
+                })?;
             if let Some(comment) = transition.comment.as_deref() {
                 let _ = bd.comment(repo_path, issue_id, comment);
             }
@@ -7165,9 +7170,13 @@ fn reclaim_stale_claim<B: BdClient + ?Sized, C: CommitProbe + ?Sized>(
                 );
                 return Ok(None);
             }
-            let reopened = bd.release(repo_path, issue_id).map_err(|error| {
-                DispatchCycleError::message(format!("stale-claim reclaim release retry: {error}"))
-            })?;
+            let reopened = bd
+                .release_owned(repo_path, issue_id, "undertake")
+                .map_err(|error| {
+                    DispatchCycleError::message(format!(
+                        "stale-claim reclaim release retry: {error}"
+                    ))
+                })?;
             let _ = bd.comment(
                 repo_path,
                 issue_id,
@@ -7253,9 +7262,11 @@ fn reclaim_stale_claim<B: BdClient + ?Sized, C: CommitProbe + ?Sized>(
             run_artifacts
                 .finish(STALE_CLAIM_REAPED_OUTCOME)
                 .map_err(run_artifact_error)?;
-            let reopened = bd.release(repo_path, issue_id).map_err(|error| {
-                DispatchCycleError::message(format!("stale-claim reclaim release: {error}"))
-            })?;
+            let reopened = bd
+                .release_owned(repo_path, issue_id, "undertake")
+                .map_err(|error| {
+                    DispatchCycleError::message(format!("stale-claim reclaim release: {error}"))
+                })?;
             let _ = bd.comment(
                 repo_path,
                 issue_id,

@@ -436,3 +436,69 @@ a worker's commit and its durable receipt can leave an unprovable commit on the 
 Undertake will refuse to touch. Ralph — in daily use — has the same exposure with no
 detection at all, so this is not a new hazard, and Undertake is strictly ahead of the
 status quo. Revisit only if CASE's scope changes.
+
+## [2026-07-28] Conditional Beads release: no bd CAS primitive exists; narrow the TOCTOU instead
+
+**Context.** `BdClient::release` (`src/bd.rs`) ran `bd update <id> --status open --assignee
+""` unconditionally. The repo lease (`quarantine::RepoLease`) only serializes concurrent
+Undertake processes; it does nothing against a human running `bd close` between Undertake's
+last observation of a claim and its eventual release. Adversarial review promoted this from
+P3 to P1 because it is an ordinary single-operator race, not an exotic multi-process TOCTOU:
+an operator who deliberately closes a Bead while Undertake is mid-run can have that close
+silently undone the moment Undertake finishes and releases.
+
+**Investigation.** Checked whether the installed `bd` (1.1.0, Homebrew) exposes any
+conditional-update / compare-and-swap primitive for `status`/`assignee`. It does not:
+- `bd update --help` has no `--if-status`, `--if-version`, ETag, or any other
+  optimistic-concurrency flag — only unconditional field setters.
+- `--claim` is documented as "Atomically claim the issue (sets assignee to you, status to
+  in_progress; idempotent if already claimed by you)" and is server-side gated in the
+  *claiming* direction only: live-probed, `bd update <id> --claim` against a `closed` issue
+  fails with `Error claiming <id>: issue not claimable: status closed` (exit 1). There is no
+  equivalent gate for the reverse (release) direction.
+- `bd batch` runs multiple writes in one Dolt transaction but explicitly documents that read
+  commands (`show`, `list`, `ready`, …) are "NOT accepted" inside it, so a read-then-write
+  cannot be made atomic through batching either.
+- `bd show` returns no version/revision counter that a future `--if-updated-at`-style flag
+  could key off.
+- Live-probed the actual vulnerability directly: claim an issue as `undertake`, `bd close`
+  it (simulating the operator), then run the exact shape of the old `release()` primitive
+  (`bd update <id> --status open --assignee ""`). It exits 0 and silently reopens the
+  closed issue, clearing `closed_at`/`close_reason`. This confirms the raw primitive is
+  genuinely unsafe, not theoretically so.
+- Raw SQL (`bd sql`) could express a conditional `UPDATE … WHERE status='in_progress' AND
+  assignee='undertake'`, but that bypasses bd's supported command surface, its Dolt
+  versioning/audit trail, and the "don't invent semantics the backend doesn't support"
+  constraint on this change. Rejected.
+
+**Decision.** No supported atomic primitive exists, so implement the narrowest achievable
+fail-closed mitigation instead: `BdClient::release_owned(repo, id, expected_assignee)` is a
+new default trait method that re-fetches the issue via `bd show` immediately before the
+mutating call, with nothing but the in-process status/assignee comparison in between, then:
+- if `status == open && assignee.is_none()`, treats it as an idempotent no-op (some other
+  completed release already happened) and returns without a redundant `bd` call;
+- if `status == in_progress && assignee == expected_assignee`, proceeds to the existing raw
+  `release()`;
+- otherwise, refuses and returns a diagnostic naming the expected vs. observed
+  status/assignee — the "explicit operator diagnostic" required instead of a silent reopen.
+
+Every production call site that previously called `bd.release(...)` directly now calls
+`bd.release_owned(..., "undertake")`: the three post-claim releases and
+`finish_promotion_recovery_failure` in `dispatch_cycle.rs`, the quarantine-recovery release,
+`apply_terminal_transition`'s Release branch, both releases inside `reclaim_stale_claim`, and
+the two release sites in `verify.rs` (`fail_with_review`, `review_revise`). The raw `release`
+stays as the low-level primitive `release_owned` itself calls, and as what `bd.rs`'s own
+real-subprocess round-trip test intentionally exercises. `loop.rs`'s `LoopClaim::release` is
+a distinct trait with no production `BdClient`-backed implementor today; out of scope here,
+but a future implementation should route through the same pattern.
+
+**Consequences / residual race.** This narrows the window from "however long Undertake's own
+bookkeeping takes between its last observation and the release call" (in the worst case,
+`reclaim_stale_claim` and the quarantine-recovery path did real filesystem/git work — run
+artifact writes, HEAD checks, worktree cleanup — between their earlier re-fetch and the old
+raw release) down to two back-to-back `bd` subprocess invocations (`show` then `update`)
+with no other I/O between them. That window is not zero — `bd` gives no way to make it
+zero — but a human would have to land a `bd close` in the literal gap between two sequential
+CLI invocations, rather than at any point during a worker's run. If `bd` ever adds a
+compare-and-swap/conditional-update primitive, `release_owned` should be revisited to use it
+directly instead of the re-fetch-then-compare pattern.

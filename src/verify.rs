@@ -647,7 +647,7 @@ fn fail_with_review<B: BdClient + ?Sized>(
     review_attempts: Vec<ReviewRecord>,
 ) -> Result<VerifyOutcome> {
     if !request.preserve_claim_on_failure && !request.defer_claim_release {
-        bd.release(&request.repo, &request.issue.id)?;
+        bd.release_owned(&request.repo, &request.issue.id, "undertake")?;
     }
     let comment = format!(
         "undertake: {} {} verify failed: {}",
@@ -974,7 +974,7 @@ fn review_revise<B: BdClient + ?Sized>(
     //    implementation. For pre-promotion verification, the metadata is now
     //    durable, so a released Bead cannot race ahead of its retry context.
     if !request.preserve_claim_on_failure {
-        bd.release(&request.repo, &request.issue.id)?;
+        bd.release_owned(&request.repo, &request.issue.id, "undertake")?;
     }
     // 3. Write the human-facing comment last. The metadata is the
     //    authoritative retry context; the comment is a breadcrumb
@@ -3484,7 +3484,12 @@ mod tests {
         }
 
         fn show(&self, _repo: &Path, _id: &str) -> crate::bd::Result<Issue> {
-            Err(BdError::new("show not implemented in fake"))
+            // `release_owned` re-fetches immediately before releasing;
+            // `self.issue` is the fixture's fixed claimed-state baseline
+            // (never mutated by other fake methods), so returning it here
+            // keeps the guard's freshness check satisfied in tests that
+            // never intend to exercise a raced external change.
+            Ok(self.issue.clone())
         }
 
         fn count(&self, _repo: &Path) -> crate::bd::Result<u64> {

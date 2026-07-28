@@ -157,10 +157,56 @@ pub(crate) trait BdClient {
     fn count(&self, repo: &Path) -> Result<u64>;
     fn blocked(&self, repo: &Path) -> Result<Vec<Issue>>;
     fn claim(&self, repo: &Path, id: &str, actor: &str) -> Result<Issue>;
+    // Raw, unconditional primitive: `bd update <id> --status open --assignee
+    // ""` runs unchecked against whatever the live record currently holds.
+    // The installed `bd` (1.1.0) has no compare-and-swap/conditional-update
+    // flag on `update` (verified against `bd update --help`: no
+    // `--if-status`/`--if-version`/optimistic-concurrency option exists),
+    // and `bd batch` explicitly refuses read commands like `show` inside its
+    // transaction, so a read-then-write cannot be made atomic in one `bd`
+    // invocation. Calling this directly reopens whatever the record says
+    // *right now* even if a human closed it moments ago (confirmed live: a
+    // raw release-shaped `bd update --status open --assignee ""` against an
+    // already-closed issue exits 0 and silently clears `closed_at`). New
+    // production call sites should use [`BdClient::release_owned`] instead;
+    // see `.docs/ai/decisions.md` (2026-07-28, "Conditional Beads release").
     fn release(&self, repo: &Path, id: &str) -> Result<Issue>;
     fn close(&self, repo: &Path, id: &str, reason: &str) -> Result<Issue>;
     fn comment(&self, repo: &Path, id: &str, text: &str) -> Result<Comment>;
     fn set_metadata(&self, repo: &Path, id: &str, key: &str, value: &str) -> Result<Issue>;
+
+    /// Releases `id` only if it is still exactly `in_progress` and assigned
+    /// to `expected_assignee` at the moment of the call.
+    ///
+    /// `bd` exposes no atomic compare-and-swap for `status`/`assignee` (see
+    /// the note on [`BdClient::release`]), so this is the narrowest
+    /// achievable mitigation for the "operator closes the Bead while
+    /// Undertake is about to release it" race: re-fetch immediately before
+    /// the mutating call, with nothing but the in-process comparison between
+    /// them. A concurrent external `bd close` landing in that residual
+    /// window is still possible in principle, but the window is now a
+    /// single comparison rather than however much work a caller did between
+    /// its own last observation and the release. A record already sitting
+    /// at `open`/unassigned is treated as an idempotent no-op (some other
+    /// completed release already happened); any other observed state fails
+    /// closed with a diagnostic instead of blindly reopening it.
+    fn release_owned(&self, repo: &Path, id: &str, expected_assignee: &str) -> Result<Issue> {
+        let current = self.show(repo, id)?;
+        if current.status == "open" && current.assignee.is_none() {
+            return Ok(current);
+        }
+        if current.status != "in_progress" || current.assignee.as_deref() != Some(expected_assignee)
+        {
+            return Err(BdError::new(format!(
+                "refusing to release {id}: expected status=in_progress assignee={expected_assignee}, \
+                 observed status={} assignee={} — the record changed since Undertake last observed \
+                 it (likely an external close or reassignment); manual recovery required",
+                current.status,
+                current.assignee.as_deref().unwrap_or("<none>"),
+            )));
+        }
+        self.release(repo, id)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -814,6 +860,236 @@ mod tests {
             .find(|issue| issue.id == "fixture-owner-absent-probe")
             .expect("ready returns the probe issue");
         assert_eq!(issue.owner, None);
+    }
+
+    fn stub_issue(status: &str, assignee: Option<&str>) -> Issue {
+        Issue {
+            id: "fixture-release-owned".to_string(),
+            title: "release_owned fixture".to_string(),
+            description: String::new(),
+            acceptance_criteria: String::new(),
+            notes: String::new(),
+            status: status.to_string(),
+            priority: 1,
+            issue_type: "task".to_string(),
+            assignee: assignee.map(str::to_string),
+            owner: None,
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            created_by: "test".to_string(),
+            updated_at: "2026-07-02T00:00:00Z".to_string(),
+            started_at: None,
+            labels: None,
+            estimated_minutes: None,
+            metadata: None,
+            parent: None,
+            dependencies: None,
+            dependency_count: None,
+            dependent_count: None,
+            comment_count: None,
+        }
+    }
+
+    /// Minimal fixture for `release_owned` unit tests: `show` always returns
+    /// the fixed `state`, and `release` records whether the raw,
+    /// unconditional primitive was actually invoked — the guard under test
+    /// is precisely whether `release_owned` reaches it.
+    struct FixedStateBdClient {
+        state: Issue,
+        released: std::cell::Cell<bool>,
+    }
+
+    impl FixedStateBdClient {
+        fn new(state: Issue) -> Self {
+            Self {
+                state,
+                released: std::cell::Cell::new(false),
+            }
+        }
+    }
+
+    impl BdClient for FixedStateBdClient {
+        fn ready(&self, _repo: &Path) -> Result<Vec<Issue>> {
+            unimplemented!("not exercised by release_owned")
+        }
+
+        fn show(&self, _repo: &Path, _id: &str) -> Result<Issue> {
+            Ok(self.state.clone())
+        }
+
+        fn count(&self, _repo: &Path) -> Result<u64> {
+            unimplemented!("not exercised by release_owned")
+        }
+
+        fn blocked(&self, _repo: &Path) -> Result<Vec<Issue>> {
+            unimplemented!("not exercised by release_owned")
+        }
+
+        fn claim(&self, _repo: &Path, _id: &str, _actor: &str) -> Result<Issue> {
+            unimplemented!("not exercised by release_owned")
+        }
+
+        fn release(&self, _repo: &Path, _id: &str) -> Result<Issue> {
+            self.released.set(true);
+            let mut released = self.state.clone();
+            released.status = "open".to_string();
+            released.assignee = None;
+            Ok(released)
+        }
+
+        fn close(&self, _repo: &Path, _id: &str, _reason: &str) -> Result<Issue> {
+            unimplemented!("not exercised by release_owned")
+        }
+
+        fn comment(&self, _repo: &Path, _id: &str, _text: &str) -> Result<Comment> {
+            unimplemented!("not exercised by release_owned")
+        }
+
+        fn set_metadata(&self, _repo: &Path, _id: &str, _key: &str, _value: &str) -> Result<Issue> {
+            unimplemented!("not exercised by release_owned")
+        }
+    }
+
+    #[test]
+    fn bd_client_release_owned_refuses_when_state_diverges_from_expectation() {
+        // Simulates the P1 race directly: by the time `release_owned` takes
+        // its immediate-before-release look, the record shows a status an
+        // operator's `bd close` would leave behind. The raw `release` must
+        // never be reached, and the caller must get a diagnostic
+        // identifying the mismatch, not a silent reopen.
+        let client = FixedStateBdClient::new(stub_issue("closed", Some("undertake")));
+
+        let error = client
+            .release_owned(Path::new("/repo"), "fixture-release-owned", "undertake")
+            .expect_err("a closed record must never be released");
+
+        assert!(
+            !client.released.get(),
+            "the raw release primitive must never be reached on a state mismatch"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("refusing to release"),
+            "diagnostic must name the refusal: {message}"
+        );
+        assert!(
+            message.contains("status=closed"),
+            "diagnostic must surface the observed status: {message}"
+        );
+    }
+
+    #[test]
+    fn bd_client_release_owned_refuses_when_assignee_no_longer_matches() {
+        let client = FixedStateBdClient::new(stub_issue("in_progress", Some("someone-else")));
+
+        let error = client
+            .release_owned(Path::new("/repo"), "fixture-release-owned", "undertake")
+            .expect_err("a claim held by a different assignee must never be released");
+
+        assert!(!client.released.get());
+        assert!(error.to_string().contains("assignee=someone-else"));
+    }
+
+    #[test]
+    fn bd_client_release_owned_is_idempotent_when_already_released() {
+        let client = FixedStateBdClient::new(stub_issue("open", None));
+
+        let issue = client
+            .release_owned(Path::new("/repo"), "fixture-release-owned", "undertake")
+            .expect("an already-open, unassigned record is a no-op, not an error");
+
+        assert!(
+            !client.released.get(),
+            "an already-released record must short-circuit without a redundant bd call"
+        );
+        assert_eq!(issue.status, "open");
+        assert_eq!(issue.assignee, None);
+    }
+
+    #[test]
+    fn bd_client_release_owned_releases_when_state_matches_expectation() {
+        let client = FixedStateBdClient::new(stub_issue("in_progress", Some("undertake")));
+
+        let issue = client
+            .release_owned(Path::new("/repo"), "fixture-release-owned", "undertake")
+            .expect("matching state must release");
+
+        assert!(client.released.get());
+        assert_eq!(issue.status, "open");
+        assert_eq!(issue.assignee, None);
+    }
+
+    #[test]
+    fn bd_client_real_subprocess_release_owned_refuses_reopening_externally_closed_bead() {
+        // Live-contract regression for the P1 race this fixes: an operator
+        // running `bd close` between Undertake's last observation and its
+        // release must never be silently undone. Direct proof against the
+        // real binary that the raw primitive is genuinely unsafe (exit 0,
+        // reopens a closed issue) lives in the investigation notes for this
+        // change; this test proves `release_owned` refuses instead.
+        if !bd_on_path() {
+            return;
+        }
+
+        let temp = TempDir::new("bd-client-release-owned-close-race");
+        init_bd_repo(temp.path());
+        setup_issue(
+            temp.path(),
+            &[
+                "create",
+                "release owned close race",
+                "--id",
+                "fixture-release-owned-race",
+                "--description",
+                "release_owned close race description",
+                "--acceptance",
+                "release_owned close race acceptance",
+                "-t",
+                "task",
+                "-p",
+                "1",
+            ],
+        );
+
+        let client = CommandBdClient::new();
+        client
+            .claim(temp.path(), "fixture-release-owned-race", "undertake")
+            .expect("claim as undertake");
+
+        // Simulate the operator: close the Bead out from under the held
+        // claim, exactly as a human running `bd close` would between
+        // Undertake's last observation and its release.
+        let output = Command::new("bd")
+            .arg("-C")
+            .arg(temp.path())
+            .args([
+                "close",
+                "fixture-release-owned-race",
+                "--reason",
+                "operator closed while undertake still thinks it holds the claim",
+            ])
+            .arg("--json")
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn bd close");
+        assert!(
+            output.status.success(),
+            "simulated operator close failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let error = client
+            .release_owned(temp.path(), "fixture-release-owned-race", "undertake")
+            .expect_err("release_owned must refuse to reopen an externally closed Bead");
+        assert!(error.to_string().contains("refusing to release"));
+
+        let after = client
+            .show(temp.path(), "fixture-release-owned-race")
+            .expect("show after refused release");
+        assert_eq!(
+            after.status, "closed",
+            "the operator's close must survive Undertake's release attempt"
+        );
     }
 
     struct TempDir(PathBuf);
