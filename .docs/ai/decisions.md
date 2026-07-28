@@ -399,3 +399,40 @@ diversity enforcement is cross-repo gated on that. Family must never be inferred
 parsing `ProfileId` — the spec forbids deriving execution coordinates from the opaque
 label. `conductor-pzo`'s specific Fable-plus-provider panel remains cutover gate 11 work,
 outside gates 4/10.
+
+## [2026-07-28] Attempt isolation is out of Undertake's scope; CASE owns containment
+
+**Context.** Adversarial review of the Phase 1a runner contract (GPT-5.6 Sol) established
+that dropping the attempt checkout costs real safety properties: an unauthenticated
+canonical commit has no recovery path (dirty-tree quarantine refuses once HEAD moved,
+`quarantine.rs:357-365`), quarantine captures only *uncommitted* work
+(`quarantine.rs:337-344`), transient unverified changes are visible to the operator and to
+watchers during execution, and `CommitProbe::is_clean` runs
+`git status --porcelain --untracked-files=normal`, which does not see ignored-file changes.
+An earlier draft of the contract asserted three compensating controls were sufficient.
+They are not.
+
+**Decision (user).** Isolation is **out of scope for Undertake entirely**. It belongs to
+CASE — the Controlled Autonomy Safety Engine (`~/git/case`, spec
+`docs/spec/CASE_V0_1_SPEC.md`, transcribed 2026-07-27, not yet frozen and not authorized
+for implementation). Undertake `work` writes the target repository directly. Undertake does
+not build attempt checkouts, commit promotion, supersession, or a containment layer, and
+must not grow one back under another name.
+
+**Consequences.** This supersedes the framing of the `[2026-07-28]` D1 ADR: in-repo
+execution is not a trade Undertake made for simplicity, it is a scope boundary. The
+promotion subsystem, verification-input materialization, `undertake supersede`, promotion
+recovery, and three of four resume state machines stay deleted.
+
+What Undertake still owes is **detection, not containment**: a durable pre-attempt HEAD
+checkpoint written before spawn, and a fail-closed refusal on resume when canonical HEAD
+moved without a matching durable receipt — Undertake declines to touch the repository and
+surfaces it for human resolution. Clean-tree preflight and quarantine adoption of
+uncommitted work remain in scope as detection.
+
+**Accepted residual risk, stated plainly.** CASE is unfrozen and unimplemented, so the
+containment gap is unowned *today*, not merely delegated. Until CASE ships, a crash between
+a worker's commit and its durable receipt can leave an unprovable commit on the branch that
+Undertake will refuse to touch. Ralph — in daily use — has the same exposure with no
+detection at all, so this is not a new hazard, and Undertake is strictly ahead of the
+status quo. Revisit only if CASE's scope changes.
