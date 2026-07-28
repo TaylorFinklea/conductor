@@ -36,21 +36,37 @@ as they stand.
 One runner owns the sequence. Per-job variation enters through **one** policy trait, never
 through a second engine.
 
+**The attempt loop is two-level, not one.** A single-level candidate walk cannot host
+`review`, whose real shape (`run_reviewers:973`) is *the whole panel concurrently, and each
+slot running its own internal chain* (`run_reviewer_slot:1913`). Conflating the two makes
+`AdvanceCandidate` ambiguous — next reviewer, or next fallback within this reviewer?
+
 ```
-AttemptRunner::run(policy, ports, request) ->  Terminal
+AttemptRunner::run(policy, ports, request) -> Terminal
 
   acquire RepoLease
-  preflight:  auth_readiness -> is_clean -> approval revalidation -> bead claim
-  for each stage the policy yields:
-      for each attempt within the stage's budget:
-          select next candidate from the stage's PINNED pool
-          execute (posture-selected: mutating | read-only)
-          classify -> Accept | RetrySameCandidate | AdvanceCandidate | Fatal
-      verify (mechanical, then optional qualitative)
-  terminal: policy.terminal(...) -> close | release, then durable evidence, then Bead mutation
+  preflight: auth_readiness -> is_clean -> approval+digest revalidation -> bead claim
+
+  for each stage the policy yields (from the stage ledger):
+      revalidate approval + policy digests            // drift since approval = fail closed
+      slots = stage.slots                             // N for review's panel; 1 elsewhere
+      run slots with stage.concurrency:
+          per slot, walk its OWN ordered candidate chain:
+              execute (posture-selected: mutating | read-only)
+              classify_attempt -> Accept | RetrySameCandidate | AdvanceCandidate | Fatal
+              //  RetrySameCandidate = schema repair, same profile, prompt sees the failed output
+              //  AdvanceCandidate   = next entry in THIS slot's chain
+      join
+      aggregate_stage(slot results) -> StageOutcome   // review's panel-completeness lives here
+      record stage artifacts into the ledger          // later stages read them
+      verify (mechanical, then optional qualitative)  // work only
+
+  terminal: policy.terminal(ledger) -> durable evidence FIRST, then the one Bead mutation
 ```
 
-Everything above the `policy.` calls is the runner's, identical for all four jobs.
+Everything outside the `policy.` calls is the runner's, identical for all four jobs.
+
+**The runner is the sole writer.** Slots produce *results*, never writes. See § Concurrency.
 
 ## Types to define
 
@@ -167,9 +183,14 @@ read family from the Musterroll `model_family` field — never by parsing `Profi
 ### `CallBudget`
 
 `review` enforces a per-run model-call ceiling with an atomic counter that fails closed
-once exhausted: `worst_case_calls = reviewer_count * (REPAIR_RETRIES + 1) + 1`
-(`adversarial.rs:158-189`). The runner owns this for every job; a stage's attempt budget
-alone does not bound total spend across a fan-out.
+once exhausted (`ReviewerCallBudget`, `adversarial.rs:158-189`); the worst-case formula
+`reviewer_count * (REPAIR_RETRIES + 1) + 1` is at `adversarial.rs:868-871`. The runner owns
+this for every job — a stage's attempt budget alone does not bound total spend across a
+fan-out.
+
+`JobPolicy::call_budget(stage_plan)` derives it. Only `review`'s formula exists today;
+`work`, `plan`, and `consult` need one stated rather than inferred. Default:
+`sum over stages of (slots x chain_length x attempts_per_candidate)`.
 
 ## The ports
 
@@ -205,13 +226,15 @@ Posture-selected. The mutating half exists; the read-only half needs widening.
 - `RepositoryWrite` → `run_with_heartbeat` (`dispatch.rs:513`), which preflights HEAD, runs
   the hooks, spawns, heartbeats, and authenticates the commit. Returns `DispatchResult`
   with stdout/stderr paths and byte counts. Use as-is.
-- `ReadOnly` → `run_readonly` (`dispatch.rs:490`) is **not sufficient as written**: it
-  returns `Result<()>`, so it reports only pass/fail and discards the output. For `review`,
-  `consult`, and `plan` the output *is* the result — the verdict, the envelope, the plan
-  document. Widen it to return the same captured-artifact shape as `DispatchResult`
-  (stdout/stderr paths plus byte counts), or add a sibling that does. Check what
-  `adversarial.rs` and `plan_job.rs` do for capture today and lift that rather than
-  inventing a third mechanism.
+- `ReadOnly` → `run_readonly` (`dispatch.rs:490`) is **not sufficient as written**, though
+  the precise defect is narrower than it first appears: output *is* captured, to
+  `SpawnRequest.stdout_path` / `stderr_path` (`dispatch.rs:248-249`). What it discards is
+  the *return* — `Result<()>` hands back no paths, byte counts, or status detail, so a
+  caller cannot classify the attempt. Widen the return to `DispatchResult`'s shape, or add
+  a sibling that does. **Do not add capture that already exists.** Note that neither
+  `adversarial` nor `plan_job` calls `run_readonly` today — both drive `exec.spawn`
+  directly; deciding which becomes the one read-only path is Phase 1b's call, and either
+  is acceptable so long as there is exactly one.
 - Both paths, `ReadOnly` only: a mandatory post-attempt HEAD/index/worktree check. A
   read-only job that mutated its repo is an *infrastructure failure*, never a result.
   Mirror the check shipped in `8a8f1fe`.
@@ -228,11 +251,42 @@ job()                     -> RunJob
 posture()                 -> MutationPosture
 claims_bead()             -> bool               // work only; verified neither plan nor review touches bd
 requires_pinned_roster()  -> bool               // false only for the bootstrap probe
-stages(progress)          -> Option<Stage>      // None ends the stage sequence
-prompt(stage, attempt)    -> SpawnRequest       // built from the pinned candidate
-classify(stage, output)   -> Option<AttemptOutcome>  // job-specific reading; None = runner default
-terminal(evidence)        -> Terminal
+revalidation_digests()    -> &[DigestKind]      // which digests this job re-checks per stage
+call_budget(stage_plan)   -> CallBudget         // worst-case model calls for the whole run
+
+next_stage(ledger)        -> Option<Stage>      // None ends the sequence
+prompt(ctx)               -> SpawnRequest
+classify_attempt(ctx, output) -> Option<AttemptOutcome>   // None = runner default
+aggregate_stage(stage, slot_results) -> StageOutcome
+terminal(ledger)          -> Terminal
 ```
+
+**`AttemptContext` is the fix for the seam's biggest hole.** A first draft had
+`prompt(stage, attempt)`, which cannot build the two prompts that matter most: the judge
+prompt is assembled from the reviewers' outputs (`finalize_review:1045` →
+`run_judge_attempt:1288`), the peer-review prompt needs the author's plan document
+(`PlanProgress::AwaitingPeer.artifact`, `run.rs:503`), and a schema-repair prompt embeds
+the *failed attempt's own stdout* (`reviewer_repair_prompt`). None of those are functions
+of the stage and candidate alone.
+
+```
+AttemptContext = {
+    stage, slot, attempt_index,
+    candidate:            &ApprovedExecution,
+    prior_stages:         &StageLedger,          // hash-pinned artifacts of completed stages
+    prior_attempt_output: Option<&ArtifactRef>,  // Some() exactly on RetrySameCandidate
+}
+```
+
+The ledger holds `ArtifactRef` (`run.rs:115`) — path plus sha256 — so a prompt is built
+from *pinned* evidence, never from ambient state. The runner captures and hashes; the
+policy reads.
+
+**`next_stage(ledger)` replaces `stages(progress)`.** The `progress` parameter was
+undefined, and plan's `Revising ⇄ AwaitingPeer` loop (`PlanProgress:487`) turns on the
+*prior peer verdict*. The ledger carries completed stages, their `StageOutcome`s, and their
+artifacts, so revise-versus-advance is a pure function of it. Plan's `PlanProgress` becomes
+a projection the plan policy computes; the runner keeps one generic ledger.
 
 A policy is **pure**: prompts in, classification and a verdict out. It never touches
 `RunHandle`, bd, git, or a process — the runner owns all of those. This is what lets
@@ -243,6 +297,19 @@ preservation and coverage invariants (`parse_judge_response:1372-1420`), and `co
 evidence-or-gaps rule all live behind `stages` + `classify` + `terminal`. **If a policy
 needs to reach past these, that is a finding to surface — not a reason to keep a second
 engine.**
+
+### `WorktreePort`
+
+Not a `dispatch.rs` primitive — `plan_job` hand-rolls it (`with_isolated_worktree:3048`:
+`git worktree add --detach <tmp> <head>`, run, then unconditional `--force` removal plus
+`remove_dir_all`). A stage that declares isolation needs it, and it cannot live in a policy:
+`Command::new(` and `git worktree` are both on `adversarial.rs`'s forbidden list.
+
+```
+create(repo, head) -> Worktree      // Drop removes, unconditionally, even on panic
+```
+
+Lift `with_isolated_worktree` into this port. `plan`'s author stage is its only v1 consumer.
 
 ### `Clock`
 
@@ -260,8 +327,9 @@ artifact-hash invariant.
 
 Requirements:
 
-1. Every runner state write goes through `run::durable_atomic_replace`
-   (`run.rs:3578-3585`), which fsyncs the file before rename and the parent afterward.
+1. Every runner state write goes through `run::durable_atomic_replace` (`run.rs:3501`,
+   logic in `durable_atomic_replace_with_observer:3505`), which fsyncs the file before
+   rename and the parent afterward. `atomic_replace:3578` is its thin `Result` wrapper.
    There are two other hand-rolled atomic writers (`deck.rs:661`, `role_routing.rs:1805`);
    do not add a fourth.
 2. The runner's state artifact is **hash-pinned in the run manifest**. A state file whose
@@ -269,6 +337,33 @@ Requirements:
 3. A terminal state is only trusted if the corresponding `AttemptFinished` /
    `VerifyFinished` events exist in the append-only journal. Evidence is durable *before*
    the Bead mutation, and the Bead mutation is the last step.
+
+## Concurrency
+
+Fan-out interacts badly with the durable substrate, and a first draft of this contract got
+it wrong. `append_event_line` (`run.rs:3589`) is **read-modify-write** — it reads the whole
+journal, appends one line, and `atomic_replace`s the file. Its own doc comment states the
+invariant: *"Run journals have one owning process."* Today `adversarial` respects this by
+collecting attempts in memory and letting `cli.rs` serialize them after the join. An
+earlier draft here said to delete that bridge and "emit events natively," which under
+concurrency would have had N slots racing read-modify-write and **losing events**.
+
+**The invariant is preserved, not violated. The runner is the sole writer.**
+
+1. Concurrent slots return *results*; they never touch `RunHandle`, the state file, or the
+   journal. The runner writes every event after the join, in deterministic slot order.
+2. The per-run state file has exactly one writer for the same reason.
+3. `CallBudget` is reserved before spawn through an atomic counter that fails closed once
+   exhausted — mirror `ReviewerCallBudget` (`adversarial.rs:158-189`); its worst-case
+   formula is at `adversarial.rs:868-871`. Without atomicity a fan-out double-spends.
+4. **Resume across N workers.** The resume model below probes *a* process group; a
+   concurrent stage has N. The run state records a worker identity per in-flight slot.
+   Reclaim requires **every** one to be provably dead; any alive or unreadable → refuse.
+5. **Dirty-tree attribution under fan-out.** N read-only slots share one checkout, so a
+   mutation cannot be attributed to a slot. Therefore the read-only HEAD/index/worktree
+   check runs **once at stage join**, not per slot: it proves the repo was unmutated across
+   the stage. Failure fails the whole stage as an infrastructure error. That is sufficient
+   and honest; per-slot attribution is not achievable and should not be claimed.
 
 ## Resume
 
@@ -341,9 +436,12 @@ which translates its in-memory `ReviewerAttempt` / `JudgeAttempt` into `AttemptS
 `AttemptFinished` / `CoverageGap` / `ReviewFinished` and calls `finish(...)`.
 
 This is enforced by a production-code string scan (`adversarial.rs:3172-3193`) asserting
-the module — excluding its test block — contains none of `"git worktree"`,
-`"Command::new("`, `"std::process::Command"`, `"crate::bd::"`, `"crate::cycle::"`,
-`"crate::dispatch_cycle::"`, `"crate::verify::"`.
+the module — excluding its test block — contains none of **eleven** strings
+(`adversarial.rs:3178-3190`): `"crate::bd::"`, `"crate::cycle::"`,
+`"crate::dispatch_cycle::"`, `"crate::verify::"`, `"CommandExec"`, `"GitCommitProbe"`,
+`"run_dispatch_cycle"`, `"std::process::Command"`, `"Command::new("`, `"git worktree"`,
+`"chezmoi apply"`. Preserve **all eleven** — an implementer working from a truncated list
+would silently weaken the invariant.
 
 A naive migration either trips that test or silently drops the event bridge.
 
@@ -368,9 +466,21 @@ The two engines disagree, and the resumable runner needs the stricter model.
 - `adversarial` authorizes **once** in `authorize_approved_execution:942` and then runs to
   completion in one process. There is no later re-check.
 
-The runner adopts plan's model for all jobs: re-validate the pinned approval and every
-policy digest at each stage boundary. Drift since approval is a fail-closed terminal, never
-a retry. `review` gains resumability it does not have today.
+The runner adopts plan's model for all jobs: re-validate the pinned approval and the job's
+declared digests at each stage boundary. Drift since approval is a fail-closed terminal,
+never a retry. `review` gains resumability it does not have today.
+
+"Every policy digest" is too vague to build from — the sets genuinely differ, so
+`JobPolicy::revalidation_digests()` declares them:
+
+| Job | Digests re-checked per stage |
+|---|---|
+| `plan` | `target_head`, `target_status`, `target_sha256`, `roster_policy_sha256`, `scheduler_policy_sha256` (`plan_job.rs:1573,1580,1592,1597`) plus a deck response strictly after `approval_watermark` (`2914`) |
+| `review` | `plan_sha256`, `roster_sha256` (`authorize_approved_execution:942`) |
+| `work` | `target_head`, bead status/claim ownership, `roster_policy_sha256` |
+| `consult` | `roster_policy_sha256` |
+
+Extend the enum rather than adding a job-specific escape hatch.
 
 Two beads were deferred as standalone items but their requirements land here:
 
