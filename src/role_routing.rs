@@ -1312,7 +1312,16 @@ fn is_quiescent_lock_only_lane(path: &Path) -> Result<bool> {
 /// Historical policy lanes remain in the source snapshot. Current scores and
 /// reservation history are retained while the ownership schema and policy
 /// digest are rebound to the identity-only renamed policy.
-fn terminal_plan_stage_is_proven(source_root: &Path, reservation: &Reservation) -> Result<bool> {
+// `owner_is_terminal` supplies the one fact role-routing cannot derive on
+// its own: whether the reservation's owning run has reached a terminal
+// state. Interpreting a run's `job` field and its job-specific `details`
+// substructure (e.g. `PlanProgress`) is the caller's concern, not
+// role-routing's — see `state.rs::migrate_live_state`.
+fn terminal_plan_stage_is_proven(
+    source_root: &Path,
+    reservation: &Reservation,
+    owner_is_terminal: &impl Fn(&serde_json::Value) -> bool,
+) -> Result<bool> {
     let owner = reservation
         .run_id
         .as_str()
@@ -1332,15 +1341,11 @@ fn terminal_plan_stage_is_proven(source_root: &Path, reservation: &Reservation) 
     .map_err(|error| RoleRoutingError::new(format!("parse reservation owner: {error}")))?;
     if manifest.get("schema").and_then(serde_json::Value::as_str) != Some("conductor/run@2")
         || manifest.get("run_id").and_then(serde_json::Value::as_str) != Some(owner)
-        || manifest.get("job").and_then(serde_json::Value::as_str) != Some("plan")
         || manifest
             .get("lifecycle")
             .and_then(serde_json::Value::as_str)
             != Some("finished")
-        || manifest
-            .pointer("/details/state/progress/state")
-            .and_then(serde_json::Value::as_str)
-            != Some("terminal")
+        || !owner_is_terminal(&manifest)
     {
         return Ok(false);
     }
@@ -1396,6 +1401,7 @@ pub(crate) fn migrate_legacy_state(
     source_root: &Path,
     destination_root: &Path,
     policy: &RoutingPolicy,
+    reservation_owner_is_terminal: impl Fn(&serde_json::Value) -> bool,
 ) -> Result<u64> {
     let source = source_root.join("role-routing");
     if !source.exists() {
@@ -1483,7 +1489,11 @@ pub(crate) fn migrate_legacy_state(
             }
             if stored.capacity_active
                 && matches!(stored.reservation.state, ReservationState::Committed)
-                && terminal_plan_stage_is_proven(source_root, &stored.reservation)?
+                && terminal_plan_stage_is_proven(
+                    source_root,
+                    &stored.reservation,
+                    &reservation_owner_is_terminal,
+                )?
             {
                 stored.capacity_active = false;
             }

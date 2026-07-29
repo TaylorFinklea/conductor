@@ -116,8 +116,13 @@ pub(crate) fn migrate_live_state(
         files_copied +=
             copy_typed_file::<crate::ratchet::RatchetStore>(&source, &staging, "ratchet.json")?;
         files_copied += migrate_runs(&source, &staging)?;
-        files_copied += crate::role_routing::migrate_legacy_state(&source, &staging, policy)
-            .map_err(io::Error::other)?;
+        files_copied += crate::role_routing::migrate_legacy_state(
+            &source,
+            &staging,
+            policy,
+            plan_run_manifest_is_terminal,
+        )
+        .map_err(io::Error::other)?;
         if tree_digest(&source)? != source_digest {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -131,6 +136,19 @@ pub(crate) fn migrate_live_state(
         let _ = fs::remove_dir_all(&staging);
     }
     result
+}
+
+/// The legacy scheduler reserved capacity for `plan` runs only, so a
+/// reservation's owner is terminal exactly when its manifest names the
+/// `plan` job and its `details.state.progress.state` has reached
+/// `"terminal"`. Role-routing has no business reading another job's
+/// manifest layout, so it asks this fact of its caller instead.
+fn plan_run_manifest_is_terminal(manifest: &serde_json::Value) -> bool {
+    manifest.get("job").and_then(serde_json::Value::as_str) == Some("plan")
+        && manifest
+            .pointer("/details/state/progress/state")
+            .and_then(serde_json::Value::as_str)
+            == Some("terminal")
 }
 
 fn absolute_path(path: &Path) -> io::Result<PathBuf> {
