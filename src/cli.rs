@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use sha2::{Digest, Sha256};
+
 use crate::config;
 
 const USAGE: &str = "usage: undertake [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [plan prepare --repo <path> (--bead <id>|--artifact <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL>) --output-kind <spec|implementation-plan> [--max-plan-revisions <0..3>] [--require-second-opinion] [--config <path>]] [plan dispatch <run-id> [--config <path>]] [plan status <run-id> [--config <path>]] [plan cancel <run-id> [--config <path>]] [migrate state --from <legacy-root> --to <undertake-root> [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]] [supersede --repo <path> --source-run <run-id> --source-cycle <cycle-id> --source-bead <id> --source-commit <sha> --replacement-run <run-id> --replacement-cycle <cycle-id> --replacement-bead <id> --replacement-commit <sha>]";
@@ -963,6 +965,12 @@ fn run_adversarial_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     adversarial_dispatch_result_exit_code(&result)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one production-path function threads run creation, reviewer dispatch, and judge \
+              synthesis through a single durable run handle; splitting it would scatter that \
+              sequencing"
+)]
 fn execute_adversarial_dispatch<C, E>(
     cfg: &crate::config::Config,
     options: &AdversarialDispatchOptions,
@@ -1032,6 +1040,11 @@ where
     let timeout = std::time::Duration::from_secs(
         u64::from(cfg.budgets.item_wall_clock_mins).saturating_mul(60),
     );
+    // Pinned once for the whole run: every reviewer and judge attempt reads
+    // the same approved artifact, so this is the run-constant "input" for
+    // each attempt's invocation evidence (mirrors plan's `input_bytes`,
+    // which is likewise hashed once and reused across every plan stage).
+    let review_input_sha256 = format!("{:x}", Sha256::digest(&authorized.artifact_bytes));
     let reviewer_run =
         match crate::adversarial::run_reviewers(&authorized, &cfg.roster, exec, timeout, &calls) {
             Ok(run) => run,
@@ -1042,7 +1055,12 @@ where
                 return Err(error.to_string());
             }
         };
-    record_adversarial_reviewer_events(&mut run_artifacts, &reviewer_run)?;
+    record_adversarial_reviewer_events(
+        &mut run_artifacts,
+        &reviewer_run,
+        &cfg.roster,
+        &review_input_sha256,
+    )?;
 
     let judge_provider_snapshot = adversarial_provider_snapshot(cfg, musterroll);
     let adversarial_run =
@@ -1065,7 +1083,12 @@ where
                 return Err(error.to_string());
             }
         };
-    record_adversarial_terminal_events(&mut run_artifacts, &adversarial_run)?;
+    record_adversarial_terminal_events(
+        &mut run_artifacts,
+        &adversarial_run,
+        &cfg.roster,
+        &review_input_sha256,
+    )?;
     Ok(adversarial_run)
 }
 
@@ -1089,14 +1112,28 @@ fn adversarial_approved_profiles(plan: &crate::adversarial::AdversarialReviewPla
 fn record_adversarial_reviewer_events(
     run_artifacts: &mut crate::run::RunHandle,
     reviewer_run: &crate::adversarial::ReviewerRun,
+    roster: &[crate::config::RosterEntry],
+    input_sha256: &str,
 ) -> Result<(), String> {
     for (index, attempt) in reviewer_run.attempts.iter().enumerate() {
+        let execution = adversarial_execution_for(roster, &attempt.model)?;
         run_artifacts
             .append_event(
                 crate::run::EventKind::AttemptStarted,
                 crate::run::EventInput {
                     profile_id: Some(attempt.model.clone()),
                     outcome: Some(adversarial_reviewer_attempt_kind(attempt.kind).to_string()),
+                    invocation: Some(crate::run::InvocationEvidence {
+                        stage: "reviewer".to_string(),
+                        slot: u32::try_from(attempt.slot).unwrap_or(u32::MAX),
+                        attempt: adversarial_reviewer_attempt_number(attempt.kind),
+                        execution,
+                        input_sha256: input_sha256.to_string(),
+                        output_sha256: None,
+                        duration_ms: Some(attempt.duration_ms),
+                        tokens: None,
+                        retry_of: None,
+                    }),
                     ..crate::run::EventInput::default()
                 },
             )
@@ -1130,14 +1167,28 @@ fn record_adversarial_reviewer_events(
 fn record_adversarial_terminal_events(
     run_artifacts: &mut crate::run::RunHandle,
     adversarial_run: &crate::adversarial::AdversarialRun,
+    roster: &[crate::config::RosterEntry],
+    input_sha256: &str,
 ) -> Result<(), String> {
     if let Some(attempt) = adversarial_run.judge_attempt.as_ref() {
+        let execution = adversarial_execution_for(roster, &attempt.model)?;
         run_artifacts
             .append_event(
                 crate::run::EventKind::AttemptStarted,
                 crate::run::EventInput {
                     profile_id: Some(attempt.model.clone()),
                     outcome: Some(adversarial_judge_attempt_kind(attempt.kind).to_string()),
+                    invocation: Some(crate::run::InvocationEvidence {
+                        stage: "judge".to_string(),
+                        slot: 0,
+                        attempt: adversarial_judge_attempt_number(attempt.kind),
+                        execution,
+                        input_sha256: input_sha256.to_string(),
+                        output_sha256: None,
+                        duration_ms: Some(attempt.duration_ms),
+                        tokens: None,
+                        retry_of: None,
+                    }),
                     ..crate::run::EventInput::default()
                 },
             )
@@ -1224,6 +1275,50 @@ fn adversarial_reviewer_attempt_kind(
         crate::adversarial::ReviewerAttemptKind::Repair => "repair",
         crate::adversarial::ReviewerAttemptKind::Fallback => "fallback",
     }
+}
+
+/// Attempt number within a reviewer slot's chain: 1 for the initial call,
+/// 2 for whichever retry follows (schema repair or provider fallback —
+/// they never both occur for the same slot). Mirrors `adversarial.rs`'s own
+/// `attempt-{N}.out` log naming for the same attempt.
+const fn adversarial_reviewer_attempt_number(kind: crate::adversarial::ReviewerAttemptKind) -> u32 {
+    match kind {
+        crate::adversarial::ReviewerAttemptKind::Initial => 1,
+        crate::adversarial::ReviewerAttemptKind::Repair
+        | crate::adversarial::ReviewerAttemptKind::Fallback => 2,
+    }
+}
+
+/// Attempt number within the judge's chain: 1 for the primary judge, 2 for
+/// its fallback.
+const fn adversarial_judge_attempt_number(kind: crate::adversarial::JudgeAttemptKind) -> u32 {
+    match kind {
+        crate::adversarial::JudgeAttemptKind::Primary => 1,
+        crate::adversarial::JudgeAttemptKind::Fallback => 2,
+    }
+}
+
+/// Builds the pinned dispatch identity for one adversarial attempt from its
+/// roster entry. `adversarial.rs`'s legacy static roster has no
+/// Musterroll-style `availability_key`/`execution_key` pair, so both are
+/// derived from the same fields the roster already carries: provider
+/// identity doubles as the availability key (this roster has no separate
+/// availability grouping), and the dispatch id — already the roster's
+/// unique exact-execution identity — stands in for the execution key.
+fn adversarial_execution_for(
+    roster: &[crate::config::RosterEntry],
+    profile_id: &str,
+) -> Result<crate::run::ApprovedExecution, String> {
+    let entry = roster
+        .iter()
+        .find(|entry| entry.name == profile_id)
+        .ok_or_else(|| format!("no roster entry for adversarial profile {profile_id:?}"))?;
+    Ok(crate::run::ApprovedExecution {
+        profile_id: entry.name.clone(),
+        provider_id: entry.provider.clone(),
+        availability_key: entry.provider.clone(),
+        execution_key: entry.dispatch_id.clone(),
+    })
 }
 
 fn adversarial_reviewer_outcome(outcome: &crate::adversarial::ReviewerAttemptOutcome) -> String {
@@ -2848,6 +2943,11 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end regression keeps mutation-sentinel, manifest, and event assertions \
+                  (including the new invocation-evidence checks) together against one real dispatch"
+    )]
     fn adversarial_successful_dispatch_keeps_all_mutation_sentinels_untouched() {
         let fixture = AdversarialCliFixture::new("cli-no-mutation");
         let sentinels = fixture.seed_mutation_sentinels();
@@ -2929,6 +3029,31 @@ mod tests {
             events.last().map(|event| event.kind),
             Some(crate::run::EventKind::RunFinished)
         );
+        let started = events
+            .iter()
+            .filter(|event| event.kind == crate::run::EventKind::AttemptStarted)
+            .collect::<Vec<_>>();
+        assert_eq!(started.len(), 3, "two reviewers plus one judge");
+        assert!(
+            started
+                .iter()
+                .all(|event| event.invocation.is_some()),
+            "every review AttemptStarted must attach generic invocation evidence"
+        );
+        let stages = started
+            .iter()
+            .filter_map(|event| event.invocation.as_ref())
+            .map(|evidence| evidence.stage.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(stages, vec!["reviewer", "reviewer", "judge"]);
+        assert!(started.iter().all(|event| {
+            let evidence = event.invocation.as_ref().expect("invocation");
+            evidence.input_sha256.len() == 64
+                && evidence.output_sha256.is_none()
+                && !evidence.execution.profile_id.is_empty()
+                && !evidence.execution.provider_id.is_empty()
+                && evidence.retry_of.is_none()
+        }));
     }
 
     #[test]

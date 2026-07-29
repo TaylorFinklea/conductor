@@ -1026,10 +1026,7 @@ fn reservation_capacity_is_active(
             .iter()
             .rev()
             .find(|event| {
-                event
-                    .plan_invocation
-                    .as_ref()
-                    .is_some_and(|evidence| evidence.stage == stage)
+                event_plan_stage_attempt(event).is_some_and(|(evt_stage, _)| evt_stage == stage)
             })
             .map(|event| event.kind),
         Some(crate::run::EventKind::AttemptFinished)
@@ -1094,10 +1091,7 @@ fn reviewer_reservation_was_bound(
 ) -> bool {
     reservation_is_current_stage(reservation, owner, stage)
         || owner.events.iter().any(|event| {
-            event
-                .plan_invocation
-                .as_ref()
-                .is_some_and(|evidence| evidence.stage == stage)
+            event_plan_stage_attempt(event).is_some_and(|(evt_stage, _)| evt_stage == stage)
         })
 }
 
@@ -2503,15 +2497,16 @@ fn append_plan_invocation(
         crate::run::EventInput {
             profile_id: Some(execution.profile_id.clone()),
             outcome: Some(outcome.to_string()),
-            plan_invocation: Some(crate::run::PlanInvocationEvidence {
-                role: "plan".to_string(),
-                stage,
+            invocation: Some(crate::run::InvocationEvidence {
+                stage: plan_stage_id(stage).to_string(),
+                slot: 0,
+                attempt: u32::from(attempt),
                 execution: execution.clone(),
                 input_sha256: input_sha256.clone(),
                 output_sha256: output_sha256.clone(),
-                attempt,
                 duration_ms: None,
                 tokens: None,
+                retry_of: None,
             }),
             ..crate::run::EventInput::default()
         },
@@ -2566,6 +2561,44 @@ fn plan_stage_label(stage: crate::run::PlanStage) -> &'static str {
         crate::run::PlanStage::PeerReview => "peer-review",
         crate::run::PlanStage::SecondOpinion => "second-opinion",
     }
+}
+
+/// `Snake_case` stage id written into the generic
+/// [`crate::run::InvocationEvidence::stage`] — distinct from
+/// [`plan_stage_label`]'s hyphenated ledger spelling.
+const fn plan_stage_id(stage: crate::run::PlanStage) -> &'static str {
+    match stage {
+        crate::run::PlanStage::Planner => "planner",
+        crate::run::PlanStage::PeerReview => "peer_review",
+        crate::run::PlanStage::SecondOpinion => "second_opinion",
+    }
+}
+
+/// Inverse of [`plan_stage_id`].
+fn plan_stage_from_id(id: &str) -> Option<crate::run::PlanStage> {
+    match id {
+        "planner" => Some(crate::run::PlanStage::Planner),
+        "peer_review" => Some(crate::run::PlanStage::PeerReview),
+        "second_opinion" => Some(crate::run::PlanStage::SecondOpinion),
+        _ => None,
+    }
+}
+
+/// Stage and attempt for one event's plan invocation evidence, read
+/// compatibly across the legacy `plan_invocation` (`@2`) and the generic
+/// `invocation` (`@3`) fields. `@3` plan writers populate `invocation`
+/// only; historical journals carry the same evidence under
+/// `plan_invocation`. Exactly one is ever populated for a given event, so
+/// this checks `plan_invocation` first only because it is the one that is
+/// `Some` exactly on those historical events.
+fn event_plan_stage_attempt(event: &crate::run::RunEvent) -> Option<(crate::run::PlanStage, u8)> {
+    if let Some(evidence) = &event.plan_invocation {
+        return Some((evidence.stage, evidence.attempt));
+    }
+    let evidence = event.invocation.as_ref()?;
+    let stage = plan_stage_from_id(&evidence.stage)?;
+    let attempt = u8::try_from(evidence.attempt).ok()?;
+    Some((stage, attempt))
 }
 
 fn plan_artifact_bytes(
@@ -2784,11 +2817,9 @@ fn plan_cancel_mode(run: &crate::run::RunHandle) -> Result<PlanCancelMode, Strin
     let events =
         crate::run::read_events(&run.events_path()).map_err(|error| format!("plan events: {error}"))?;
     let latest = events.iter().rev().find_map(|event| {
-        event
-            .plan_invocation
-            .as_ref()
-            .filter(|evidence| evidence.stage == crate::run::PlanStage::Planner)
-            .map(|evidence| (event, evidence))
+        event_plan_stage_attempt(event)
+            .filter(|(stage, _)| *stage == crate::run::PlanStage::Planner)
+            .map(|(_, attempt)| (event, attempt))
     });
     if matches!(
         latest,
@@ -2798,10 +2829,10 @@ fn plan_cancel_mode(run: &crate::run::RunHandle) -> Result<PlanCancelMode, Strin
                 outcome: Some(outcome),
                 ..
             },
-            evidence,
+            attempt,
         )) if outcome == "failed"
             && planner_attempt > 0
-            && evidence.attempt == planner_attempt
+            && attempt == planner_attempt
     ) {
         Ok(PlanCancelMode::FailedAuthoring)
     } else {
@@ -4029,21 +4060,17 @@ enabled = true
         let invocations = events
             .iter()
             .filter(|event| event.kind == crate::run::EventKind::AttemptFinished)
-            .filter_map(|event| event.plan_invocation.as_ref())
+            .filter_map(|event| event.invocation.as_ref())
             .collect::<Vec<_>>();
         assert_eq!(
             invocations
                 .iter()
-                .map(|evidence| evidence.stage)
+                .map(|evidence| evidence.stage.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                crate::run::PlanStage::Planner,
-                crate::run::PlanStage::PeerReview,
-                crate::run::PlanStage::SecondOpinion,
-            ]
+            vec!["planner", "peer_review", "second_opinion"]
         );
         assert!(invocations.iter().all(|evidence| {
-            evidence.role == "plan"
+            evidence.slot == 0
                 && evidence.input_sha256.len() == 64
                 && evidence
                     .output_sha256
@@ -4051,6 +4078,31 @@ enabled = true
                     .is_some_and(|digest| digest.len() == 64)
                 && evidence.attempt == 1
         }));
+        // Every stage's `AttemptStarted` from `append_plan_invocation`
+        // attaches evidence. The planner stage's fresh-authoring dispatch
+        // additionally emits one binding-only `AttemptStarted` from
+        // `RunHandle::start_plan_authoring` (durably committing the
+        // selected author before the invocation itself), which must NOT
+        // attach it: that event exists to bind identity, not to record a
+        // model call.
+        let started = events
+            .iter()
+            .filter(|event| event.kind == crate::run::EventKind::AttemptStarted)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            started.len(),
+            4,
+            "one binding-only planner-authoring event plus one evidence-bearing start per stage"
+        );
+        let (with_invocation, without): (Vec<&crate::run::RunEvent>, Vec<&crate::run::RunEvent>) =
+            started.iter().copied().partition(|event| event.invocation.is_some());
+        assert_eq!(with_invocation.len(), 3, "one evidence-bearing start per stage");
+        assert_eq!(
+            without.len(),
+            1,
+            "exactly the planner-authoring binding event"
+        );
+        assert_eq!(without[0].outcome.as_deref(), Some("planner_authoring"));
     }
 
     fn assert_malformed_peer_repair_ledger(paths: &PlanJobPaths) {
@@ -4561,7 +4613,7 @@ enabled = true
             let events = crate::run::read_events(&run.events_path()).expect("events");
             let route = events
                 .iter()
-                .filter_map(|event| event.plan_invocation.as_ref())
+                .filter_map(|event| event.invocation.as_ref())
                 .map(|evidence| evidence.execution.profile_id.as_str())
                 .collect::<Vec<_>>();
             assert_eq!(
@@ -5550,9 +5602,9 @@ enabled = true
                 event.kind == crate::run::EventKind::AttemptFinished
                     && event.outcome.as_deref() == Some("returned")
                     && event
-                        .plan_invocation
+                        .invocation
                         .as_ref()
-                        .is_some_and(|evidence| evidence.stage == crate::run::PlanStage::PeerReview)
+                        .is_some_and(|evidence| evidence.stage == "peer_review")
             }),
             "the unavailable bound peer must not be replaced or produce a successful review"
         );
@@ -5623,9 +5675,10 @@ enabled = true
                 .any(|event| {
                     event.kind == crate::run::EventKind::AttemptFinished
                         && event.outcome.as_deref() == Some("returned")
-                        && event.plan_invocation.as_ref().is_some_and(|evidence| {
-                            evidence.stage == crate::run::PlanStage::SecondOpinion
-                        })
+                        && event
+                            .invocation
+                            .as_ref()
+                            .is_some_and(|evidence| evidence.stage == "second_opinion")
                 }),
             "the exhausted unbound second opinion must not produce a successful invocation"
         );

@@ -1,0 +1,45 @@
+{
+  "schema": "undertake/run@2",
+  "run_id": "run-work-20260716T120000.000000000-p15606-000000",
+  "job": "work",
+  "target": {
+    "repo": "/repo/undertake",
+    "bead": "undertake-run-contract"
+  },
+  "details": {
+    "job": "work",
+    "state": null
+  },
+  "created_at": "2026-07-16T12:00:00+00:00",
+  "updated_at": "2026-07-29T00:57:25.985478+00:00",
+  "approved_profiles": {
+    "profiles": [
+      "claude-sonnet-5",
+      "gpt-5.6-luna"
+    ]
+  },
+  "musterroll_roster_artifact": {
+    "path": "/home/.config/musterroll/roster.toml",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "limits": {
+    "item_wall_clock_mins": 45,
+    "max_attempts": 3
+  },
+  "verifier": {
+    "mechanical": "cargo test",
+    "qualitative": "lead-review"
+  },
+  "artifacts": [
+    {
+      "path": "approval.json",
+      "sha256": "3a0f0adb413c15a5608797b162c8bdca763410d3109a6fdb4a362178120bd18d"
+    },
+    {
+      "path": "/home/.config/musterroll/roster.toml",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "lifecycle": "finished",
+  "outcome": "verified"
+}

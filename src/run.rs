@@ -21,8 +21,14 @@ use sha2::{Digest, Sha256};
 
 /// Schema tag stamped on every manifest written by this module.
 pub(crate) const RUN_SCHEMA: &str = "undertake/run@2";
-/// Schema tag stamped on every event line written by this module.
+/// Schema tag historically stamped on every event line written by this
+/// module. Retained as the read-compatibility value: `read_events` still
+/// accepts it, but no code path writes it anymore.
 pub(crate) const EVENT_SCHEMA: &str = "undertake/event@2";
+/// Schema tag stamped on every event line written by this module. Adds the
+/// generic `invocation` evidence field; `@2` journals remain readable via
+/// `read_events`'s dual-schema check.
+pub(crate) const EVENT_SCHEMA_V3: &str = "undertake/event@3";
 const TERMINAL_TRANSITION_PATH: &str = "artifacts/terminal-transition.json";
 const WORKER_COMMIT_HOOK_REF_PATH: &str = "worker-commit-hook";
 
@@ -937,6 +943,13 @@ impl RunManifest {
 /// Typed evidence for one plan backend invocation. Start and finish events
 /// share the immutable identity and input digest; the finish event adds the
 /// observed output digest, duration, and any harness-reported token count.
+///
+/// Read-compatibility only as of `undertake/event@3`: historical `@2`
+/// journals carry this shape under [`RunEvent::plan_invocation`], but no
+/// code path writes it anymore — new writes (plan included) use the
+/// generic [`InvocationEvidence`] under [`RunEvent::invocation`] instead.
+/// Kept byte-for-byte so those journals keep deserializing under
+/// `#[serde(deny_unknown_fields)]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PlanInvocationEvidence {
@@ -950,7 +963,28 @@ pub(crate) struct PlanInvocationEvidence {
     pub(crate) tokens: Option<u64>,
 }
 
-/// `undertake/event@2` — one append-only event line.
+/// Generic per-invocation evidence for one attempt, shared by every job
+/// (work, review, consult, plan). Introduced in `undertake/event@3` as the
+/// job-agnostic replacement for [`PlanInvocationEvidence`], which stays
+/// plan-shaped and read-only. `stage` is a `snake_case` stage id rather
+/// than a job-specific enum so no job's evidence type leaks into `run.rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InvocationEvidence {
+    pub(crate) stage: String,
+    pub(crate) slot: u32,
+    pub(crate) attempt: u32,
+    pub(crate) execution: ApprovedExecution,
+    pub(crate) input_sha256: String,
+    pub(crate) output_sha256: Option<String>,
+    pub(crate) duration_ms: Option<u64>,
+    pub(crate) tokens: Option<u64>,
+    /// `event_id` of the attempt this one retries; `None` on a first
+    /// attempt.
+    pub(crate) retry_of: Option<String>,
+}
+
+/// `undertake/event@2` / `undertake/event@3` — one append-only event line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunEvent {
@@ -970,8 +1004,15 @@ pub(crate) struct RunEvent {
     pub(crate) outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) provider_limit: Option<RuntimeLimitEvidence>,
+    /// `@2` read-compatibility only; new writes always leave this `None`.
+    /// See [`PlanInvocationEvidence`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) plan_invocation: Option<PlanInvocationEvidence>,
+    /// Generic per-invocation evidence, `@3` and later. `#[serde(default)]`
+    /// is what lets `@2` lines, which never had this key, keep
+    /// deserializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) invocation: Option<InvocationEvidence>,
 }
 
 /// Fields pinned into a new run's manifest at creation.
@@ -1003,15 +1044,17 @@ pub(crate) struct NewPlanRun {
     pub(crate) input_bytes: Vec<u8>,
 }
 
-/// Fields for one `undertake/event@2` row; `run_id`, `seq`, `ts`, `job`, and
-/// `target` are filled in by the owning [`RunHandle`].
+/// Fields for one event row; `run_id`, `seq`, `ts`, `job`, and `target` are
+/// filled in by the owning [`RunHandle`]. Never carries `plan_invocation` —
+/// that field is `@2` read-compatibility only, so [`RunEvent`] always
+/// writes it as `None`; use `invocation` instead.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EventInput {
     pub(crate) profile_id: Option<String>,
     pub(crate) artifact_refs: Vec<ArtifactRef>,
     pub(crate) outcome: Option<String>,
     pub(crate) provider_limit: Option<RuntimeLimitEvidence>,
-    pub(crate) plan_invocation: Option<PlanInvocationEvidence>,
+    pub(crate) invocation: Option<InvocationEvidence>,
 }
 
 /// Handle to one created (or reopened) run directory; owns the manifest and
@@ -2221,7 +2264,7 @@ impl RunHandle {
         }
         let seq = self.next_seq;
         let event = RunEvent {
-            schema: EVENT_SCHEMA.to_string(),
+            schema: EVENT_SCHEMA_V3.to_string(),
             event_id: format!("{}-{seq:06}", self.manifest.run_id),
             run_id: self.manifest.run_id.clone(),
             seq,
@@ -2233,7 +2276,8 @@ impl RunHandle {
             artifact_refs: input.artifact_refs,
             outcome: input.outcome.clone(),
             provider_limit: input.provider_limit,
-            plan_invocation: input.plan_invocation,
+            plan_invocation: None,
+            invocation: input.invocation,
         };
         append_event_line(&self.events_path(), &event)?;
         self.next_seq += 1;
@@ -2274,7 +2318,7 @@ impl RunHandle {
                 artifact_refs,
                 profile_id: None,
                 provider_limit: None,
-                plan_invocation: None,
+                invocation: None,
             },
         )
     }
@@ -3226,6 +3270,22 @@ fn check_schema(value: &serde_json::Value, expected: &str, path: &Path) -> Resul
     Ok(())
 }
 
+/// Event-log-only schema gate: unlike [`check_schema`] (still an exact
+/// match, e.g. for the manifest), this accepts either the historical `@2`
+/// value or the current `@3` value, since `read_events` must keep opening
+/// journals written by the prior binary.
+fn check_event_schema(value: &serde_json::Value, path: &Path) -> Result<()> {
+    let schema = value.get("schema").and_then(serde_json::Value::as_str);
+    if schema != Some(EVENT_SCHEMA) && schema != Some(EVENT_SCHEMA_V3) {
+        return Err(RunError::new(format!(
+            "unknown schema {:?} in {}, expected {EVENT_SCHEMA:?} or {EVENT_SCHEMA_V3:?}",
+            schema.unwrap_or("<missing>"),
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Reads and validates every line of `events.jsonl`, rejecting an unknown
 /// schema or a malformed (e.g. partially written) line. Fails closed on the
 /// first bad line rather than silently dropping it.
@@ -3261,7 +3321,7 @@ pub(crate) fn read_events(path: &Path) -> Result<Vec<RunEvent>> {
                 idx + 1
             ))
         })?;
-        check_schema(&value, EVENT_SCHEMA, path)
+        check_event_schema(&value, path)
             .map_err(|e| RunError::new(format!("{e} (line {})", idx + 1)))?;
         let event: RunEvent = serde_json::from_value(value).map_err(|e| {
             RunError::new(format!(
@@ -3855,6 +3915,128 @@ mod tests {
         }
     }
 
+    /// Real `undertake/event@2` bytes, captured by running the prior
+    /// (pre-`@3`) binary's own `RunHandle::create_at` + `append_event_at` +
+    /// `finish` -- not synthesized from the code below, since that would
+    /// prove nothing about the actual historical wire shape. Includes two
+    /// events with real `plan_invocation` evidence, mirroring what plan
+    /// wrote before this bead switched it to the generic `invocation`
+    /// field.
+    const CAPTURED_EVENTS_V2: &str = include_str!("../tests/fixtures/run-events-v2.jsonl");
+    /// The matching manifest for [`CAPTURED_EVENTS_V2`], captured from the
+    /// same run.
+    const CAPTURED_MANIFEST_V2: &str = include_str!("../tests/fixtures/run-manifest-v2.json");
+    /// The `approval.json` artifact the first event's `artifact_refs`
+    /// pins by path and sha256; `read_events` fails closed if a
+    /// referenced local artifact is missing, so the fixture directory
+    /// needs it too.
+    const CAPTURED_APPROVAL_V2: &str = include_str!("../tests/fixtures/run-approval-v2.json");
+    const CAPTURED_V2_RUN_ID: &str = "run-work-20260716T120000.000000000-p15606-000000";
+
+    #[test]
+    fn v2_fixture_journal_opens_reads_and_resumes_under_the_new_binary() {
+        // read_events alone: every line keeps its historical `@2` schema
+        // tag, and the new `invocation` field the `@3` writer added
+        // defaults to `None` via `#[serde(default)]` rather than tripping
+        // `deny_unknown_fields` on a key that was never present.
+        let temp = TempDir::new("v2-fixture-resume");
+        let run_dir = runs_dir(temp.path()).join(CAPTURED_V2_RUN_ID);
+        std::fs::create_dir_all(&run_dir).expect("mkdir fixture run dir");
+        std::fs::write(run_dir.join("manifest.json"), CAPTURED_MANIFEST_V2)
+            .expect("write fixture manifest");
+        std::fs::write(run_dir.join("events.jsonl"), CAPTURED_EVENTS_V2)
+            .expect("write fixture events");
+        std::fs::write(run_dir.join("approval.json"), CAPTURED_APPROVAL_V2)
+            .expect("write fixture approval");
+
+        let events = read_events(&run_dir.join("events.jsonl")).expect("read v2 fixture events");
+        assert_eq!(events.len(), 7);
+        assert!(events.iter().all(|event| event.schema == EVENT_SCHEMA));
+        assert!(events.iter().all(|event| event.invocation.is_none()));
+        let plan_evidence = events
+            .iter()
+            .filter_map(|event| event.plan_invocation.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(plan_evidence.len(), 2, "the two plan-shaped fixture events");
+        assert!(plan_evidence
+            .iter()
+            .all(|evidence| evidence.stage == PlanStage::Planner && evidence.attempt == 1));
+
+        // Full resume: `RunHandle::open` reads manifest + events together
+        // and must accept this run exactly as the prior binary left it --
+        // finished, with its pinned outcome.
+        let handle = RunHandle::open(temp.path(), CAPTURED_V2_RUN_ID).expect("open v2 fixture run");
+        let manifest = read_manifest(&handle.manifest_path()).expect("read reopened manifest");
+        assert_eq!(manifest.lifecycle, RunLifecycle::Finished);
+        assert_eq!(manifest.outcome.as_deref(), Some("verified"));
+    }
+
+    /// Every production `EventKind::AttemptStarted` emitter in the
+    /// codebase, found by scanning each file's own *production* source
+    /// (everything before its `mod tests {` boundary, so test-only
+    /// call sites -- e.g. `plan_job.rs`'s fixtures that invoke
+    /// `append_plan_invocation` directly to hand-build a scenario -- don't
+    /// inflate the count) for the literal call-site pattern
+    /// `EventKind::AttemptStarted,`. The trailing comma is what
+    /// distinguishes an emitter's first positional argument from a `==`
+    /// comparison in a filter or reader, which is never followed by a
+    /// comma at that position. A new emitter anywhere changes one of these
+    /// counts and fails this test, forcing a deliberate decision about
+    /// whether it attaches `invocation` evidence -- so budget
+    /// reconstruction (built on that evidence) cannot silently regress.
+    /// This test only proves the *count* of call sites; whether each one
+    /// attaches evidence is proven separately by the behavioral tests
+    /// cited alongside each entry below.
+    ///
+    /// The needle is assembled at runtime, split across two literals, so
+    /// this test's own source (included below via `include_str!("run.rs")`
+    /// to scan itself) does not match itself.
+    #[test]
+    fn every_attempt_started_emitter_is_accounted_for() {
+        let needle = format!("{}{}", "EventKind::AttemptStarted", ",");
+        let production_source = |source: &str| -> String {
+            source
+                .split_once("\nmod tests {")
+                .map_or(source, |(production, _)| production)
+                .to_string()
+        };
+        let inventory: [(&str, &str, usize); 5] = [
+            // review: reviewer + judge AttemptStarted, both attach
+            // invocation. Verified by
+            // `cli::tests::adversarial_successful_dispatch_keeps_all_mutation_sentinels_untouched`.
+            ("cli.rs", include_str!("cli.rs"), 2),
+            // work: the single worker-chain AttemptStarted, attaches
+            // invocation. Verified by `dispatch_cycle::tests::e2e_sandbox`.
+            ("dispatch_cycle.rs", include_str!("dispatch_cycle.rs"), 1),
+            // The standalone `loop` kernel is `#[allow(dead_code)]` --
+            // not wired into any active CLI path yet ("activated by the
+            // next job-specific CLI cutover") -- so its single
+            // AttemptStarted never runs in production today and is
+            // correctly left unattached (`EventInput::default()`).
+            ("loop.rs", include_str!("loop.rs"), 1),
+            // plan: three call sites, all funneled through the single
+            // `append_plan_invocation` helper, all attach invocation.
+            // Verified by `plan_job::tests::assert_successful_plan_ledger_and_events`.
+            ("plan_job.rs", include_str!("plan_job.rs"), 3),
+            // run.rs itself: `start_plan_authoring` and
+            // `replace_plan_author_before_artifact` are deliberately
+            // binding-only and must NOT attach invocation. Verified by
+            // `plan_job::tests::assert_successful_plan_ledger_and_events`'s
+            // planner_authoring split-check (building an equivalent
+            // fixture here would duplicate plan_job.rs's whole dispatch
+            // harness).
+            ("run.rs", include_str!("run.rs"), 2),
+        ];
+        for (file, source, expected_total) in inventory {
+            let total = production_source(source).matches(&needle).count();
+            assert_eq!(
+                total, expected_total,
+                "{file}: production AttemptStarted emitter count changed -- update this \
+                 inventory and confirm the new site's invocation-attach decision"
+            );
+        }
+    }
+
     #[test]
     fn run_event_manifest_pins_target_job_profiles_roster_hash_limits_and_lifecycle() {
         let temp = TempDir::new("manifest-pins");
@@ -3937,7 +4119,7 @@ mod tests {
                 EventKind::RunFinished,
             ]
         );
-        assert!(events.iter().all(|e| e.schema == EVENT_SCHEMA));
+        assert!(events.iter().all(|e| e.schema == EVENT_SCHEMA_V3));
         let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6, 7]);
 

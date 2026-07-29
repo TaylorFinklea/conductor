@@ -6026,6 +6026,22 @@ where
                 EventInput {
                     profile_id: Some(roster.name.clone()),
                     outcome: Some(format!("running:{attempt_id}")),
+                    invocation: Some(crate::run::InvocationEvidence {
+                        stage: "work".to_string(),
+                        slot: 0,
+                        attempt: u32::try_from(next_attempt).unwrap_or(u32::MAX),
+                        execution: crate::run::ApprovedExecution {
+                            profile_id: roster.name.clone(),
+                            provider_id: roster.provider.clone(),
+                            availability_key: roster.provider.clone(),
+                            execution_key: roster.dispatch_id.clone(),
+                        },
+                        input_sha256: format!("{:x}", Sha256::digest(request.prompt.as_bytes())),
+                        output_sha256: None,
+                        duration_ms: None,
+                        tokens: None,
+                        retry_of: None,
+                    }),
                     ..EventInput::default()
                 },
             )
@@ -6216,7 +6232,7 @@ where
                                     "{outcome_label}; quarantine failed: {error}"
                                 )),
                                 provider_limit: provider_limit_evidence.clone(),
-                                plan_invocation: None,
+                                invocation: None,
                             },
                         )
                         .map_err(run_artifact_error)?;
@@ -6253,7 +6269,7 @@ where
                 artifact_refs,
                 outcome: Some(outcome_label),
                 provider_limit: provider_limit_evidence.clone(),
-                plan_invocation: None,
+                invocation: None,
             },
         ) {
             if worker_succeeded {
@@ -9424,6 +9440,22 @@ provider = "opencode-go"
                 .iter()
                 .any(|event| event.kind == EventKind::VerifyFinished)
         );
+        let started = events
+            .iter()
+            .filter(|event| event.kind == EventKind::AttemptStarted)
+            .collect::<Vec<_>>();
+        assert_eq!(started.len(), 1, "one worker attempt in this fixture");
+        let evidence = started[0]
+            .invocation
+            .as_ref()
+            .expect("work AttemptStarted must attach generic invocation evidence");
+        assert_eq!(evidence.stage, "work");
+        assert_eq!(evidence.slot, 0);
+        assert_eq!(evidence.attempt, 1);
+        assert_eq!(evidence.execution.profile_id, "fake-worker");
+        assert_eq!(evidence.input_sha256.len(), 64);
+        assert!(evidence.output_sha256.is_none());
+        assert!(evidence.retry_of.is_none());
     }
 
     #[test]
