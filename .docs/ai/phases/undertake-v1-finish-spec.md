@@ -174,9 +174,15 @@ retires (`undertake-core-consolidation-spec.md:489-490`). Draft v1 omitted this.
     crate, no `lib.rs` — `--bin undertake` is required, `--lib` will not find it). The
     `dispatch_cycle::tests::` substring matches every `#[test]` fn in the file's single
     flat `mod tests` block (`src/dispatch_cycle.rs:8238`–EOF) and nothing outside it.
-  - **Measured 2026-07-28**: 123 tests, `123 passed; 0 failed; 0 ignored` (729 filtered
-    out of the crate's 852 total). Confirmed via `#[test]` grep count in that line range
-    matching the `--list` count exactly.
+  - **The gate is "every test under the selector passes, and the count never shrinks
+    without explicit justification"** — *not* a fixed number. The corpus legitimately
+    grows as later phases add coverage to `dispatch_cycle`; it must never silently lose
+    tests, which is what the count guards against.
+  - **Measured 2026-07-28 at `f5e1c0a`**: 123 passing. **Re-measured at `c3488fa`: 126
+    passing**, and the +3 was traced to our own prep work — `moe` (`b88da79`), `47p`
+    (`5224787`), `gtgf` (`bf44828`), `8nth` (`ca03137`), and `44hc` (`1078a1f`) each
+    added tests to that module. Growth from added coverage is expected and fine.
+    Confirmed via `#[test]` grep count in that line range matching the `--list` count exactly.
   - This selector must pass unchanged (same 123, all green) before the legacy engine
     (`dispatch_cycle.rs`) may be deleted — that deletion is Phase 6.
 - Delete `roster_drift.rs` (1,017) and its `main.rs` mod declaration. Uncontroversially
