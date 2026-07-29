@@ -6233,6 +6233,7 @@ where
                                 )),
                                 provider_limit: provider_limit_evidence.clone(),
                                 invocation: None,
+                                terminal_verdict: None,
                             },
                         )
                         .map_err(run_artifact_error)?;
@@ -6270,6 +6271,7 @@ where
                 outcome: Some(outcome_label),
                 provider_limit: provider_limit_evidence.clone(),
                 invocation: None,
+                terminal_verdict: None,
             },
         ) {
             if worker_succeeded {

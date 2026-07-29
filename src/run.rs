@@ -984,6 +984,40 @@ pub(crate) struct InvocationEvidence {
     pub(crate) retry_of: Option<String>,
 }
 
+/// Generic, job-agnostic terminal-state discriminator carried on a
+/// `run_finished` event, `@3` and later. This is what makes reconciliation
+/// (see [`reconcile_terminal_manifest`]) able to reconstruct *any* job's
+/// terminal `RunDetails`, not just `work`'s: `outcome` is free text chosen
+/// per call site for human/Bead-facing display, and different call sites
+/// legitimately use different strings for the *same* structural verdict
+/// (`finish_plan_blocked` writes `"blocked"`, `cancel_prepared_plan` and
+/// `cancel_failed_authoring_plan` write `"canceled"`, and all three set the
+/// identical [`PlanTerminalVerdict::Blocked`]) — so reconciliation must
+/// never parse `outcome` as a discriminator. This enum is that
+/// discriminator instead, mirrored from the `Terminal` shape in
+/// `.docs/ai/phases/undertake-runner-contract.md`'s "`Terminal` — replaces
+/// `Completed | Failed`" section (which additionally carries a `reason` on
+/// `Blocked`/`NeedsInput`; that reason already lives in `outcome`, so it is
+/// not duplicated here). Every job maps its own verdict type onto this set;
+/// `plan`'s mapping is `Accepted -> Completed`, `Rejected -> Failed`,
+/// `Blocked -> Blocked`, `NeedsInput -> NeedsInput` (see
+/// [`plan_terminal_verdict_from_generic`]). `Canceled` is unused by `plan`
+/// today (its two "canceled" call sites are structurally `Blocked`) and is
+/// carried here only because the contract names it as part of the shared
+/// set; `work`, `review`, and `consult` do not populate this field yet —
+/// only `plan`'s `RunDetails` has verdict-shaped mutable state today, so
+/// [`reconcile_terminal_manifest`] requires it only for `plan`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TerminalVerdict {
+    Completed,
+    Failed,
+    Blocked,
+    NeedsInput,
+    Canceled,
+}
+
 /// `undertake/event@2` / `undertake/event@3` — one append-only event line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1013,6 +1047,10 @@ pub(crate) struct RunEvent {
     /// deserializing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) invocation: Option<InvocationEvidence>,
+    /// Generic terminal-state discriminator, `@3` and later; only ever
+    /// `Some` on a [`EventKind::RunFinished`] event. See [`TerminalVerdict`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_verdict: Option<TerminalVerdict>,
 }
 
 /// Fields pinned into a new run's manifest at creation.
@@ -1055,6 +1093,9 @@ pub(crate) struct EventInput {
     pub(crate) outcome: Option<String>,
     pub(crate) provider_limit: Option<RuntimeLimitEvidence>,
     pub(crate) invocation: Option<InvocationEvidence>,
+    /// See [`RunEvent::terminal_verdict`]; only meaningful on a
+    /// [`EventKind::RunFinished`] input, set via [`RunHandle::finish_with_verdict`].
+    pub(crate) terminal_verdict: Option<TerminalVerdict>,
 }
 
 /// Handle to one created (or reopened) run directory; owns the manifest and
@@ -1906,9 +1947,7 @@ impl RunHandle {
         self.plan_mut("blocking active plan")?.progress = PlanProgress::Terminal {
             verdict: PlanTerminalVerdict::Blocked,
         };
-        self.manifest.updated_at = Utc::now().to_rfc3339();
-        self.write_manifest()?;
-        self.finish("blocked")
+        self.finish_with_verdict("blocked", TerminalVerdict::Blocked, Vec::new())
     }
 
     /// Persists each author invocation before the harness starts, so a crash
@@ -1997,22 +2036,17 @@ impl RunHandle {
                 ));
             }
         };
-        if exhausted {
-            self.plan_mut("finishing exhausted plan revision")?.progress = PlanProgress::Terminal {
-                verdict: PlanTerminalVerdict::Rejected,
-            };
-        } else {
+        // The non-terminal `ReviewFinished` event is appended with progress
+        // still in its pre-verdict shape -- the mutation to a terminal (or
+        // `Revising`/`AwaitingSecondOpinion`) shape happens only after, so a
+        // crash between the two event appends below never lets a terminal
+        // `PlanProgress` reach disk ahead of the `run_finished` event that
+        // must accompany it (see `finish_with_verdict`'s doc comment).
+        if !exhausted {
             self.plan_mut("recording plan peer verdict")?
                 .progress
                 .record_peer_verdict(peer.clone(), verdict)?;
-            if matches!(verdict, PeerVerdict::Approve) && !require_second_opinion {
-                self.plan_mut("accepting implementation plan")?.progress = PlanProgress::Terminal {
-                    verdict: PlanTerminalVerdict::Accepted,
-                };
-            }
         }
-        self.manifest.updated_at = Utc::now().to_rfc3339();
-        self.write_manifest()?;
         self.append_event(
             EventKind::ReviewFinished,
             EventInput {
@@ -2028,9 +2062,15 @@ impl RunHandle {
             },
         )?;
         if exhausted {
-            self.finish_with_artifacts("rejected", vec![artifact])
+            self.plan_mut("finishing exhausted plan revision")?.progress = PlanProgress::Terminal {
+                verdict: PlanTerminalVerdict::Rejected,
+            };
+            self.finish_with_verdict("rejected", TerminalVerdict::Failed, vec![artifact])
         } else if matches!(verdict, PeerVerdict::Approve) && !require_second_opinion {
-            self.finish_with_artifacts("accepted", vec![artifact])
+            self.plan_mut("accepting implementation plan")?.progress = PlanProgress::Terminal {
+                verdict: PlanTerminalVerdict::Accepted,
+            };
+            self.finish_with_verdict("accepted", TerminalVerdict::Completed, vec![artifact])
         } else {
             Ok(())
         }
@@ -2088,7 +2128,7 @@ impl RunHandle {
     /// never re-opens the peer/revision loop.
     pub(crate) fn record_plan_second_opinion(
         &mut self,
-        second: ApprovedExecution,
+        second: &ApprovedExecution,
         verdict: SecondOpinionVerdict,
     ) -> Result<()> {
         let PlanProgress::AwaitingSecondOpinion {
@@ -2114,15 +2154,16 @@ impl RunHandle {
                 "second opinion must use a pairwise-distinct provider",
             ));
         }
-        self.plan_mut("recording plan second opinion")?
-            .progress
-            .record_second_opinion(&second, verdict)?;
-        self.manifest.updated_at = Utc::now().to_rfc3339();
-        self.write_manifest()?;
+        // Append the non-terminal `ReviewFinished` event before mutating
+        // progress to its terminal shape (`record_second_opinion` always
+        // lands on `PlanProgress::Terminal`, unlike the peer-verdict path),
+        // so a crash between the two event appends below never lets that
+        // terminal mutation reach disk ahead of the `run_finished` event
+        // that must accompany it (see `finish_with_verdict`'s doc comment).
         self.append_event(
             EventKind::ReviewFinished,
             EventInput {
-                profile_id: Some(second.profile_id),
+                profile_id: Some(second.profile_id.clone()),
                 artifact_refs: vec![artifact.clone()],
                 outcome: Some(match verdict {
                     SecondOpinionVerdict::Accept => "accepted".to_string(),
@@ -2131,10 +2172,17 @@ impl RunHandle {
                 ..EventInput::default()
             },
         )?;
-        self.finish_with_artifacts(
+        self.plan_mut("recording plan second opinion")?
+            .progress
+            .record_second_opinion(second, verdict)?;
+        self.finish_with_verdict(
             match verdict {
                 SecondOpinionVerdict::Accept => "accepted",
                 SecondOpinionVerdict::Reject => "rejected",
+            },
+            match verdict {
+                SecondOpinionVerdict::Accept => TerminalVerdict::Completed,
+                SecondOpinionVerdict::Reject => TerminalVerdict::Failed,
             },
             vec![artifact],
         )
@@ -2154,9 +2202,7 @@ impl RunHandle {
         self.plan_mut("canceling plan")?.progress = PlanProgress::Terminal {
             verdict: PlanTerminalVerdict::Blocked,
         };
-        self.manifest.updated_at = Utc::now().to_rfc3339();
-        self.write_manifest()?;
-        self.finish("canceled")
+        self.finish_with_verdict("canceled", TerminalVerdict::Blocked, Vec::new())
     }
 
     pub(crate) fn cancel_failed_authoring_plan(&mut self) -> Result<()> {
@@ -2169,9 +2215,7 @@ impl RunHandle {
             PlanProgress::Terminal {
                 verdict: PlanTerminalVerdict::Blocked,
             };
-        self.manifest.updated_at = Utc::now().to_rfc3339();
-        self.write_manifest()?;
-        self.finish("canceled")
+        self.finish_with_verdict("canceled", TerminalVerdict::Blocked, Vec::new())
     }
 
     /// Marks a plan document with unresolved author questions as terminal
@@ -2185,9 +2229,7 @@ impl RunHandle {
         self.plan_mut("finishing plan needs input")?.progress = PlanProgress::Terminal {
             verdict: PlanTerminalVerdict::NeedsInput,
         };
-        self.manifest.updated_at = Utc::now().to_rfc3339();
-        self.write_manifest()?;
-        self.finish_with_artifacts("needs_input", vec![artifact])
+        self.finish_with_verdict("needs_input", TerminalVerdict::NeedsInput, vec![artifact])
     }
 
     /// Records a policy-approved fresh budget before resuming a verifier or
@@ -2262,6 +2304,11 @@ impl RunHandle {
         for artifact in &input.artifact_refs {
             validate_artifact_ref(artifact, "event artifact")?;
         }
+        if input.terminal_verdict.is_some() && !matches!(kind, EventKind::RunFinished) {
+            return Err(RunError::new(
+                "terminal verdict is only legal on a run_finished event",
+            ));
+        }
         let seq = self.next_seq;
         let event = RunEvent {
             schema: EVENT_SCHEMA_V3.to_string(),
@@ -2278,6 +2325,7 @@ impl RunHandle {
             provider_limit: input.provider_limit,
             plan_invocation: None,
             invocation: input.invocation,
+            terminal_verdict: input.terminal_verdict,
         };
         append_event_line(&self.events_path(), &event)?;
         self.next_seq += 1;
@@ -2308,6 +2356,57 @@ impl RunHandle {
         outcome: impl Into<String>,
         artifact_refs: Vec<ArtifactRef>,
     ) -> Result<()> {
+        self.finish_terminal(outcome, None, artifact_refs)
+    }
+
+    /// Same terminal write as [`Self::finish_with_artifacts`], additionally
+    /// pinning the generic [`TerminalVerdict`] a job needs to reconstruct
+    /// its own `RunDetails` terminal shape from the journal alone (see
+    /// [`reconcile_terminal_manifest`]). Use this instead of
+    /// `finish`/`finish_with_artifacts` whenever the caller's `RunDetails`
+    /// variant carries verdict-shaped mutable state — today, `plan` only.
+    pub(crate) fn finish_with_verdict(
+        &mut self,
+        outcome: impl Into<String>,
+        terminal_verdict: TerminalVerdict,
+        artifact_refs: Vec<ArtifactRef>,
+    ) -> Result<()> {
+        self.finish_terminal(outcome, Some(terminal_verdict), artifact_refs)
+    }
+
+    /// The uniform terminal write order for every job (work, review,
+    /// consult, plan): the durable `run_finished` journal event is appended
+    /// FIRST (`append_event` -> `append_event_line`, fsynced), and only
+    /// then does the single atomic `write_manifest()` at the end of
+    /// `append_event_at` persist the terminal projection — lifecycle,
+    /// outcome, and (via the in-memory mutation a caller made just before
+    /// calling this) any job-specific terminal state, e.g.
+    /// `PlanProgress::Terminal`. That "just before calling this" ordering is
+    /// load-bearing: a caller must mutate its own `RunDetails` to its
+    /// terminal shape no earlier than immediately before invoking
+    /// `finish`/`finish_with_artifacts`/`finish_with_verdict`, and must
+    /// never call `write_manifest()` on that mutation itself. Doing so would
+    /// let the terminal mutation reach disk ahead of the journal event that
+    /// is supposed to prove it — exactly the defect this method closes: six
+    /// `plan` call sites used to write `progress = Terminal { .. }` via
+    /// their own explicit `write_manifest()` before ever appending
+    /// `run_finished` (some even before an intervening non-terminal event
+    /// like `ReviewFinished`), so a crash in that window left a manifest
+    /// claiming a terminal verdict under a `Running` lifecycle with no
+    /// terminal event to justify it — a skew `RunHandle::open` could not
+    /// detect (it only reconciles when the *last* journaled event is
+    /// `run_finished`) and therefore passed through as silently resumable.
+    /// Under this order, that same crash instead leaves the *journal* ahead
+    /// of the *manifest* (event durable, terminal `write_manifest()` never
+    /// ran) — a case `open` already detects via `reconcile_terminal_manifest`,
+    /// which this change extends to repair every `RunDetails` variant, not
+    /// only `work`.
+    fn finish_terminal(
+        &mut self,
+        outcome: impl Into<String>,
+        terminal_verdict: Option<TerminalVerdict>,
+        artifact_refs: Vec<ArtifactRef>,
+    ) -> Result<()> {
         if let Ok(work) = self.work_mut("finishing") {
             work.stage = WorkStage::Completed;
         }
@@ -2319,6 +2418,7 @@ impl RunHandle {
                 profile_id: None,
                 provider_limit: None,
                 invocation: None,
+                terminal_verdict,
             },
         )
     }
@@ -2377,6 +2477,11 @@ fn validate_terminal_event(event: &RunEvent) -> Result<()> {
     if event.profile_id.is_some() {
         return Err(RunError::new("terminal event must not name a profile"));
     }
+    if event.job == RunJob::Plan && event.terminal_verdict.is_none() {
+        return Err(RunError::new(
+            "plan terminal event is missing its generic terminal verdict",
+        ));
+    }
     Ok(())
 }
 
@@ -2406,6 +2511,19 @@ fn validate_terminal_transition(transition: &TerminalTransition) -> Result<()> {
     Ok(())
 }
 
+/// Repairs a manifest that lags the journal's terminal `run_finished` event
+/// -- the crash window [`RunHandle::finish_with_verdict`]'s doc comment
+/// (see the private `finish_terminal` it and `finish`/`finish_with_artifacts`
+/// share) names as the one this whole write-order fix targets: the process
+/// stopped after the terminal event was durably appended but before the
+/// terminal `write_manifest()` that must follow it landed. Every
+/// `RunDetails` variant is repaired here, not only `work`'s: `review` and
+/// `consult` carry no verdict-shaped mutable state yet, so the generic
+/// lifecycle/outcome/artifact repair below already fully reconciles them;
+/// `plan`'s `PlanProgress` is verdict-shaped, so it is rebuilt from the
+/// event's [`TerminalVerdict`] via [`plan_terminal_verdict_from_generic`] --
+/// [`validate_terminal_event`] (already run by every caller of this
+/// function) guarantees a `plan` terminal event carries one.
 fn reconcile_terminal_manifest(
     dir: &Path,
     manifest: &mut RunManifest,
@@ -2416,8 +2534,21 @@ fn reconcile_terminal_manifest(
             "unfinished manifest outcome conflicts with terminal event outcome",
         ));
     }
-    if let RunDetails::Work { state: Some(work) } = &mut manifest.details {
-        work.stage = WorkStage::Completed;
+    match &mut manifest.details {
+        RunDetails::Work { state: Some(work) } => {
+            work.stage = WorkStage::Completed;
+        }
+        RunDetails::Work { state: None }
+        | RunDetails::Review { .. }
+        | RunDetails::Consult { .. } => {}
+        RunDetails::Plan { state } => {
+            let verdict = terminal.terminal_verdict.ok_or_else(|| {
+                RunError::new("plan terminal event is missing its generic terminal verdict")
+            })?;
+            state.progress = PlanProgress::Terminal {
+                verdict: plan_terminal_verdict_from_generic(verdict)?,
+            };
+        }
     }
     for artifact in &terminal.artifact_refs {
         if !manifest.artifacts.contains(artifact) {
@@ -2432,6 +2563,23 @@ fn reconcile_terminal_manifest(
     })?;
     bytes.push(b'\n');
     atomic_replace(&dir.join("manifest.json"), &bytes)
+}
+
+/// The inverse of the mapping documented on [`TerminalVerdict`], used by
+/// [`reconcile_terminal_manifest`] to rebuild [`PlanProgress::Terminal`].
+/// `Canceled` is unreachable because no `plan` terminal call site ever
+/// writes it -- both of `plan`'s "canceled" outcomes are structurally
+/// [`PlanTerminalVerdict::Blocked`].
+fn plan_terminal_verdict_from_generic(verdict: TerminalVerdict) -> Result<PlanTerminalVerdict> {
+    match verdict {
+        TerminalVerdict::Completed => Ok(PlanTerminalVerdict::Accepted),
+        TerminalVerdict::Failed => Ok(PlanTerminalVerdict::Rejected),
+        TerminalVerdict::Blocked => Ok(PlanTerminalVerdict::Blocked),
+        TerminalVerdict::NeedsInput => Ok(PlanTerminalVerdict::NeedsInput),
+        TerminalVerdict::Canceled => Err(RunError::new(
+            "plan runs never reach the generic canceled terminal verdict",
+        )),
+    }
 }
 
 fn work_state(manifest: &RunManifest) -> Option<&WorkState> {
@@ -5614,5 +5762,361 @@ mod tests {
             .join("\n");
         content.push('\n');
         std::fs::write(path, content).expect("write events");
+    }
+
+    // -- Terminal-window crash coverage (prep 2: job-generic reconciliation) --
+    //
+    // Every terminal write now goes through `finish_terminal`
+    // (`finish`/`finish_with_artifacts`/`finish_with_verdict`), which
+    // appends the durable `run_finished` journal event before the atomic
+    // manifest write that follows it in the same call. The tests below
+    // simulate a crash in exactly that window -- the journal fully durable,
+    // the matching manifest write never having landed -- for every
+    // `RunDetails` variant, and assert `RunHandle::open` reconciles each to
+    // one defined, `Finished` state rather than passing the skew through as
+    // resumable.
+
+    /// Rolls `manifest.json` back to its state immediately before `terminal`
+    /// runs, simulating a crash in which every event `terminal` appends
+    /// becomes durable in the journal but none of the matching manifest
+    /// writes land -- the window `reconcile_terminal_manifest` exists to
+    /// repair. Mirrors
+    /// `run_event_open_recovers_authenticated_terminal_event_before_manifest_rewrite`'s
+    /// pattern, generalized to every job.
+    fn simulate_crash_after_terminal_event<F>(handle: &mut RunHandle, terminal: F)
+    where
+        F: FnOnce(&mut RunHandle) -> Result<()>,
+    {
+        let manifest_path = handle.manifest_path();
+        let pre_terminal_bytes =
+            std::fs::read(&manifest_path).expect("read pre-terminal manifest snapshot");
+        terminal(handle).expect("perform terminal transition");
+        std::fs::write(&manifest_path, &pre_terminal_bytes)
+            .expect("roll manifest back to its pre-terminal snapshot");
+    }
+
+    fn plan_execution(profile_id: &str, provider_id: &str) -> ApprovedExecution {
+        ApprovedExecution {
+            profile_id: profile_id.to_string(),
+            provider_id: provider_id.to_string(),
+            availability_key: provider_id.to_string(),
+            execution_key: format!("{provider_id}/{profile_id}"),
+        }
+    }
+
+    fn plan_stage_route(stage: PlanStage, candidate: ApprovedExecution) -> PlanStageRoute {
+        PlanStageRoute {
+            stage,
+            capability_role: "senior".to_string(),
+            candidates: vec![candidate],
+            provider_distinct_from: Vec::new(),
+            constraints: PlanStageConstraints::unconstrained(),
+        }
+    }
+
+    fn new_plan_run_request(run_id: &str) -> NewPlanRun {
+        let input_bytes = br#"{"summary":"terminal-window crash coverage fixture"}"#.to_vec();
+        let input_artifact = ArtifactRef {
+            path: "target-input.json".to_string(),
+            sha256: format!("{:x}", Sha256::digest(&input_bytes)),
+        };
+        let target = PlanTarget {
+            repo: "/repo/undertake".to_string(),
+            input: PlanInput::Artifact {
+                artifact: input_artifact,
+                tier: PlanTier::Senior,
+                complexity: PlanComplexity::M,
+            },
+        };
+        let routes = PlanRoutes {
+            stages: vec![
+                plan_stage_route(PlanStage::Planner, plan_execution("author", "anthropic")),
+                plan_stage_route(PlanStage::PeerReview, plan_execution("peer", "openai")),
+                plan_stage_route(
+                    PlanStage::SecondOpinion,
+                    plan_execution("second", "opencode-go"),
+                ),
+            ],
+        };
+        let details = PlanRunDetails {
+            target,
+            routes,
+            progress: PlanProgress::Prepared,
+            stage_attempts: PlanStageAttempts::default(),
+            revision_limit: RevisionLimit::new(1).expect("revision limit"),
+            stage_attempt_limit: StageAttemptLimit::new(2).expect("stage attempt limit"),
+        };
+        NewPlanRun {
+            run_id: run_id.to_string(),
+            target: RunTarget {
+                repo: "/repo/undertake".to_string(),
+                bead: Some("undertake-run-contract".to_string()),
+            },
+            details,
+            approved_profiles: vec!["author".to_string()],
+            musterroll_roster_artifact: None,
+            roster_snapshot: RosterSnapshotInput {
+                bytes: br#"{
+                  "schema":"musterroll/roster@2",
+                  "generated_at":"2026-07-16T12:00:00Z",
+                  "source_artifact":{"path":"/source/roster.toml","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                  "policy_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "providers":[],
+                  "profiles":[]
+                }"#
+                .to_vec(),
+                policy_sha256: "b".repeat(64),
+            },
+            limits: RunLimits {
+                item_wall_clock_mins: Some(30),
+                max_attempts: Some(3),
+            },
+            verifier: RunVerifier::default(),
+            approval: serde_json::json!({
+                "schema": "test/approval@1",
+                "decision": "approved"
+            }),
+            input_bytes,
+        }
+    }
+
+    #[test]
+    fn terminal_window_crash_reconciles_work_run() {
+        let temp = TempDir::new("terminal-window-work");
+        let mut request = new_run_request();
+        request.work = Some(WorkState {
+            cycle_id: "cycle-1".to_string(),
+            authorization_sha256: "b".repeat(64),
+            before_head: None,
+            owner_pid: None,
+            owner_pid_generation: None,
+            worker_pgid: None,
+            worker_pgid_generation: None,
+            worker_slots: Vec::new(),
+            worker_profile: None,
+            worker_commit: None,
+            mechanical: None,
+            stage: WorkStage::Implementing,
+            review_resume_budget_secs: None,
+        });
+        let mut handle = RunHandle::create_at(temp.path(), RunJob::Work, request, fixed_now())
+            .expect("create work run");
+        simulate_crash_after_terminal_event(&mut handle, |handle| handle.finish("verified"));
+        let run_id = handle.run_id().to_string();
+        drop(handle);
+
+        let reopened = RunHandle::open(temp.path(), &run_id).expect("reconcile work run");
+        assert_eq!(reopened.manifest().lifecycle, RunLifecycle::Finished);
+        assert_eq!(reopened.manifest().outcome.as_deref(), Some("verified"));
+        assert_eq!(
+            reopened.work().expect("work state").stage,
+            WorkStage::Completed,
+            "work-only reconciliation must still complete the work stage"
+        );
+    }
+
+    #[test]
+    fn terminal_window_crash_reconciles_review_and_consult_runs() {
+        for job in [RunJob::Review, RunJob::Consult] {
+            let label = format!("terminal-window-{job:?}");
+            let temp = TempDir::new(&label);
+            let mut handle = RunHandle::create_at(temp.path(), job, new_run_request(), fixed_now())
+                .expect("create run");
+            simulate_crash_after_terminal_event(&mut handle, |handle| handle.finish("completed"));
+            let run_id = handle.run_id().to_string();
+            drop(handle);
+
+            let reopened = RunHandle::open(temp.path(), &run_id)
+                .unwrap_or_else(|error| panic!("reconcile {job:?} run: {error}"));
+            assert_eq!(reopened.manifest().lifecycle, RunLifecycle::Finished);
+            assert_eq!(reopened.manifest().outcome.as_deref(), Some("completed"));
+        }
+    }
+
+    #[test]
+    fn terminal_window_crash_reconciles_plan_blocked_via_finish_plan_blocked() {
+        let temp = TempDir::new("terminal-window-plan-blocked");
+        let mut handle =
+            RunHandle::create_plan(temp.path(), new_plan_run_request("run-plan-blocked"))
+                .expect("create plan run");
+        handle
+            .start_plan_authoring(plan_execution("author", "anthropic"))
+            .expect("start authoring");
+
+        simulate_crash_after_terminal_event(&mut handle, RunHandle::finish_plan_blocked);
+        let run_id = handle.run_id().to_string();
+        drop(handle);
+
+        let reopened = RunHandle::open(temp.path(), &run_id).expect("reconcile blocked plan");
+        assert_eq!(reopened.manifest().lifecycle, RunLifecycle::Finished);
+        assert_eq!(reopened.manifest().outcome.as_deref(), Some("blocked"));
+        assert!(matches!(
+            reopened.plan().expect("plan").progress,
+            PlanProgress::Terminal {
+                verdict: PlanTerminalVerdict::Blocked
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_window_crash_reconciles_plan_blocked_via_cancel_prepared_plan() {
+        let temp = TempDir::new("terminal-window-plan-cancel-prepared");
+        let mut handle = RunHandle::create_plan(
+            temp.path(),
+            new_plan_run_request("run-plan-cancel-prepared"),
+        )
+        .expect("create plan run");
+        // Progress is `Prepared` immediately after creation; no setup needed.
+
+        simulate_crash_after_terminal_event(&mut handle, RunHandle::cancel_prepared_plan);
+        let run_id = handle.run_id().to_string();
+        drop(handle);
+
+        let reopened =
+            RunHandle::open(temp.path(), &run_id).expect("reconcile canceled-prepared plan");
+        assert_eq!(reopened.manifest().lifecycle, RunLifecycle::Finished);
+        assert_eq!(reopened.manifest().outcome.as_deref(), Some("canceled"));
+        assert!(
+            matches!(
+                reopened.plan().expect("plan").progress,
+                PlanProgress::Terminal {
+                    verdict: PlanTerminalVerdict::Blocked
+                }
+            ),
+            "cancel_prepared_plan's \"canceled\" outcome must reconcile to the same \
+             PlanTerminalVerdict::Blocked as finish_plan_blocked's \"blocked\" outcome -- \
+             the outcome strings differ, the durable verdict must not"
+        );
+    }
+
+    #[test]
+    fn terminal_window_crash_reconciles_plan_blocked_via_cancel_failed_authoring_plan() {
+        let temp = TempDir::new("terminal-window-plan-cancel-authoring");
+        let mut handle = RunHandle::create_plan(
+            temp.path(),
+            new_plan_run_request("run-plan-cancel-authoring"),
+        )
+        .expect("create plan run");
+        handle
+            .start_plan_authoring(plan_execution("author", "anthropic"))
+            .expect("start authoring");
+
+        simulate_crash_after_terminal_event(&mut handle, RunHandle::cancel_failed_authoring_plan);
+        let run_id = handle.run_id().to_string();
+        drop(handle);
+
+        let reopened =
+            RunHandle::open(temp.path(), &run_id).expect("reconcile canceled-authoring plan");
+        assert_eq!(reopened.manifest().lifecycle, RunLifecycle::Finished);
+        assert_eq!(reopened.manifest().outcome.as_deref(), Some("canceled"));
+        assert!(matches!(
+            reopened.plan().expect("plan").progress,
+            PlanProgress::Terminal {
+                verdict: PlanTerminalVerdict::Blocked
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_window_crash_reconciles_plan_needs_input() {
+        let temp = TempDir::new("terminal-window-plan-needs-input");
+        let mut handle =
+            RunHandle::create_plan(temp.path(), new_plan_run_request("run-plan-needs-input"))
+                .expect("create plan run");
+        handle
+            .start_plan_authoring(plan_execution("author", "anthropic"))
+            .expect("start authoring");
+        let artifact = handle
+            .capture_plan_artifact(Path::new("needs-input.json"), b"{\"open_questions\":true}")
+            .expect("capture needs-input artifact");
+
+        simulate_crash_after_terminal_event(&mut handle, move |handle| {
+            handle.finish_plan_needs_input(artifact)
+        });
+        let run_id = handle.run_id().to_string();
+        drop(handle);
+
+        let reopened = RunHandle::open(temp.path(), &run_id).expect("reconcile needs-input plan");
+        assert_eq!(reopened.manifest().lifecycle, RunLifecycle::Finished);
+        assert_eq!(reopened.manifest().outcome.as_deref(), Some("needs_input"));
+        assert!(matches!(
+            reopened.plan().expect("plan").progress,
+            PlanProgress::Terminal {
+                verdict: PlanTerminalVerdict::NeedsInput
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_window_crash_reconciles_plan_accepted_via_record_plan_peer_verdict() {
+        let temp = TempDir::new("terminal-window-plan-peer-accept");
+        let mut handle =
+            RunHandle::create_plan(temp.path(), new_plan_run_request("run-plan-peer-accept"))
+                .expect("create plan run");
+        handle
+            .start_plan_authoring(plan_execution("author", "anthropic"))
+            .expect("start authoring");
+        let draft = handle
+            .capture_plan_artifact(Path::new("draft.json"), b"{\"draft\":true}")
+            .expect("capture draft artifact");
+        handle.await_plan_peer(draft).expect("await peer review");
+        let peer = plan_execution("peer", "openai");
+
+        simulate_crash_after_terminal_event(&mut handle, move |handle| {
+            handle.record_plan_peer_verdict(peer, PeerVerdict::Approve, false)
+        });
+        let run_id = handle.run_id().to_string();
+        drop(handle);
+
+        let reopened = RunHandle::open(temp.path(), &run_id).expect("reconcile accepted plan");
+        assert_eq!(reopened.manifest().lifecycle, RunLifecycle::Finished);
+        assert_eq!(reopened.manifest().outcome.as_deref(), Some("accepted"));
+        assert!(matches!(
+            reopened.plan().expect("plan").progress,
+            PlanProgress::Terminal {
+                verdict: PlanTerminalVerdict::Accepted
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_window_crash_reconciles_plan_rejected_via_record_plan_second_opinion() {
+        let temp = TempDir::new("terminal-window-plan-second-opinion");
+        let mut handle = RunHandle::create_plan(
+            temp.path(),
+            new_plan_run_request("run-plan-second-opinion"),
+        )
+        .expect("create plan run");
+        handle
+            .start_plan_authoring(plan_execution("author", "anthropic"))
+            .expect("start authoring");
+        let draft = handle
+            .capture_plan_artifact(Path::new("draft.json"), b"{\"draft\":true}")
+            .expect("capture draft artifact");
+        handle.await_plan_peer(draft).expect("await peer review");
+        let peer = plan_execution("peer", "openai");
+        handle
+            .record_plan_peer_verdict(peer, PeerVerdict::Approve, true)
+            .expect("peer approves; second opinion required");
+        let second = plan_execution("second", "opencode-go");
+        handle
+            .bind_plan_second_opinion(second.clone(), "second-bind".to_string())
+            .expect("persist second-opinion binding before its first invocation");
+
+        simulate_crash_after_terminal_event(&mut handle, move |handle| {
+            handle.record_plan_second_opinion(&second, SecondOpinionVerdict::Reject)
+        });
+        let run_id = handle.run_id().to_string();
+        drop(handle);
+
+        let reopened = RunHandle::open(temp.path(), &run_id).expect("reconcile rejected plan");
+        assert_eq!(reopened.manifest().lifecycle, RunLifecycle::Finished);
+        assert_eq!(reopened.manifest().outcome.as_deref(), Some("rejected"));
+        assert!(matches!(
+            reopened.plan().expect("plan").progress,
+            PlanProgress::Terminal {
+                verdict: PlanTerminalVerdict::Rejected
+            }
+        ));
     }
 }

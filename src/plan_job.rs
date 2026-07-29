@@ -2462,7 +2462,7 @@ where
                     &opinion_bytes,
                 )
                 .map_err(|error| format!("plan second-opinion artifact: {error}"))?;
-                run.record_plan_second_opinion(reviewer, verdict)
+                run.record_plan_second_opinion(&reviewer, verdict)
                     .map_err(|error| format!("plan second-opinion checkpoint: {error}"))?;
             }
             crate::run::PlanProgress::Prepared
