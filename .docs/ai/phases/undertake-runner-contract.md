@@ -251,15 +251,26 @@ Posture-selected. The mutating half exists; the read-only half needs widening.
 - `RepositoryWrite` → `run_with_heartbeat` (`dispatch.rs:513`), which preflights HEAD, runs
   the hooks, spawns, heartbeats, and authenticates the commit. Returns `DispatchResult`
   with stdout/stderr paths and byte counts. Use as-is.
-- `ReadOnly` → `run_readonly` (`dispatch.rs:490`) is **not sufficient as written**, though
-  the precise defect is narrower than it first appears: output *is* captured, to
-  `SpawnRequest.stdout_path` / `stderr_path` (`dispatch.rs:248-249`). What it discards is
-  the *return* — `Result<()>` hands back no paths, byte counts, or status detail, so a
-  caller cannot classify the attempt. Widen the return to `DispatchResult`'s shape, or add
-  a sibling that does. **Do not add capture that already exists.** Note that neither
-  `adversarial` nor `plan_job` calls `run_readonly` today — both drive `exec.spawn`
-  directly; deciding which becomes the one read-only path is Phase 1b's call, and either
-  is acceptable so long as there is exactly one.
+- `ReadOnly` → `run_readonly` — **RESOLVED by prep 3 (`48a21b9`).** It now takes a
+  `hook_name` plus `WorkerHooks` and mirrors `run_with_heartbeat`'s
+  `on_pre_spawn → spawn → on_spawn` sequencing, including fail-closed termination and
+  reaping when `on_spawn` errors, and it returns `DispatchResult` rather than `Result<()>`.
+  Output was always captured to `SpawnRequest.stdout_path` / `stderr_path`; only the
+  *return* discarded it.
+
+  **Correction to an earlier draft of this document.** It claimed "neither `adversarial`
+  nor `plan_job` calls `run_readonly` today — both drive `exec.spawn` directly." That was
+  wrong for `adversarial`, which has called `dispatch::run_readonly` since `a0d0084`
+  (verified: two call sites, `run_judge_attempt` and `run_reviewer_attempt`). The claim
+  came from a review finding that was not independently checked before being written down.
+
+  `plan_job` is the real remainder: it never called `run_readonly` *or* `exec.spawn` — its
+  process execution lives in `cli.rs`'s `CommandPlanAuthor`, which drives
+  `run_bounded_command` on a raw `std::process::Command`, entirely outside the
+  `Exec`/`SpawnRequest` abstraction. **Two read-only paths therefore survive until
+  `conductor-mkct`**, which converges them uniformly across all four jobs. Converging
+  `plan` earlier would mean threading an `Exec` through all four `PlanAuthor` methods —
+  correctly deferred, but it is a real outstanding item, not a closed one.
 - Both paths, `ReadOnly` only: a mandatory post-attempt HEAD/index/worktree check. A
   read-only job that mutated its repo is an *infrastructure failure*, never a result.
   Mirror the check shipped in `8a8f1fe`.
