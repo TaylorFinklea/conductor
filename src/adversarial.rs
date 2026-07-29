@@ -1328,9 +1328,15 @@ fn run_judge_attempt<E: Exec>(
         stderr_path: stderr_path.clone(),
     };
     let started = Instant::now();
-    let outcome = match dispatch::run_readonly(exec, &spawn, timeout) {
+    let outcome = match dispatch::run_readonly(exec, &spawn, timeout, "judge", &mut ()) {
         Err(error) => JudgeAttemptOutcome::ProcessFailed(error.to_string()),
-        Ok(()) => match fs::read(&stdout_path) {
+        Ok(result) if result.status != dispatch::DispatchStatus::Success => {
+            JudgeAttemptOutcome::ProcessFailed(format!(
+                "read-only process failed: {:?}",
+                result.status
+            ))
+        }
+        Ok(_) => match fs::read(&stdout_path) {
             Err(error) => JudgeAttemptOutcome::ProcessFailed(format!(
                 "failed to read judge stdout {}: {error}",
                 stdout_path.display()
@@ -2036,9 +2042,16 @@ fn run_reviewer_attempt<E: Exec + Sync>(
         stderr_path: stderr_path.clone(),
     };
     let started = Instant::now();
-    let outcome = match dispatch::run_readonly(exec, &spawn, timeout) {
+    let hook_name = format!("reviewer-slot-{}", slot.slot);
+    let outcome = match dispatch::run_readonly(exec, &spawn, timeout, &hook_name, &mut ()) {
         Err(error) => ReviewerAttemptOutcome::ProcessFailed(error.to_string()),
-        Ok(()) => match fs::read(&stdout_path) {
+        Ok(result) if result.status != dispatch::DispatchStatus::Success => {
+            ReviewerAttemptOutcome::ProcessFailed(format!(
+                "read-only process failed: {:?}",
+                result.status
+            ))
+        }
+        Ok(_) => match fs::read(&stdout_path) {
             Err(error) => ReviewerAttemptOutcome::ProcessFailed(format!(
                 "failed to read reviewer stdout {}: {error}",
                 stdout_path.display()

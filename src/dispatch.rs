@@ -487,27 +487,69 @@ pub(crate) fn run<E: Exec, C: CommitProbe>(
     run_with_heartbeat(exec, commits, request, state_dir, timeout, timeout, &mut ())
 }
 
-pub(crate) fn run_readonly<E: Exec + ?Sized>(
+/// Runs a non-mutating attempt (`review`, `consult`, plan's model calls).
+/// Mirrors [`run_with_heartbeat`]'s `on_pre_spawn` -> spawn -> `on_spawn`
+/// sequencing, including its fail-closed behavior, so a read-only fan-out
+/// slot durably records its spawn identity before it can act — without any
+/// of the write path's commit-authentication hook-directory machinery,
+/// which does not apply here (a read-only worker never commits). `hook_name`
+/// identifies the calling slot to `hooks`; this function attaches no
+/// meaning of its own to it.
+///
+/// Output is already captured to `request.stdout_path` / `stderr_path` by
+/// the spawned process itself. What this returns is the *result* — status,
+/// paths, and byte counts — via [`DispatchResult`], the same shape
+/// `run_with_heartbeat` returns, so a caller can classify a read-only
+/// attempt exactly as it would a mutating one. `worker_commit` and
+/// `authentication_rejection` are always `None`: a read-only attempt never
+/// commits, so those fields never apply.
+pub(crate) fn run_readonly<E, K>(
     exec: &E,
     request: &SpawnRequest,
     timeout: Duration,
-) -> Result<()> {
+    hook_name: &str,
+    hooks: &mut K,
+) -> Result<DispatchResult>
+where
+    E: Exec + ?Sized,
+    K: WorkerHooks + ?Sized,
+{
+    hooks.on_pre_spawn(hook_name)?;
     let mut child = exec.spawn(request)?;
-    let process = wait_with_timeout_and_heartbeat(child.as_mut(), timeout, timeout, &mut ())?;
-    if process.timed_out {
-        return Err(DispatchError::new("read-only process timed out"));
+    // Bind the run to this worker's identity before it can meaningfully act.
+    // If that durable record fails, tear the worker (and any descendants)
+    // down rather than let a worker whose identity we cannot prove keep
+    // running unattended.
+    if let Err(error) = hooks.on_spawn(child.id()) {
+        if terminate_and_reap_best_effort(child.as_mut()) {
+            return Err(error);
+        }
+        return Err(DispatchError::worker_state_uncertain(format!(
+            "{error}; spawned worker process group could not be proven quiescent"
+        )));
     }
-    if process.status.success {
-        Ok(())
+    let process = wait_with_timeout_and_heartbeat(child.as_mut(), timeout, timeout, hooks)?;
+    hooks.on_worker_quiescent(hook_name)?;
+    let stdout_bytes = file_len(&request.stdout_path)?;
+    let stderr_bytes = file_len(&request.stderr_path)?;
+    let status = if process.timed_out {
+        DispatchStatus::Failed(DispatchFailure::TimedOut)
+    } else if process.status.success {
+        DispatchStatus::Success
     } else {
-        Err(DispatchError::new(format!(
-            "read-only process exited with status {}",
-            process
-                .status
-                .code
-                .map_or_else(|| "signal".to_string(), |code| code.to_string())
-        )))
-    }
+        DispatchStatus::Failed(DispatchFailure::ExitNonZero {
+            code: process.status.code,
+        })
+    };
+    Ok(DispatchResult {
+        status,
+        worker_commit: None,
+        authentication_rejection: None,
+        stdout_path: request.stdout_path.clone(),
+        stderr_path: request.stderr_path.clone(),
+        stdout_bytes,
+        stderr_bytes,
+    })
 }
 
 pub(crate) fn run_with_heartbeat<E, C, K>(
