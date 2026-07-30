@@ -101,7 +101,8 @@ pub(crate) enum RunLifecycle {
     Finished,
 }
 
-/// One event kind from the spec's stable `undertake/event@2` list.
+/// One event kind from the spec's stable `undertake/event@2` list, extended
+/// by `undertake/event@3`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
@@ -113,6 +114,14 @@ pub(crate) enum EventKind {
     ReviewFinished,
     RunFinished,
     CoverageGap,
+    /// `@3` and later only (bead `conductor-v37z`): one stage's durable
+    /// outcome, written by [`crate::runner::AttemptRunner::run`] immediately
+    /// after `JobPolicy::transition` returns, before the ledger is used to
+    /// pick the next stage. This is what lets a resumed run reconstruct its
+    /// [`crate::runner::StageLedger`] from the journal instead of restarting
+    /// it empty and replaying already-completed stages. See
+    /// [`StageProgress`].
+    StageFinished,
 }
 
 /// `{"path": ..., "sha256": ...}` artifact identity.
@@ -1018,6 +1027,45 @@ pub(crate) enum TerminalVerdict {
     Canceled,
 }
 
+/// Which of the runner's two [`crate::runner::Transition`] arms produced the
+/// [`StageProgress`] this accompanies. `@3` and later only (bead
+/// `conductor-v37z`).
+///
+/// A typed discriminator rather than free text: the `44hc` work (the prior
+/// generic-terminal-reconciliation bead) established that `RunEvent::outcome`
+/// is chosen per call site for human/Bead-facing display and is therefore
+/// unsafe to parse as a structural discriminator (see [`TerminalVerdict`]'s
+/// own doc comment, which exists for exactly that reason). The same
+/// objection applies here: a resumed run must be able to tell whether the
+/// last recorded stage ended via `Transition::Continue` (so `JobPolicy::
+/// next_stage` should be asked what runs next) or `Transition::Terminal` (so
+/// it must not be asked at all -- see [`StageProgress`]'s doc comment) without
+/// ever guessing that distinction from prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StageTransitionKind {
+    Continue,
+    Terminal,
+}
+
+/// Durable evidence of one stage's completion, carried on an
+/// [`EventKind::StageFinished`] event's [`RunEvent::stage_progress`]. `@3`
+/// and later only (bead `conductor-v37z`). `stage` is a `snake_case` stage id
+/// string, mirroring [`InvocationEvidence::stage`], rather than a job-specific
+/// enum, so no job's stage vocabulary leaks into `run.rs`.
+///
+/// The event's own `artifact_refs` (already a general-purpose field on
+/// [`RunEvent`]) carry the stage's output identities; this struct adds only
+/// what `artifact_refs` cannot express: which stage they belong to, and
+/// which transition produced them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StageProgress {
+    pub(crate) stage: String,
+    pub(crate) transition: StageTransitionKind,
+}
+
 /// `undertake/event@2` / `undertake/event@3` — one append-only event line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1051,6 +1099,13 @@ pub(crate) struct RunEvent {
     /// `Some` on a [`EventKind::RunFinished`] event. See [`TerminalVerdict`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) terminal_verdict: Option<TerminalVerdict>,
+    /// One stage's durable completion evidence, `@3` and later; only ever
+    /// `Some` on a [`EventKind::StageFinished`] event. See [`StageProgress`].
+    /// `#[serde(default)]` is what lets `@2` lines, and any `@3` line written
+    /// before this bead, keep deserializing with no `StageFinished` events
+    /// at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stage_progress: Option<StageProgress>,
 }
 
 /// Fields pinned into a new run's manifest at creation.
@@ -1096,6 +1151,9 @@ pub(crate) struct EventInput {
     /// See [`RunEvent::terminal_verdict`]; only meaningful on a
     /// [`EventKind::RunFinished`] input, set via [`RunHandle::finish_with_verdict`].
     pub(crate) terminal_verdict: Option<TerminalVerdict>,
+    /// See [`RunEvent::stage_progress`]; only meaningful on a
+    /// [`EventKind::StageFinished`] input.
+    pub(crate) stage_progress: Option<StageProgress>,
 }
 
 /// Handle to one created (or reopened) run directory; owns the manifest and
@@ -2309,6 +2367,11 @@ impl RunHandle {
                 "terminal verdict is only legal on a run_finished event",
             ));
         }
+        if input.stage_progress.is_some() && !matches!(kind, EventKind::StageFinished) {
+            return Err(RunError::new(
+                "stage progress is only legal on a stage_finished event",
+            ));
+        }
         let seq = self.next_seq;
         let event = RunEvent {
             schema: EVENT_SCHEMA_V3.to_string(),
@@ -2326,6 +2389,7 @@ impl RunHandle {
             plan_invocation: None,
             invocation: input.invocation,
             terminal_verdict: input.terminal_verdict,
+            stage_progress: input.stage_progress,
         };
         append_event_line(&self.events_path(), &event)?;
         self.next_seq += 1;
@@ -2419,6 +2483,7 @@ impl RunHandle {
                 provider_limit: None,
                 invocation: None,
                 terminal_verdict,
+                stage_progress: None,
             },
         )
     }

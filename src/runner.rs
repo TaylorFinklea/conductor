@@ -1275,6 +1275,115 @@ fn revalidate_digests(
     Ok(None)
 }
 
+/// Durably records one stage's outcome as a `stage_finished` event, before
+/// the ledger is used to pick another stage — the contract's "missing
+/// reducer" durability requirement ("the runner persists exactly what
+/// \[`Transition`\] returns before it calls `next_stage` again"). This is
+/// what [`reconstruct_stage_ledger`] later replays on resume (bead
+/// `conductor-v37z`). `artifact_refs` re-assert the exact `ArtifactRef`s
+/// [`write_attempt_events`] already captured for this stage's accepted
+/// attempts — no new bytes are written here, only their identity is
+/// re-declared as this stage's durable evidence.
+fn write_stage_finished_event(
+    handle: &mut run::RunHandle,
+    outcome: &StageOutcome,
+    transition: run::StageTransitionKind,
+) -> Result<()> {
+    handle
+        .append_event(
+            run::EventKind::StageFinished,
+            run::EventInput {
+                artifact_refs: outcome
+                    .outputs
+                    .iter()
+                    .map(|output| output.artifact.clone())
+                    .collect(),
+                stage_progress: Some(run::StageProgress {
+                    stage: outcome.stage.as_str().to_string(),
+                    transition,
+                }),
+                ..run::EventInput::default()
+            },
+        )
+        .map_err(|error| RunnerError::new(error.to_string()))
+}
+
+/// Reconstructs the durable [`StageLedger`] a resumed run must continue from,
+/// rather than restarting it empty and replaying every already-completed
+/// stage — bead `conductor-v37z`'s defect: budget is reserve-never-refund by
+/// design, so a replayed stage permanently consumes approved ceiling a
+/// crash-then-resume should never have spent.
+///
+/// Replays every `stage_finished` event in `events` (already
+/// sequence-validated by [`run::read_events`]) in journal order. For each,
+/// its artifact bytes are re-read from `handle`'s run directory and
+/// re-hashed against the pinned `sha256` — the ledger is only ever built
+/// from evidence that is still exactly what the journal says it is, never
+/// guessed. `@2` journals, and any `@3` journal written before this bead,
+/// carry no `stage_finished` events at all and correctly reconstruct to an
+/// empty ledger — identical to the pre-fix behavior; this only changes
+/// journals this binary writes going forward.
+///
+/// Fails closed — `Err`, never a partial or guessed ledger — on: a
+/// `stage_finished` event with no `stage_progress` (an uninterpretable
+/// record — some writer emitted the kind without the payload reconstruction
+/// depends on); an invalid stage id; or a referenced artifact missing from
+/// disk or no longer matching its pinned hash.
+///
+/// The returned `bool` is `true` exactly when the *last* `stage_finished`
+/// event recorded a [`run::StageTransitionKind::Terminal`] transition,
+/// meaning a prior process had already decided to end the run without
+/// consulting `next_stage` again (`## Shape`: "`Transition::Terminal`:
+/// ... end the sequence now, without another `next_stage` call"). Resume
+/// must honor that same skip: `next_stage` is only a pure function of
+/// completed-stage evidence, and a policy is free to have it disagree with a
+/// `Terminal` transition already returned for that exact ledger state —
+/// calling it anyway on resume could resurrect a stage the policy had
+/// already decided was done.
+fn reconstruct_stage_ledger(
+    handle: &run::RunHandle,
+    events: &[run::RunEvent],
+) -> Result<(StageLedger, bool)> {
+    let mut ledger = StageLedger::new();
+    let mut last_was_terminal = false;
+    for event in events {
+        if event.kind != run::EventKind::StageFinished {
+            continue;
+        }
+        let progress = event.stage_progress.as_ref().ok_or_else(|| {
+            RunnerError::new(format!(
+                "stage_finished event {} carries no stage_progress; refusing to guess the ledger",
+                event.event_id
+            ))
+        })?;
+        let stage = StageId::new(progress.stage.clone())?;
+        let mut outputs = Vec::with_capacity(event.artifact_refs.len());
+        for artifact in &event.artifact_refs {
+            let path = handle.dir().join(&artifact.path);
+            let bytes = std::fs::read(&path).map_err(|error| {
+                RunnerError::new(format!(
+                    "stage_finished artifact {} unreadable: {error}",
+                    artifact.path
+                ))
+            })?;
+            let actual = sha256_hex(&bytes);
+            if actual != artifact.sha256 {
+                return Err(RunnerError::new(format!(
+                    "stage_finished artifact {} hash mismatch: journal pins {}, disk has {actual}",
+                    artifact.path, artifact.sha256
+                )));
+            }
+            outputs.push(AttemptOutput {
+                bytes,
+                artifact: artifact.clone(),
+            });
+        }
+        ledger.record(StageOutcome { stage, outputs });
+        last_was_terminal = matches!(progress.transition, run::StageTransitionKind::Terminal);
+    }
+    Ok((ledger, last_was_terminal))
+}
+
 /// Terminal handling: durable evidence first (`RunHandle::finish_with_verdict`,
 /// itself event-then-manifest per `1078a1f`), then the single Bead mutation
 /// last — `## Shape`: "terminal: policy.terminal(ledger) -> durable
@@ -1391,18 +1500,60 @@ impl AttemptRunner {
         let budget = CallBudget::reconstructed(ceiling, consumed);
         let sequencer = AtomicU64::new(0);
 
-        let mut ledger = StageLedger::new();
-        let Some(mut stage) = policy.next_stage(&ledger) else {
+        // Reconstruct completed stages from the journal instead of
+        // restarting the ledger empty (`conductor-v37z`): a run resumed
+        // after completing stage N must continue at N+1, not replay it and
+        // permanently burn more of its reserve-never-refund budget.
+        let (mut ledger, resumed_terminal) = reconstruct_stage_ledger(handle, &events)?;
+
+        // A prior process's `Transition::Terminal` already decided this run
+        // was over without ever consulting `next_stage` again (`## Shape`:
+        // "`Transition::Terminal`: ... end the sequence now, without
+        // another `next_stage` call") -- honor that same skip on resume
+        // instead of asking the policy for a stage it never intended to
+        // run again. Otherwise this is exactly the fresh-run selection:
+        // `next_stage` on an empty ledger picks the first stage; on a
+        // reconstructed non-empty ledger it picks up after the last
+        // completed one.
+        let mut stage = if resumed_terminal {
+            None
+        } else {
+            policy.next_stage(&ledger)
+        };
+        if stage.is_none() && ledger.completed_stages().next().is_none() {
+            // Nothing was ever durably recorded and the policy names no
+            // stage at all -- the original zero-stage early return,
+            // unchanged: no lease was ever needed and no bead was ever
+            // claimed.
             let terminal = policy.terminal(&ledger);
             return finalize(handle, ports, request, terminal, false);
-        };
+        }
 
-        // Repo lease: taken once, held for the whole run, only when this
-        // (first) stage's target is git-backed (`## Target kinds`:
-        // `ArtifactOnly` takes no lease). Every job in practice declares
-        // one uniform `TargetKind` across all its stages.
+        // Repo lease: taken once, held for the whole run, only when the
+        // job's target is git-backed (`## Target kinds`: `ArtifactOnly`
+        // takes no lease). Every job in practice declares one uniform
+        // `TargetKind` across all its stages, so this reads it from
+        // whichever stage is about to dispatch, falling back to the job's
+        // first-ever stage when resume has nothing left to dispatch at all
+        // (`stage` is `None` here only when a prior process already
+        // recorded a terminal transition, or ran every stage to
+        // exhaustion).
+        let target_kind = match &stage {
+            Some(next) => next.target_kind,
+            None => {
+                policy
+                    .next_stage(&StageLedger::new())
+                    .ok_or_else(|| {
+                        RunnerError::new(
+                            "resumed run has completed stages but the policy names no first \
+                             stage to determine its target kind from",
+                        )
+                    })?
+                    .target_kind
+            }
+        };
         let repo = handle.manifest().target.repo.clone();
-        let _lease = if stage.target_kind == TargetKind::ArtifactOnly {
+        let _lease = if target_kind == TargetKind::ArtifactOnly {
             None
         } else {
             Some(
@@ -1421,7 +1572,7 @@ impl AttemptRunner {
             }
         }
 
-        if stage.target_kind == TargetKind::GitWorkingTree {
+        if target_kind == TargetKind::GitWorkingTree {
             let clean = ports
                 .commits
                 .is_clean(Path::new(&repo))
@@ -1449,7 +1600,7 @@ impl AttemptRunner {
             bead_claimed = true;
         }
 
-        loop {
+        while let Some(current_stage) = stage.take() {
             // Revalidated at every stage boundary, including this first
             // one again: drift since the preflight check above is exactly
             // as fail-closed as drift caught there (`## Approval must be
@@ -1469,23 +1620,22 @@ impl AttemptRunner {
             let traces = dispatch_stage_slots(
                 policy,
                 ports.executor,
-                &stage,
+                &current_stage,
                 &ledger,
                 &budget,
                 ports.clock,
                 &sequencer,
             )?;
-            let slot_results = write_attempt_events(handle, &stage, traces)?;
-            let stage_outcome = policy.aggregate_stage(&stage, &slot_results);
+            let slot_results = write_attempt_events(handle, &current_stage, traces)?;
+            let stage_outcome = policy.aggregate_stage(&current_stage, &slot_results);
             match policy.transition(&ledger, stage_outcome) {
                 Transition::Continue(outcome) => {
+                    write_stage_finished_event(handle, &outcome, run::StageTransitionKind::Continue)?;
                     ledger.record(outcome);
-                    match policy.next_stage(&ledger) {
-                        Some(next) => stage = next,
-                        None => break,
-                    }
+                    stage = policy.next_stage(&ledger);
                 }
                 Transition::Terminal(outcome) => {
+                    write_stage_finished_event(handle, &outcome, run::StageTransitionKind::Terminal)?;
                     ledger.record(outcome);
                     break;
                 }
@@ -2254,15 +2404,27 @@ mod tests {
             }
 
             fn prompt(&self, ctx: AttemptContext<'_>) -> PromptMaterial {
+                // `ledger_artifacts` proves the ledger (whether built fresh
+                // or reconstructed on resume) is what every later stage's
+                // prompt actually reads from -- not just what `terminal`
+                // sees at the very end.
+                let ledger_artifacts: Vec<String> = ctx
+                    .prior_stages
+                    .completed_stages()
+                    .flat_map(|stage| ctx.prior_stages.artifacts_for(stage))
+                    .map(|artifact| artifact.sha256.clone())
+                    .collect();
                 PromptMaterial {
                     prompt: format!(
-                        "stage={} slot={} attempt={} candidate={} prior={:?}",
+                        "stage={} slot={} attempt={} candidate={} prior={:?} \
+                         ledger_stages={} ledger_artifacts={ledger_artifacts:?}",
                         ctx.stage.id.as_str(),
                         ctx.slot.index,
                         ctx.attempt_index,
                         ctx.candidate.profile_id,
                         ctx.prior_attempt_output
                             .map(|artifact| artifact.sha256.clone()),
+                        ctx.prior_stages.completed_stages().count(),
                     ),
                     response_schema: None,
                 }
@@ -2419,6 +2581,12 @@ mod tests {
                     run::EventKind::CoverageGap,
                     run::EventKind::AttemptStarted,
                     run::EventKind::AttemptFinished,
+                    // Durable stage-boundary evidence (`conductor-v37z`),
+                    // written before the ledger is used to pick the next
+                    // stage -- here, immediately before the single stage's
+                    // `Transition::Continue` ends the run with no further
+                    // stage to run.
+                    run::EventKind::StageFinished,
                     run::EventKind::RunFinished,
                 ]
             );
@@ -3018,6 +3186,441 @@ mod tests {
                 .stderr(Stdio::null())
                 .status();
             worker.wait().expect("reap worker");
+        }
+
+        // ---- resume: reconstruct the StageLedger instead of restarting it (`conductor-v37z`) ----
+
+        /// Seeds `handle`'s journal with the durable evidence a prior
+        /// process would have written for one already-completed stage --
+        /// one accepted attempt (`AttemptStarted`/`AttemptFinished`, both
+        /// carrying `InvocationEvidence`) plus the `StageFinished` event
+        /// [`reconstruct_stage_ledger`] replays. A single test process
+        /// cannot literally run `AttemptRunner::run` twice against the same
+        /// handle to produce this state -- `finalize` marks a run
+        /// permanently `Finished`, and `append_event` refuses to append to
+        /// one -- so seeding the journal directly is the same technique
+        /// `resume_refuses_while_a_recorded_worker_slot_is_alive` above
+        /// already uses to simulate "a prior process's state" for the
+        /// worker-slot liveness gate.
+        fn seed_completed_stage(
+            temp: &TempDir,
+            handle: &mut run::RunHandle,
+            stage_id: &str,
+            profile_id: &str,
+            body: &str,
+            transition: run::StageTransitionKind,
+        ) -> ArtifactRef {
+            let source = temp.path().join(format!("{stage_id}-{profile_id}-seed.out"));
+            std::fs::write(&source, body).expect("write seed artifact source");
+            let artifact = handle
+                .capture_artifact(
+                    &source,
+                    Path::new(&format!("attempts/{stage_id}-{profile_id}-seed.out")),
+                )
+                .expect("capture seed artifact");
+            let execution = candidate(profile_id);
+            let input_sha256 = sha256_hex(b"seed-input");
+            handle
+                .append_event(
+                    run::EventKind::AttemptStarted,
+                    run::EventInput {
+                        profile_id: Some(profile_id.to_string()),
+                        invocation: Some(run::InvocationEvidence {
+                            stage: stage_id.to_string(),
+                            slot: 0,
+                            attempt: 1,
+                            execution: execution.clone(),
+                            input_sha256: input_sha256.clone(),
+                            output_sha256: None,
+                            duration_ms: None,
+                            tokens: None,
+                            retry_of: None,
+                        }),
+                        ..run::EventInput::default()
+                    },
+                )
+                .expect("seed attempt_started");
+            handle
+                .append_event(
+                    run::EventKind::AttemptFinished,
+                    run::EventInput {
+                        profile_id: Some(profile_id.to_string()),
+                        artifact_refs: vec![artifact.clone()],
+                        outcome: Some("accepted".to_string()),
+                        invocation: Some(run::InvocationEvidence {
+                            stage: stage_id.to_string(),
+                            slot: 0,
+                            attempt: 1,
+                            execution,
+                            input_sha256,
+                            output_sha256: Some(artifact.sha256.clone()),
+                            duration_ms: Some(1),
+                            tokens: None,
+                            retry_of: None,
+                        }),
+                        ..run::EventInput::default()
+                    },
+                )
+                .expect("seed attempt_finished");
+            handle
+                .append_event(
+                    run::EventKind::StageFinished,
+                    run::EventInput {
+                        artifact_refs: vec![artifact.clone()],
+                        stage_progress: Some(run::StageProgress {
+                            stage: stage_id.to_string(),
+                            transition,
+                        }),
+                        ..run::EventInput::default()
+                    },
+                )
+                .expect("seed stage_finished");
+            artifact
+        }
+
+        #[test]
+        fn resume_after_a_completed_stage_continues_at_the_next_stage_without_re_executing_it() {
+            let temp = TempDir::new("resume-continue");
+            let mut handle = create_run(&temp, "/artifact/review-target", None, Some(5));
+            let seeded = seed_completed_stage(
+                &temp,
+                &mut handle,
+                "stage_a",
+                "worker-1",
+                "stage-a-output",
+                run::StageTransitionKind::Continue,
+            );
+
+            let stage_a = one_slot_stage(
+                "stage_a",
+                vec![candidate("worker-1")],
+                1,
+                TargetKind::ArtifactOnly,
+                BTreeMap::new(),
+            );
+            let stage_b = one_slot_stage(
+                "stage_b",
+                vec![candidate("worker-2")],
+                1,
+                TargetKind::ArtifactOnly,
+                BTreeMap::new(),
+            );
+            let policy = ScriptedPolicy::new(run::RunJob::Work, vec![stage_a, stage_b]);
+
+            let executor = FakeAttemptExecutor::new(temp.path().join("stdout"));
+            // worker-1 (stage_a's candidate) is deliberately never scripted:
+            // if resume incorrectly replayed stage_a, the fake would panic
+            // on an unscripted call instead of silently re-running it.
+            executor.script("worker-2", vec![ScriptedAttempt::Success("stage-b-output")]);
+            let exec = FakeExec {
+                readiness: dispatch::AuthReadiness::Ready,
+            };
+            let commits = FakeCommitProbe { clean: true };
+            let bd = FakeBeadGateway::default();
+            let digests = FakeDigestSource::default();
+            let ports = RunnerPorts {
+                exec: &exec,
+                commits: &commits,
+                bd: &bd,
+                executor: &executor,
+                clock: &SystemClock,
+                digests: &digests,
+            };
+            let request = RunRequest {
+                state_dir: temp.path().join("state"),
+                backend: Backend::Claude,
+                owner: "undertake".to_string(),
+                pinned_digests: BTreeMap::new(),
+            };
+
+            let terminal =
+                AttemptRunner::run(&policy, &ports, &mut handle, &request).expect("run completes");
+            assert_eq!(terminal.verdict, TerminalVerdict::Completed);
+            let calls = executor.calls();
+            assert_eq!(calls.len(), 1, "stage_a must not be re-executed on resume");
+            assert_eq!(calls[0].0, "worker-2");
+            assert!(
+                calls[0].1.contains("ledger_stages=1"),
+                "stage_b's prompt must see stage_a as already completed via the ledger: {}",
+                calls[0].1
+            );
+            assert!(
+                calls[0].1.contains(seeded.sha256.as_str()),
+                "stage_a's artifact must be visible to stage_b's prompt via the ledger: {}",
+                calls[0].1
+            );
+
+            // Only stage_b's attempt is newly journaled; stage_a's seeded
+            // events are untouched and not duplicated.
+            let started = attempt_started_events(&handle);
+            assert_eq!(
+                started.len(),
+                2,
+                "seeded stage_a attempt + new stage_b attempt"
+            );
+            assert_eq!(
+                started[1]
+                    .invocation
+                    .as_ref()
+                    .expect("invocation")
+                    .execution
+                    .profile_id,
+                "worker-2"
+            );
+        }
+
+        #[test]
+        fn resume_mid_stage_without_a_stage_finished_event_reruns_the_stage_from_attempt_one() {
+            let temp = TempDir::new("resume-mid-stage");
+            let mut handle = create_run(&temp, "/artifact/review-target", None, Some(2));
+
+            // Simulate a crash: stage_a's one candidate has durable
+            // attempt-level evidence from a prior process, but no
+            // `StageFinished` event followed it -- the process crashed
+            // before `aggregate_stage`/`transition` ever ran for stage_a.
+            handle
+                .append_event(
+                    run::EventKind::AttemptStarted,
+                    run::EventInput {
+                        profile_id: Some("worker-1".to_string()),
+                        invocation: Some(run::InvocationEvidence {
+                            stage: "stage_a".to_string(),
+                            slot: 0,
+                            attempt: 1,
+                            execution: candidate("worker-1"),
+                            input_sha256: sha256_hex(b"crashed-input"),
+                            output_sha256: None,
+                            duration_ms: None,
+                            tokens: None,
+                            retry_of: None,
+                        }),
+                        ..run::EventInput::default()
+                    },
+                )
+                .expect("seed crashed attempt_started");
+
+            let stage = one_slot_stage(
+                "stage_a",
+                vec![candidate("worker-1")],
+                1,
+                TargetKind::ArtifactOnly,
+                BTreeMap::new(),
+            );
+            let policy = ScriptedPolicy::new(run::RunJob::Work, vec![stage]);
+
+            let executor = FakeAttemptExecutor::new(temp.path().join("stdout"));
+            executor.script("worker-1", vec![ScriptedAttempt::Success("replay-output")]);
+            let exec = FakeExec {
+                readiness: dispatch::AuthReadiness::Ready,
+            };
+            let commits = FakeCommitProbe { clean: true };
+            let bd = FakeBeadGateway::default();
+            let digests = FakeDigestSource::default();
+            let ports = RunnerPorts {
+                exec: &exec,
+                commits: &commits,
+                bd: &bd,
+                executor: &executor,
+                clock: &SystemClock,
+                digests: &digests,
+            };
+            let request = RunRequest {
+                state_dir: temp.path().join("state"),
+                backend: Backend::Claude,
+                owner: "undertake".to_string(),
+                pinned_digests: BTreeMap::new(),
+            };
+
+            let terminal =
+                AttemptRunner::run(&policy, &ports, &mut handle, &request).expect("run completes");
+            assert_eq!(terminal.verdict, TerminalVerdict::Completed);
+            assert_eq!(
+                executor.call_count(),
+                1,
+                "the incomplete stage must be re-dispatched, not skipped"
+            );
+            let started = attempt_started_events(&handle);
+            assert_eq!(
+                started.len(),
+                2,
+                "the crashed attempt plus exactly one fresh replay attempt"
+            );
+            assert_eq!(
+                started[1].invocation.as_ref().expect("invocation").attempt,
+                1,
+                "the replay must start the candidate over at attempt 1, not continue a phantom retry chain"
+            );
+        }
+
+        #[test]
+        fn resume_mid_stage_budget_reservation_carries_the_crashed_attempt_forward() {
+            let temp = TempDir::new("resume-mid-stage-budget");
+            // Ceiling of 1, already fully consumed by the pre-seeded
+            // crashed attempt below: the replay's reservation must fail
+            // closed before the (deliberately unscripted) executor is ever
+            // called.
+            let mut handle = create_run(&temp, "/artifact/review-target", None, Some(1));
+
+            handle
+                .append_event(
+                    run::EventKind::AttemptStarted,
+                    run::EventInput {
+                        profile_id: Some("worker-1".to_string()),
+                        invocation: Some(run::InvocationEvidence {
+                            stage: "stage_a".to_string(),
+                            slot: 0,
+                            attempt: 1,
+                            execution: candidate("worker-1"),
+                            input_sha256: sha256_hex(b"crashed-input"),
+                            output_sha256: None,
+                            duration_ms: None,
+                            tokens: None,
+                            retry_of: None,
+                        }),
+                        ..run::EventInput::default()
+                    },
+                )
+                .expect("seed crashed attempt_started");
+
+            let stage = one_slot_stage(
+                "stage_a",
+                vec![candidate("worker-1")],
+                1,
+                TargetKind::ArtifactOnly,
+                BTreeMap::new(),
+            );
+            let policy = ScriptedPolicy::new(run::RunJob::Work, vec![stage]);
+
+            // worker-1 is intentionally never scripted: if reserve-never-refund
+            // did not carry the crashed attempt's cost forward, the replay's
+            // reservation would wrongly succeed and the fake would panic on
+            // an unscripted call.
+            let executor = FakeAttemptExecutor::new(temp.path().join("stdout"));
+            let exec = FakeExec {
+                readiness: dispatch::AuthReadiness::Ready,
+            };
+            let commits = FakeCommitProbe { clean: true };
+            let bd = FakeBeadGateway::default();
+            let digests = FakeDigestSource::default();
+            let ports = RunnerPorts {
+                exec: &exec,
+                commits: &commits,
+                bd: &bd,
+                executor: &executor,
+                clock: &SystemClock,
+                digests: &digests,
+            };
+            let request = RunRequest {
+                state_dir: temp.path().join("state"),
+                backend: Backend::Claude,
+                owner: "undertake".to_string(),
+                pinned_digests: BTreeMap::new(),
+            };
+
+            let terminal = AttemptRunner::run(&policy, &ports, &mut handle, &request)
+                .expect("run reaches a terminal, not an error");
+            assert_ne!(terminal.verdict, TerminalVerdict::Completed);
+            assert_eq!(
+                executor.call_count(),
+                0,
+                "the crashed attempt's reservation must count against the ceiling on resume"
+            );
+        }
+
+        #[test]
+        fn resume_with_an_uninterpretable_stage_finished_event_fails_closed_without_guessing() {
+            let temp = TempDir::new("resume-uninterpretable");
+            let mut handle = create_run(&temp, "/nonexistent/repo-e", Some("bead-5"), Some(5));
+
+            // A `stage_finished` event with no `stage_progress` is legal to
+            // write (mirrors `run_finished` without a `terminal_verdict`)
+            // but carries none of the payload reconstruction depends on --
+            // exactly the "uninterpretable record" the contract requires
+            // reconstruction to refuse rather than guess past.
+            handle
+                .append_event(run::EventKind::StageFinished, run::EventInput::default())
+                .expect("write an uninterpretable stage_finished event");
+
+            let stage = one_slot_stage(
+                "stage_a",
+                vec![candidate("worker-1")],
+                1,
+                TargetKind::ArtifactOnly,
+                BTreeMap::new(),
+            );
+            let mut policy = ScriptedPolicy::new(run::RunJob::Work, vec![stage]);
+            policy.claims_bead = true;
+
+            let executor = FakeAttemptExecutor::new(temp.path().join("stdout"));
+            let exec = FakeExec {
+                readiness: dispatch::AuthReadiness::Ready,
+            };
+            let commits = FakeCommitProbe { clean: true };
+            let bd = FakeBeadGateway::default();
+            let digests = FakeDigestSource::default();
+            let ports = RunnerPorts {
+                exec: &exec,
+                commits: &commits,
+                bd: &bd,
+                executor: &executor,
+                clock: &SystemClock,
+                digests: &digests,
+            };
+            let request = RunRequest {
+                state_dir: temp.path().join("state"),
+                backend: Backend::Claude,
+                owner: "undertake".to_string(),
+                pinned_digests: BTreeMap::new(),
+            };
+
+            let error = AttemptRunner::run(&policy, &ports, &mut handle, &request)
+                .expect_err("an uninterpretable stage_finished record must refuse, not guess");
+            assert!(error.to_string().contains("stage_progress"), "{error}");
+            assert_eq!(executor.call_count(), 0);
+            assert!(
+                bd.calls().is_empty(),
+                "bead must never be claimed on a fail-closed refusal"
+            );
+        }
+
+        #[test]
+        fn reconstruction_over_the_v2_fixture_journal_yields_an_empty_ledger_without_erroring() {
+            // The @2 fixture predates `StageFinished` entirely, so
+            // reconstruction must open and read it cleanly -- exactly
+            // today's (pre-fix) always-empty ledger, not an error. This is
+            // the resume path's own round-trip over the same fixture
+            // `run::tests::v2_fixture_journal_opens_reads_and_resumes_under_the_new_binary`
+            // already proves `read_events` handles.
+            const CAPTURED_EVENTS_V2: &str = include_str!("../tests/fixtures/run-events-v2.jsonl");
+            // `read_events` fails closed if a referenced local artifact is
+            // missing (`run::validate_local_artifact`); the fixture's first
+            // event pins `approval.json` by path and sha256, so the fixture
+            // directory needs it too, exactly like
+            // `run::tests::v2_fixture_journal_opens_reads_and_resumes_under_the_new_binary`.
+            const CAPTURED_APPROVAL_V2: &str = include_str!("../tests/fixtures/run-approval-v2.json");
+
+            let temp = TempDir::new("v2-fixture-reconstruction");
+            let events_path = temp.path().join("events.jsonl");
+            std::fs::write(&events_path, CAPTURED_EVENTS_V2).expect("write v2 fixture events");
+            std::fs::write(temp.path().join("approval.json"), CAPTURED_APPROVAL_V2)
+                .expect("write v2 fixture approval");
+            let events = run::read_events(&events_path).expect("read v2 fixture events");
+            assert!(
+                !events.is_empty(),
+                "the v2 fixture must contain at least one event to be a meaningful round trip"
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.kind != run::EventKind::StageFinished),
+                "the v2 fixture predates StageFinished by construction"
+            );
+
+            let handle = create_run(&temp, "/artifact/review-target", None, Some(5));
+            let (ledger, resumed_terminal) = reconstruct_stage_ledger(&handle, &events)
+                .expect("the v2 journal must reconstruct cleanly, not fail closed");
+            assert_eq!(ledger.completed_stages().count(), 0);
+            assert!(!resumed_terminal);
         }
     }
 }
