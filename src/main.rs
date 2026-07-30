@@ -12,7 +12,6 @@ mod dispatch_cycle;
 mod fields;
 mod job;
 mod ledger;
-mod r#loop;
 mod plan;
 mod plan_job;
 mod process;
@@ -27,6 +26,7 @@ mod scan;
 mod state;
 mod triage;
 mod verify;
+mod work_policy;
 #[cfg(feature = "tui")]
 mod dashboard;
 

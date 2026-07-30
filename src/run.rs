@@ -4218,15 +4218,17 @@ mod tests {
             // invocation. Verified by
             // `cli::tests::adversarial_successful_dispatch_keeps_all_mutation_sentinels_untouched`.
             ("cli.rs", include_str!("cli.rs"), 2),
-            // work: the single worker-chain AttemptStarted, attaches
-            // invocation. Verified by `dispatch_cycle::tests::e2e_sandbox`.
+            // work (legacy fleet path): the single worker-chain
+            // AttemptStarted, attaches invocation. Verified by
+            // `dispatch_cycle::tests::e2e_sandbox`. The legacy path stays
+            // untouched until Phase 6 deletes it (`conductor-vd3y`).
             ("dispatch_cycle.rs", include_str!("dispatch_cycle.rs"), 1),
-            // The standalone `loop` kernel is `#[allow(dead_code)]` --
-            // not wired into any active CLI path yet ("activated by the
-            // next job-specific CLI cutover") -- so its single
-            // AttemptStarted never runs in production today and is
-            // correctly left unattached (`EventInput::default()`).
-            ("loop.rs", include_str!("loop.rs"), 1),
+            // The generic runner's single AttemptStarted emitter
+            // (`write_attempt_events`), active in production since `work`
+            // migrated onto it (`conductor-vd3y`). Attaches invocation.
+            // Verified by `work_policy::tests::
+            // work_policy_end_to_end_commits_verifies_and_closes_the_bead`.
+            ("runner.rs", include_str!("runner.rs"), 1),
             // plan: three call sites, all funneled through the single
             // `append_plan_invocation` helper, all attach invocation.
             // Verified by `plan_job::tests::assert_successful_plan_ledger_and_events`.

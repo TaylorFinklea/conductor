@@ -3,10 +3,10 @@
 //! This module intentionally owns no execution path. It accepts only the four
 //! v2 [`RunJob`] variants, validates their immutable policy bindings, and
 //! produces the evidence a loop kernel must persist before selecting a profile.
-#![allow(
-    dead_code,
-    reason = "the loop kernel consumes this registry after its prerequisite lands"
-)]
+//!
+//! `work` consumes this registry in production (`cli::run_work`,
+//! `conductor-vd3y`); `review`/`consult`/`plan` do not yet, so their
+//! bindings are still validated here but otherwise unread.
 
 use std::fmt;
 
@@ -148,6 +148,12 @@ impl JobRegistry {
     /// Validates and explains one profile selected from the immutable binding.
     /// Every earlier pinned identity must be named unavailable; otherwise the
     /// caller attempted to bypass an eligible selection without evidence.
+    #[allow(
+        dead_code,
+        reason = "persistable selection evidence for a future fallback-explain \
+                  consumer (review/consult/plan migrations); not yet called by \
+                  `work`, the only job.rs consumer wired in production so far"
+    )]
     pub(crate) fn explain(
         &self,
         job: RunJob,

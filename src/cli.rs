@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config;
 
-const USAGE: &str = "usage: undertake [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [plan prepare --repo <path> (--bead <id>|--artifact <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL>) --output-kind <spec|implementation-plan> [--max-plan-revisions <0..3>] [--require-second-opinion] [--config <path>]] [plan dispatch <run-id> [--config <path>]] [plan status <run-id> [--config <path>]] [plan cancel <run-id> [--config <path>]] [migrate state --from <legacy-root> --to <undertake-root> [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]] [supersede --repo <path> --source-run <run-id> --source-cycle <cycle-id> --source-bead <id> --source-commit <sha> --replacement-run <run-id> --replacement-cycle <cycle-id> --replacement-bead <id> --replacement-commit <sha>]";
+const USAGE: &str = "usage: undertake [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [plan prepare --repo <path> (--bead <id>|--artifact <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL>) --output-kind <spec|implementation-plan> [--max-plan-revisions <0..3>] [--require-second-opinion] [--config <path>]] [plan dispatch <run-id> [--config <path>]] [plan status <run-id> [--config <path>]] [plan cancel <run-id> [--config <path>]] [migrate state --from <legacy-root> --to <undertake-root> [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]] [supersede --repo <path> --source-run <run-id> --source-cycle <cycle-id> --source-bead <id> --source-commit <sha> --replacement-run <run-id> --replacement-cycle <cycle-id> --replacement-bead <id> --replacement-commit <sha>] [work --repo <path> --bead <id> [--config <path>]]";
 
 /// The dashboard segment of the usage line. Empty in a
 /// `--no-default-features` build, where the command does not exist at all;
@@ -50,6 +50,7 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
         Some("scan") => run_scan(&mut it),
         Some("status") => run_status(&mut it),
         Some("supersede") => run_supersede(&mut it),
+        Some("work") => run_work(&mut it),
         Some(cmd) => {
             eprintln!("unknown subcommand: {cmd}");
             print_usage();
@@ -2082,6 +2083,340 @@ fn run_status(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     println!();
     println!("state directory: {}", state_dir.display());
     ExitCode::SUCCESS
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkOptions {
+    repo: PathBuf,
+    bead: String,
+    config: PathBuf,
+}
+
+fn parse_work_options(args: &[String]) -> Result<WorkOptions, String> {
+    let mut repo = None;
+    let mut bead = None;
+    let mut config_path = PathBuf::from("undertake.toml");
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--repo" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--repo requires a path".to_string())?;
+                repo = Some(PathBuf::from(value));
+            }
+            "--bead" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--bead requires an id".to_string())?;
+                bead = Some(value.clone());
+            }
+            "--config" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--config requires a path argument".to_string())?;
+                config_path = PathBuf::from(value);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(WorkOptions {
+        repo: repo.ok_or_else(|| "work requires --repo <path>".to_string())?,
+        bead: bead.ok_or_else(|| "work requires --bead <id>".to_string())?,
+        config: config_path,
+    })
+}
+
+/// `undertake work` — the first job migrated onto the generic
+/// [`crate::runner::AttemptRunner`] (bead `conductor-vd3y`). Reads its
+/// profile pool, fallback order, limits, verifier policy,
+/// `approval_required`, and mutation posture from the validated
+/// [`crate::job::JobRegistry`]'s `work` binding; a missing or invalid
+/// binding is a fail-closed refusal with an actionable diagnostic, never a
+/// built-in default.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear sequence: parse options, load and validate the closed job \
+              registry, resolve the roster, fetch and triage the bead, create the run, \
+              and dispatch it — splitting it would scatter the fail-closed checks each \
+              step depends on the previous one having already passed"
+)]
+fn run_work(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let args: Vec<String> = it.collect();
+    let options = match parse_work_options(&args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("work: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let cfg = match config::load(&options.config) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            eprintln!("config: invalid — {error}");
+            return ExitCode::from(2);
+        }
+    };
+    if cfg.jobs.is_empty() {
+        eprintln!(
+            "work: no [[job]] bindings configured in {}; the closed registry requires a \
+             work, review, consult, and plan [[job]] entry (see .docs/ai/phases/\
+             undertake-runner-contract.md) before `undertake work` can run",
+            options.config.display()
+        );
+        return ExitCode::from(2);
+    }
+    let registry = match crate::job::JobRegistry::new(cfg.jobs.clone()) {
+        Ok(registry) => registry,
+        Err(error) => {
+            eprintln!(
+                "work: invalid [[job]] configuration in {} — {error}",
+                options.config.display()
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let Some(binding) = registry.binding(crate::run::RunJob::Work) else {
+        eprintln!(
+            "work: no [[job]]\nkind = \"work\"\nbinding in {}",
+            options.config.display()
+        );
+        return ExitCode::from(2);
+    };
+
+    let musterroll = crate::musterroll::CommandMusterrollClient::new();
+    let snapshot = match crate::musterroll::MusterrollClient::roster_snapshot(&musterroll) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("work: musterroll roster snapshot unavailable — {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) = registry.validate_pinned_profiles(&snapshot) {
+        eprintln!("work: {error}");
+        return ExitCode::from(2);
+    }
+    let (candidates, dispatch_facts) =
+        match crate::work_policy::resolve_candidates(binding, &snapshot) {
+            Ok(pair) => pair,
+            Err(error) => {
+                eprintln!("work: {error}");
+                return ExitCode::from(2);
+            }
+        };
+
+    let bd_client = crate::bd::CommandBdClient::new();
+    let issue = match crate::bd::BdClient::show(&bd_client, &options.repo, &options.bead) {
+        Ok(issue) => issue,
+        Err(error) => {
+            eprintln!("work: bd show {}: {error}", options.bead);
+            return ExitCode::from(1);
+        }
+    };
+    let verify_cmd = match crate::fields::extract(&issue) {
+        crate::fields::Triage::Triaged(fields) => match fields.verify_cmd {
+            Some(cmd) if !cmd.trim().is_empty() => cmd,
+            _ => {
+                eprintln!("work: issue {} has no verify_cmd", options.bead);
+                return ExitCode::from(2);
+            }
+        },
+        crate::fields::Triage::Untriaged { missing } => {
+            eprintln!(
+                "work: issue {} is untriaged (missing {missing:?}); undertake work only \
+                 dispatches triaged items",
+                options.bead
+            );
+            return ExitCode::from(2);
+        }
+    };
+
+    let commits = crate::dispatch::GitCommitProbe;
+    let before_head = match crate::dispatch::CommitProbe::head(&commits, &options.repo) {
+        Ok(Some(head)) => head,
+        Ok(None) => {
+            eprintln!(
+                "work: repository {} has no commits",
+                options.repo.display()
+            );
+            return ExitCode::from(2);
+        }
+        Err(error) => {
+            eprintln!("work: git head: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let authorization_sha256 = {
+        let mut hasher = Sha256::new();
+        hasher.update(options.bead.as_bytes());
+        hasher.update(options.repo.display().to_string().as_bytes());
+        for candidate in &candidates {
+            hasher.update(candidate.profile_id.as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    };
+    let approval = serde_json::json!({
+        "schema": "undertake/work-direct-approval@1",
+        "approval_required": binding.approval_required,
+        "repo": options.repo.display().to_string(),
+        "bead": options.bead,
+    });
+
+    // `AttemptRunner::run` checks readiness for one backend up front, before
+    // any stage runs; `work`'s pool can span several, so the primary (first
+    // pinned, still-eligible) candidate's backend stands in for the run-wide
+    // preflight. An empty pool falls back to `Pi` only because the request
+    // still needs some value — the run ends `Blocked` on an empty pool
+    // regardless of what this check reports.
+    let request_backend = candidates
+        .first()
+        .and_then(|candidate| dispatch_facts.get(&candidate.profile_id))
+        .map_or(crate::config::Backend::Pi, |facts| facts.backend);
+
+    let attempt_budget = binding
+        .limits
+        .max_attempts
+        .and_then(|value| u8::try_from(value).ok())
+        .and_then(|value| crate::run::StageAttemptLimit::new(value).ok())
+        .unwrap_or_else(|| crate::run::StageAttemptLimit::new(1).expect("nonzero"));
+    let policy = crate::work_policy::WorkPolicy::new(
+        issue,
+        verify_cmd.clone(),
+        options.repo.clone(),
+        candidates,
+        attempt_budget,
+    );
+    let max_attempts =
+        u64::from(crate::runner::CallBudget::worst_case(&policy.stage_plan()).ceiling());
+
+    let state = state_dir();
+    let mut handle = match crate::run::RunHandle::create(
+        &state,
+        crate::run::RunJob::Work,
+        crate::run::NewRun {
+            target: crate::run::RunTarget {
+                repo: options.repo.display().to_string(),
+                bead: Some(options.bead.clone()),
+            },
+            approved_profiles: binding.pinned_profile_ids().map(str::to_string).collect(),
+            musterroll_roster_artifact: None,
+            roster_snapshot: None,
+            limits: crate::run::RunLimits {
+                item_wall_clock_mins: binding.limits.item_wall_clock_mins,
+                max_attempts: Some(max_attempts),
+            },
+            verifier: crate::run::RunVerifier {
+                mechanical: Some(verify_cmd.clone()),
+                qualitative: None,
+            },
+            work: Some(crate::run::WorkState {
+                cycle_id: format!("work-{}", options.bead),
+                authorization_sha256,
+                before_head: Some(before_head.clone()),
+                owner_pid: Some(std::process::id()),
+                owner_pid_generation: crate::quarantine::process_generation(std::process::id()),
+                worker_pgid: None,
+                worker_pgid_generation: None,
+                worker_slots: Vec::new(),
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                review_resume_budget_secs: None,
+                stage: crate::run::WorkStage::Implementing,
+            }),
+            approval: Some(approval),
+        },
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("work: failed to create run — {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let run_id = handle.run_id().to_string();
+    let run_dir = handle.dir().to_path_buf();
+    let exec = crate::dispatch::CommandExec;
+    let recovery = crate::quarantine::GitRepoRecovery;
+    let worker_resource_limits = crate::dispatch::WorkerResourceLimits::from_budgets(&cfg.budgets);
+    let item_timeout = std::time::Duration::from_secs(
+        binding
+            .limits
+            .item_wall_clock_mins
+            .unwrap_or(u64::from(cfg.budgets.item_wall_clock_mins))
+            * 60,
+    );
+    let executor = crate::work_policy::ProductionAttemptExecutor::new(
+        &exec,
+        &commits,
+        &recovery,
+        options.repo.clone(),
+        run_id,
+        options.bead.clone(),
+        state.clone(),
+        run_dir,
+        Some(before_head.clone()),
+        dispatch_facts,
+        worker_resource_limits,
+        item_timeout,
+        std::time::Duration::from_secs(5),
+    );
+    // `WorkPolicy::revalidation_digests()` declares no digests (see its own
+    // doc comment for why `target_head` cannot be safely reused here), so
+    // `pinned_digests` stays empty; `digests` is still wired for
+    // completeness of the `RunnerPorts` seam.
+    let digests = crate::work_policy::HeadDigestSource::new(&commits, options.repo.clone());
+    let request = crate::runner::RunRequest {
+        state_dir: state,
+        backend: request_backend,
+        owner: "undertake".to_string(),
+        pinned_digests: std::collections::BTreeMap::new(),
+    };
+    let ports = crate::runner::RunnerPorts {
+        exec: &exec,
+        commits: &commits,
+        bd: &bd_client,
+        executor: &executor,
+        clock: &crate::runner::SystemClock,
+        digests: &digests,
+    };
+
+    let terminal = match crate::runner::AttemptRunner::run(&policy, &ports, &mut handle, &request)
+    {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            eprintln!("work: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if terminal.verdict != crate::run::TerminalVerdict::Completed {
+        if let Some(reason) = &terminal.reason {
+            let _ = crate::bd::BdClient::comment(
+                &bd_client,
+                &options.repo,
+                &options.bead,
+                &format!("undertake work: {reason}"),
+            );
+        }
+    }
+
+    println!(
+        "work {}: {:?}{}",
+        options.bead,
+        terminal.verdict,
+        terminal
+            .reason
+            .as_deref()
+            .map(|reason| format!(" — {reason}"))
+            .unwrap_or_default()
+    );
+    if terminal.verdict == crate::run::TerminalVerdict::Completed {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

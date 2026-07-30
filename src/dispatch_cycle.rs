@@ -8057,7 +8057,7 @@ fn append_ledger(
 /// `verify.rs`; if either side is renamed, both must move together.
 const UNDERTAKE_REVISE_FINDINGS_METADATA_KEY: &str = "undertake_revise_findings";
 
-fn render_worker_prompt(issue: &Issue, repo: &Path, verify_cmd: &str) -> String {
+pub(crate) fn render_worker_prompt(issue: &Issue, repo: &Path, verify_cmd: &str) -> String {
     let repo = repo.display().to_string();
     let revision_findings = revision_findings_from_issue(issue);
     let mut out = String::with_capacity(WORKER_TEMPLATE.len() + issue.description.len());

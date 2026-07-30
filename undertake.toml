@@ -211,3 +211,41 @@ fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--high"]
 [[job_fallback]]
 profile_id = "neuralwatt--pi--kimi-k2.6-fast--none"
 fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--medium"]
+
+# Native v2 job registry (bead conductor-vd3y). Closed: exactly one binding
+# per RunJob variant (work/review/consult/plan) is required once this table
+# is non-empty (job.rs::JobRegistry::new). `work` is the only binding a
+# production code path (`undertake work`) reads today; review/consult/plan
+# are pinned here only to satisfy the closed registry ahead of their own
+# migrations and are not yet consumed by any command.
+[[job]]
+kind = "work"
+profile_ids = ["anthropic--claude-code--claude-sonnet-5--none"]
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-terra--xhigh", "openai-codex--codex--gpt-5.6-sol--max"]
+mutation = "repository_write"
+approval_required = true
+role_policy = "implementer"
+item_wall_clock_mins = 45
+max_attempts = 1
+
+[[job]]
+kind = "review"
+profile_ids = ["openai-codex--codex--gpt-5.6-sol--max"]
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-terra--xhigh"]
+mutation = "read_only"
+approval_required = true
+role_policy = "reviewer-panel"
+
+[[job]]
+kind = "consult"
+profile_ids = ["ollama-cloud--omp--glm-5.2--max"]
+mutation = "read_only"
+approval_required = false
+
+[[job]]
+kind = "plan"
+profile_ids = ["openai-codex--omp--gpt-5.6-sol--xhigh"]
+fallback_profile_ids = ["anthropic--omp--claude-opus-4-8--max"]
+mutation = "read_only"
+approval_required = true
+role_policy = "planner"
