@@ -4202,8 +4202,16 @@ mod tests {
     /// cited alongside each entry below.
     ///
     /// The needle is assembled at runtime, split across two literals, so
-    /// this test's own source (included below via `include_str!("run.rs")`
-    /// to scan itself) does not match itself.
+    /// this test's own source (it scans `run.rs` from disk along with every
+    /// other source file) does not match itself.
+    ///
+    /// Discovery is DYNAMIC: the test walks `src/` at runtime rather than
+    /// holding a hardcoded file list. The first revision of this test used a
+    /// fixed `include_str!` array, and the very next new emitter
+    /// (`probe.rs`, `conductor-bxb`) silently escaped it — the exact failure
+    /// mode the test exists to prevent. A file absent from the inventory
+    /// below must contain zero production emitters, so a brand-new module
+    /// with an emitter fails the test until deliberately triaged here.
     #[test]
     fn every_attempt_started_emitter_is_accounted_for() {
         let needle = format!("{}{}", "EventKind::AttemptStarted", ",");
@@ -4213,41 +4221,75 @@ mod tests {
                 .map_or(source, |(production, _)| production)
                 .to_string()
         };
-        let inventory: [(&str, &str, usize); 5] = [
-            // review: reviewer + judge AttemptStarted, both attach
-            // invocation. Verified by
+        // file (relative to src/) -> expected production emitter count.
+        // Every entry's invocation-attach decision is proven by the
+        // behavioral test cited beside it.
+        let inventory: std::collections::BTreeMap<&str, usize> = [
+            // review: reviewer + judge, both attach invocation. Verified by
             // `cli::tests::adversarial_successful_dispatch_keeps_all_mutation_sentinels_untouched`.
-            ("cli.rs", include_str!("cli.rs"), 2),
-            // work (legacy fleet path): the single worker-chain
-            // AttemptStarted, attaches invocation. Verified by
-            // `dispatch_cycle::tests::e2e_sandbox`. The legacy path stays
-            // untouched until Phase 6 deletes it (`conductor-vd3y`).
-            ("dispatch_cycle.rs", include_str!("dispatch_cycle.rs"), 1),
-            // The generic runner's single AttemptStarted emitter
-            // (`write_attempt_events`), active in production since `work`
-            // migrated onto it (`conductor-vd3y`). Attaches invocation.
-            // Verified by `work_policy::tests::
+            ("cli.rs", 2),
+            // work (legacy fleet path, untouched until Phase 6). Attaches
+            // invocation. Verified by `dispatch_cycle::tests::e2e_sandbox`.
+            ("dispatch_cycle.rs", 1),
+            // The generic runner's single emitter (`write_attempt_events`),
+            // live since `work` migrated (`conductor-vd3y`). Attaches
+            // invocation. Verified by `work_policy::tests::
             // work_policy_end_to_end_commits_verifies_and_closes_the_bead`.
-            ("runner.rs", include_str!("runner.rs"), 1),
-            // plan: three call sites, all funneled through the single
-            // `append_plan_invocation` helper, all attach invocation.
-            // Verified by `plan_job::tests::assert_successful_plan_ledger_and_events`.
-            ("plan_job.rs", include_str!("plan_job.rs"), 3),
+            ("runner.rs", 1),
+            // plan: three call sites through `append_plan_invocation`, all
+            // attach invocation. Verified by
+            // `plan_job::tests::assert_successful_plan_ledger_and_events`.
+            ("plan_job.rs", 3),
             // run.rs itself: `start_plan_authoring` and
-            // `replace_plan_author_before_artifact` are deliberately
-            // binding-only and must NOT attach invocation. Verified by
-            // `plan_job::tests::assert_successful_plan_ledger_and_events`'s
-            // planner_authoring split-check (building an equivalent
-            // fixture here would duplicate plan_job.rs's whole dispatch
-            // harness).
-            ("run.rs", include_str!("run.rs"), 2),
-        ];
-        for (file, source, expected_total) in inventory {
-            let total = production_source(source).matches(&needle).count();
+            // `replace_plan_author_before_artifact` are binding-only and
+            // must NOT attach invocation. Verified by plan_job's
+            // planner_authoring split-check.
+            ("run.rs", 2),
+            // bootstrap provider probe (`conductor-bxb`): one emitter in its
+            // own dedicated run, stage `provider_probe`, attaches invocation
+            // so scorecards see probe evidence as probe evidence. Verified
+            // by `probe::tests`.
+            ("probe.rs", 1),
+        ]
+        .into_iter()
+        .collect();
+
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![src_root.clone()];
+        let mut seen = std::collections::BTreeMap::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dirent").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(&src_root)
+                    .expect("under src/")
+                    .to_string_lossy()
+                    .into_owned();
+                let source = std::fs::read_to_string(&path).expect("read source file");
+                let total = production_source(&source).matches(&needle).count();
+                seen.insert(relative, total);
+            }
+        }
+        for (file, total) in &seen {
+            let expected = inventory.get(file.as_str()).copied().unwrap_or(0);
             assert_eq!(
-                total, expected_total,
+                *total, expected,
                 "{file}: production AttemptStarted emitter count changed -- update this \
                  inventory and confirm the new site's invocation-attach decision"
+            );
+        }
+        for file in inventory.keys() {
+            assert!(
+                seen.contains_key(*file),
+                "{file}: listed in the emitter inventory but not found under src/ -- \
+                 remove the stale entry"
             );
         }
     }
