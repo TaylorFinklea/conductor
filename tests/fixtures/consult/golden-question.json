@@ -1,0 +1,12 @@
+{
+  "envelope": "guildhall/envoy@1",
+  "id": "env-20260701T000000Z-c0ffee01",
+  "ts": "2026-07-01T00:00:00Z",
+  "kind": "question",
+  "from": { "hall": "conductor", "agent": "claude-sonnet-5" },
+  "to": { "repo": "/Users/tfinklea/git/envoy" },
+  "constraints": { "read_only": true },
+  "question": {
+    "text": "Which language does envoy's envelope validator use, and why?"
+  }
+}

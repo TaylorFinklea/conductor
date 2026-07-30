@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config;
 
-const USAGE: &str = "usage: undertake [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [plan prepare --repo <path> (--bead <id>|--artifact <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL>) --output-kind <spec|implementation-plan> [--max-plan-revisions <0..3>] [--require-second-opinion] [--config <path>]] [plan dispatch <run-id> [--config <path>]] [plan status <run-id> [--config <path>]] [plan cancel <run-id> [--config <path>]] [migrate state --from <legacy-root> --to <undertake-root> [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]] [supersede --repo <path> --source-run <run-id> --source-cycle <cycle-id> --source-bead <id> --source-commit <sha> --replacement-run <run-id> --replacement-cycle <cycle-id> --replacement-bead <id> --replacement-commit <sha>] [work --repo <path> --bead <id> [--config <path>]]";
+const USAGE: &str = "usage: undertake [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [plan prepare --repo <path> (--bead <id>|--artifact <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL>) --output-kind <spec|implementation-plan> [--max-plan-revisions <0..3>] [--require-second-opinion] [--config <path>]] [plan dispatch <run-id> [--config <path>]] [plan status <run-id> [--config <path>]] [plan cancel <run-id> [--config <path>]] [migrate state --from <legacy-root> --to <undertake-root> [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]] [supersede --repo <path> --source-run <run-id> --source-cycle <cycle-id> --source-bead <id> --source-commit <sha> --replacement-run <run-id> --replacement-cycle <cycle-id> --replacement-bead <id> --replacement-commit <sha>] [work --repo <path> --bead <id> [--config <path>]] [consult --repo <path> --question <text> [--config <path>]]";
 
 /// The dashboard segment of the usage line. Empty in a
 /// `--no-default-features` build, where the command does not exist at all;
@@ -39,6 +39,7 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
         }
         Some("adversarial-review") => run_adversarial(&mut it),
         Some("config") => run_config(&mut it),
+        Some("consult") => run_consult(&mut it),
         #[cfg(feature = "tui")]
         Some("dashboard") => run_dashboard_command(&mut it),
         Some("cycle") => run_cycle(&mut it),
@@ -2487,6 +2488,286 @@ fn run_work(it: &mut std::vec::IntoIter<String>) -> ExitCode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ConsultOptions {
+    repo: PathBuf,
+    question: String,
+    config: PathBuf,
+}
+
+fn parse_consult_options(args: &[String]) -> Result<ConsultOptions, String> {
+    let mut repo = None;
+    let mut question = None;
+    let mut config_path = PathBuf::from("undertake.toml");
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--repo" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--repo requires a path".to_string())?;
+                repo = Some(PathBuf::from(value));
+            }
+            "--question" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--question requires text".to_string())?;
+                question = Some(value.clone());
+            }
+            "--config" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--config requires a path argument".to_string())?;
+                config_path = PathBuf::from(value);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(ConsultOptions {
+        repo: repo.ok_or_else(|| "consult requires --repo <path>".to_string())?,
+        question: question.ok_or_else(|| "consult requires --question <text>".to_string())?,
+        config: config_path,
+    })
+}
+
+/// The accepted answer envelope's captured artifact — the run's product,
+/// per the consult job's terminal rule — read back from `handle`'s own
+/// journal: the last `stage_finished` event's `artifact_refs` (not
+/// `handle.manifest().artifacts`, which accumulates every attempt's output,
+/// including any rejected schema-repair attempts).
+fn consult_completed_artifact(handle: &crate::run::RunHandle) -> Option<(PathBuf, Option<String>)> {
+    let events = crate::run::read_events(&handle.events_path()).ok()?;
+    let artifact = events
+        .iter()
+        .rev()
+        .find(|event| event.kind == crate::run::EventKind::StageFinished)
+        .and_then(|event| event.artifact_refs.first())?;
+    let path = handle.dir().join(&artifact.path);
+    let summary = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| crate::consult_policy::summarize_envelope(&bytes));
+    Some((path, summary))
+}
+
+/// `undertake consult` — the `consult` job from the Envoy contract
+/// (`.docs/ai/phases/undertake-runner-contract.md`'s consult row: "read-only;
+/// explicit ordered profile IDs; terminal rule = evidence-or-gaps answer
+/// envelope"). Mirrors `run_work`'s shape: reads the closed
+/// [`crate::job::JobRegistry`]'s `consult` binding, pins one Musterroll
+/// roster snapshot for both eligibility and the run manifest, and drives a
+/// pure [`crate::consult_policy::ConsultPolicy`] through
+/// [`crate::runner::AttemptRunner`]. Unlike `work`, consult never claims a
+/// bead (no `--bead` argument exists) and runs no bootstrap probe — its
+/// binding has `approval_required = false` and an empty pool is simply
+/// `Blocked`, not a wedge to break.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear sequence mirroring run_work: parse options, load and validate the \
+              closed job registry, resolve the roster, create the run, and dispatch it — \
+              splitting it would scatter the fail-closed checks each step depends on the \
+              previous one having already passed"
+)]
+fn run_consult(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let args: Vec<String> = it.collect();
+    let options = match parse_consult_options(&args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("consult: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let cfg = match config::load(&options.config) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            eprintln!("config: invalid — {error}");
+            return ExitCode::from(2);
+        }
+    };
+    if cfg.jobs.is_empty() {
+        eprintln!(
+            "consult: no [[job]] bindings configured in {}; the closed registry requires a \
+             work, review, consult, and plan [[job]] entry (see .docs/ai/phases/\
+             undertake-runner-contract.md) before `undertake consult` can run",
+            options.config.display()
+        );
+        return ExitCode::from(2);
+    }
+    let registry = match crate::job::JobRegistry::new(cfg.jobs.clone()) {
+        Ok(registry) => registry,
+        Err(error) => {
+            eprintln!(
+                "consult: invalid [[job]] configuration in {} — {error}",
+                options.config.display()
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let Some(binding) = registry.binding(crate::run::RunJob::Consult) else {
+        eprintln!(
+            "consult: no [[job]]\nkind = \"consult\"\nbinding in {}",
+            options.config.display()
+        );
+        return ExitCode::from(2);
+    };
+
+    let musterroll = crate::musterroll::CommandMusterrollClient::new();
+    let snapshot = match crate::musterroll::MusterrollClient::roster_snapshot(&musterroll) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("consult: musterroll roster snapshot unavailable — {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) = registry.validate_pinned_profiles(&snapshot) {
+        eprintln!("consult: {error}");
+        return ExitCode::from(2);
+    }
+    let (candidates, dispatch_facts) =
+        match crate::work_policy::resolve_candidates(binding, &snapshot) {
+            Ok(pair) => pair,
+            Err(error) => {
+                eprintln!("consult: {error}");
+                return ExitCode::from(2);
+            }
+        };
+    if candidates.is_empty() {
+        println!("consult: Blocked — no eligible profile in the consult job's pinned pool");
+        return ExitCode::from(1);
+    }
+
+    let request_backend = candidates
+        .first()
+        .and_then(|candidate| dispatch_facts.get(&candidate.profile_id))
+        .map_or(crate::config::Backend::Pi, |facts| facts.backend);
+
+    let attempt_budget = binding
+        .limits
+        .max_attempts
+        .and_then(|value| u8::try_from(value).ok())
+        .and_then(|value| crate::run::StageAttemptLimit::new(value).ok())
+        .unwrap_or_else(|| {
+            crate::run::StageAttemptLimit::new(crate::consult_policy::DEFAULT_CONSULT_ATTEMPT_BUDGET)
+                .expect("nonzero")
+        });
+    let policy = crate::consult_policy::ConsultPolicy::new(
+        options.question.clone(),
+        options.repo.clone(),
+        candidates,
+        attempt_budget,
+    );
+    let max_attempts =
+        u64::from(crate::runner::CallBudget::worst_case(&policy.stage_plan()).ceiling());
+
+    let state = state_dir();
+    let mut handle = match crate::run::RunHandle::create(
+        &state,
+        crate::run::RunJob::Consult,
+        crate::run::NewRun {
+            target: crate::run::RunTarget {
+                repo: options.repo.display().to_string(),
+                bead: None,
+            },
+            approved_profiles: binding.pinned_profile_ids().map(str::to_string).collect(),
+            musterroll_roster_artifact: None,
+            roster_snapshot: Some(crate::run::RosterSnapshotInput {
+                bytes: snapshot.snapshot_bytes().to_vec(),
+                policy_sha256: snapshot.policy_sha256().to_string(),
+            }),
+            limits: crate::run::RunLimits {
+                item_wall_clock_mins: binding.limits.item_wall_clock_mins,
+                max_attempts: Some(max_attempts),
+            },
+            verifier: crate::run::RunVerifier::default(),
+            work: None,
+            approval: None,
+        },
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("consult: failed to create run — {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let run_dir = handle.dir().to_path_buf();
+    let exec = crate::dispatch::CommandExec;
+    let commits = crate::dispatch::GitCommitProbe;
+    let item_timeout = std::time::Duration::from_secs(
+        binding
+            .limits
+            .item_wall_clock_mins
+            .unwrap_or(u64::from(cfg.budgets.item_wall_clock_mins))
+            * 60,
+    );
+    let executor = match crate::consult_policy::ConsultAttemptExecutor::new(
+        &exec,
+        &commits,
+        options.repo.clone(),
+        run_dir,
+        dispatch_facts,
+        item_timeout,
+    ) {
+        Ok(executor) => executor,
+        Err(error) => {
+            eprintln!("consult: failed to preflight target repo {}: {error}", options.repo.display());
+            return ExitCode::from(1);
+        }
+    };
+
+    let roster_policy_sha256 = handle.manifest().roster_policy_sha256.clone();
+    let digests = crate::consult_policy::ConsultDigestSource::new(roster_policy_sha256.clone());
+    let mut pinned_digests = std::collections::BTreeMap::new();
+    if let Some(policy_sha256) = roster_policy_sha256 {
+        pinned_digests.insert(crate::runner::DigestKind::RosterPolicySha256, policy_sha256);
+    }
+    let request = crate::runner::RunRequest {
+        state_dir: state,
+        backend: request_backend,
+        owner: "undertake".to_string(),
+        pinned_digests,
+    };
+    let bd_client = crate::bd::CommandBdClient::new();
+    let ports = crate::runner::RunnerPorts {
+        exec: &exec,
+        commits: &commits,
+        bd: &bd_client,
+        executor: &executor,
+        clock: &crate::runner::SystemClock,
+        digests: &digests,
+    };
+
+    let terminal = match crate::runner::AttemptRunner::run(&policy, &ports, &mut handle, &request)
+    {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            eprintln!("consult: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    println!(
+        "consult {}: {:?}{}",
+        options.repo.display(),
+        terminal.verdict,
+        terminal
+            .reason
+            .as_deref()
+            .map(|reason| format!(" — {reason}"))
+            .unwrap_or_default()
+    );
+    if terminal.verdict == crate::run::TerminalVerdict::Completed {
+        if let Some((path, summary)) = consult_completed_artifact(&handle) {
+            println!("consult: envelope captured at {}", path.display());
+            if let Some(summary) = summary {
+                println!("consult: {summary}");
+            }
+        }
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CycleOptions {
     dry_run: bool,
     config: PathBuf,
@@ -2909,6 +3190,75 @@ mod tests {
         runs.sort();
         assert_eq!(runs.len(), 1, "expected exactly one contract run");
         runs.pop().expect("one run")
+    }
+
+    #[test]
+    fn parse_consult_options_requires_repo_and_question() {
+        let parsed = parse_consult_options(&[
+            "--repo".to_string(),
+            "/tmp/target-repo".to_string(),
+            "--question".to_string(),
+            "does this repo use rustfmt?".to_string(),
+        ])
+        .expect("valid consult options");
+        assert_eq!(parsed.repo, PathBuf::from("/tmp/target-repo"));
+        assert_eq!(parsed.question, "does this repo use rustfmt?");
+        assert_eq!(parsed.config, PathBuf::from("undertake.toml"));
+
+        assert!(parse_consult_options(&["--question".to_string(), "q".to_string()]).is_err());
+        assert!(parse_consult_options(&["--repo".to_string(), "/tmp/x".to_string()]).is_err());
+    }
+
+    /// A config declaring `work`/`review`/`plan` but no `consult` binding
+    /// fails closed before `undertake consult` ever queries Musterroll,
+    /// claims a bead, or touches the target repository — the closed
+    /// `JobRegistry` (exactly four bindings) rejects it outright.
+    #[test]
+    fn consult_fails_closed_when_the_job_registry_has_no_consult_binding() {
+        let temp = CliTempDir::new("consult-missing-binding");
+        let config_path = temp.path().join("undertake.toml");
+        std::fs::write(
+            &config_path,
+            "[[job]]\nkind = \"work\"\nprofile_ids = [\"w\"]\n\
+             mutation = \"repository_write\"\napproval_required = true\n\n\
+             [[job]]\nkind = \"review\"\nprofile_ids = [\"r\"]\n\
+             mutation = \"read_only\"\napproval_required = true\n\n\
+             [[job]]\nkind = \"plan\"\nprofile_ids = [\"p\"]\n\
+             mutation = \"read_only\"\napproval_required = true\n",
+        )
+        .expect("write config missing the consult binding");
+
+        let exit = run(vec![
+            "consult".to_string(),
+            "--repo".to_string(),
+            "/tmp/target-repo".to_string(),
+            "--question".to_string(),
+            "does this repo use rustfmt?".to_string(),
+            "--config".to_string(),
+            config_path.display().to_string(),
+        ]);
+        assert_eq!(exit, ExitCode::from(2));
+    }
+
+    /// An empty `[[job]]` table (no bindings configured at all) is the same
+    /// fail-closed shape, hit even earlier — before `JobRegistry::new` is
+    /// ever called.
+    #[test]
+    fn consult_fails_closed_when_no_job_bindings_are_configured_at_all() {
+        let temp = CliTempDir::new("consult-no-jobs-at-all");
+        let config_path = temp.path().join("undertake.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+
+        let exit = run(vec![
+            "consult".to_string(),
+            "--repo".to_string(),
+            "/tmp/target-repo".to_string(),
+            "--question".to_string(),
+            "does this repo use rustfmt?".to_string(),
+            "--config".to_string(),
+            config_path.display().to_string(),
+        ]);
+        assert_eq!(exit, ExitCode::from(2));
     }
 
     #[test]

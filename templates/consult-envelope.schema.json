@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://guildhall.local/schemas/envoy-envelope-v1.json",
+  "$comment": "Imported from ~/git/envoy/skill/envelope.schema.json on 2026-07-29 for bead conductor-utwq (see .docs/ai/phases/undertake-runner-contract.md's `consult` row). Byte-for-byte otherwise unchanged. Documentation/interchange artifact only, exactly as the source file's own description states -- src/consult_policy.rs's parse_and_validate_envelope is the actual in-process Rust enforcement mechanism the `consult` job runs; this file is never loaded at runtime and Undertake never shells out to Envoy's scripts/validate-envelope.sh.",
+  "title": "guildhall/envoy@1 envelope",
+  "description": "JSON Schema rendering of ~/git/guildhall/.docs/ai/phases/envoy-envelope.md's shape (lines 8-32). Documentation/interchange artifact for other consumers — scripts/validate-envelope.sh is the actual enforcement mechanism (see .docs/ai/decisions.md).",
+  "type": "object",
+  "required": ["envelope", "id", "ts", "kind", "from", "to", "constraints"],
+  "properties": {
+    "envelope": {
+      "const": "guildhall/envoy@1"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^env-"
+    },
+    "ts": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "kind": {
+      "enum": ["question", "answer", "notice"]
+    },
+    "from": {
+      "type": "object",
+      "required": ["hall", "agent"],
+      "properties": {
+        "hall": { "type": "string", "minLength": 1 },
+        "agent": { "type": "string", "minLength": 1 },
+        "session_ref": { "type": "string" }
+      }
+    },
+    "to": {
+      "type": "object",
+      "required": ["repo"],
+      "properties": {
+        "repo": { "type": "string", "pattern": "^/" },
+        "hall": { "type": "string" }
+      }
+    },
+    "reply_to": {
+      "type": "string",
+      "pattern": "^env-"
+    },
+    "deadline": {
+      "type": "string"
+    },
+    "constraints": {
+      "type": "object",
+      "required": ["read_only"],
+      "properties": {
+        "read_only": { "const": true },
+        "max_minutes": { "type": "number" }
+      }
+    },
+    "question": {
+      "type": "object",
+      "properties": {
+        "text": { "type": "string", "minLength": 1 },
+        "schema": { "type": "object" }
+      }
+    },
+    "answer": {
+      "type": "object",
+      "properties": {
+        "value": {},
+        "confidence": { "enum": ["high", "medium", "low"] },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "line": { "type": "number" },
+              "note": { "type": "string" }
+            }
+          }
+        },
+        "gaps": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "kind": { "const": "question" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["question"],
+        "properties": {
+          "question": { "required": ["text"] }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "answer" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["answer"],
+        "properties": {
+          "answer": {
+            "anyOf": [
+              {
+                "required": ["evidence"],
+                "properties": { "evidence": { "type": "array", "minItems": 1 } }
+              },
+              {
+                "required": ["gaps"],
+                "properties": { "gaps": { "type": "array", "minItems": 1 } }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

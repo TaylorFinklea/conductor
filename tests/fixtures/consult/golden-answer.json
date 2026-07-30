@@ -1,0 +1,20 @@
+{
+  "envelope": "guildhall/envoy@1",
+  "id": "env-20260701T000005Z-decade02",
+  "ts": "2026-07-01T00:00:05Z",
+  "kind": "answer",
+  "from": { "hall": "envoy", "agent": "claude-sonnet-5" },
+  "to": { "repo": "/Users/tfinklea/git/envoy" },
+  "reply_to": "env-20260701T000000Z-c0ffee01",
+  "constraints": { "read_only": true },
+  "answer": {
+    "value": "shell + jq",
+    "confidence": "high",
+    "evidence": [
+      {
+        "path": ".docs/ai/decisions.md",
+        "note": "§ [2026-07-01] Envelope validator: shell + jq, not Rust"
+      }
+    ]
+  }
+}

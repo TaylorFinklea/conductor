@@ -5,6 +5,7 @@ mod bd;
 mod musterroll;
 mod cli;
 mod config;
+mod consult_policy;
 mod cycle;
 mod deck;
 mod dispatch;
