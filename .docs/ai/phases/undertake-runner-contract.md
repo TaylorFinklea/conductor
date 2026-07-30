@@ -704,6 +704,154 @@ Only then does `conductor-mkct` extract the runner onto genuinely generic substr
 Both are now sequencing consequences rather than open design questions. The remaining
 genuine unknowns are inside the prep items above.
 
+## `conductor-ed12` finding (2026-07-30): `plan`'s re-home does not fit the runner as built
+
+`conductor-ed12` set out to re-home `plan_job::dispatch`/`dispatch_review_stages` onto
+`AttemptRunner` now that `runner.rs` exists with a full `AttemptRunner::run` (not just pass
+(a)'s types) and two jobs (`work`, `consult`) already migrated as `JobPolicy` implementors.
+After reading `runner.rs` end to end, `plan_job.rs`'s `dispatch`/`dispatch_review_stages`
+(`plan_job.rs:1543-2475`) and their helpers, `run.rs`'s `PlanProgress` machinery, and
+`role_routing.rs`'s reservation API, the re-home **does not fit in one reviewable commit
+without distorting the runner or forking plan's semantics**. This is the STOP-AND-SURFACE
+map the bead's own instructions asked for. No implementation code changed; this section is
+the only edit.
+
+### What migrates cleanly
+
+`with_isolated_worktree` (`plan_job.rs:3078-3116`: `git worktree add --detach`, run, then
+unconditional `git worktree remove --force` + `remove_dir_all`) is byte-for-byte the same
+shape as `runner::Worktree`/`WorktreePort` (`runner.rs:671-757`), which was built as an
+independent reimplementation of exactly this contract in anticipation of this migration. A
+`GitWorktreeIsolated` `AttemptExecutor` wrapping `WorktreePort::create` around
+`dispatch::run_readonly` is buildable today with no runner changes. This was the one piece
+of the bead's own "known integration points" that held up under verification.
+
+### What does not fit, and why
+
+1. **The live-eligibility recheck-and-filter machinery the contract assigns to "the
+   runner" does not exist in `runner.rs`.** `### Stage constraints` (above) states: "the
+   pool is authorization, the recheck is eligibility, and both belong to the runner...
+   takes the stage's pinned candidate pool, filters by live eligibility... applies the
+   constraints, and picks in pinned order." `Stage.constraints: StageConstraints` is a
+   field on every `Stage` (`runner.rs:279`), but grepping `runner.rs` for any non-test read
+   of it returns nothing: `AttemptRunner::run`, `dispatch_stage_slots`, and `walk_slot`
+   walk `slot.candidates` in the order given with no live-recheck or filter step at all.
+   `work` and `consult` never needed this (`work_policy.rs`/`consult_policy.rs` have no
+   `RoleRouter`/reservation/live-recheck logic — grepped, zero hits), so the gap was never
+   exercised. `plan` is the first job that would need it, at multiple points:
+   `recheck_author` re-validates a bound author/peer/second before every attempt
+   (`plan_job.rs:1657,1911,2110,2293`), and `select_reviewer`/`available_planner` filter a
+   live-eligible pool before binding (`plan_job.rs:2680`, `3034-3055`). Building this now,
+   for the first time, inside a plan-specific migration would make the runner generic in
+   name only — the actual generic implementation is a separate, independently reviewable
+   piece of work.
+
+2. **Per-attempt reservation/capacity mutation has no channel to the runner's fixed
+   executor-error handling.** `activate_plan_stage_capacity` (`plan_job.rs:1419-1471`, a
+   `RoleRouter::activate_capacity` mutation) runs inside `start_plan_stage_invocation`
+   (`plan_job.rs:1480-1535`), which fires before **every** model call in a stage,
+   including repair retries (call sites at `plan_job.rs:1941,2001,2130,2184,2320,2377`) —
+   not once per run. Pre-call eligibility loss needs to map to `AdvanceCandidate` for an
+   unbound planner candidate but to `Fatal` for a bound peer/second/revision-author
+   (`plan_job.rs:1915-1922` is the canonical "bound peer loses eligibility → Blocked, never
+   fallback" case the contract itself cites). But `walk_slot`'s only channel for an
+   executor-detected problem is `AttemptExecutor::execute` returning `Err`, and
+   `walk_slot` hardcodes that branch to `AttemptAction::Fatal` unconditionally
+   (`runner.rs:1041-1058`) — it never consults `stage.action_for()` the way a classified
+   `AttemptOutcome` does. There is today no way for an executor (or anything short of the
+   runner's own core loop) to report "ineligible before spawn, and here is which
+   stage-declared action that implies."
+
+3. **`select_reviewer` is a stateful "select and durably bind" step with side effects on
+   two separate stores, not a pure candidate pick.** `select_reviewer`
+   (`plan_job.rs:2627-2776`) filters a live-eligible pool (constraint-checked against the
+   author/peer, tier, and provider-diversity rules already generalized into
+   `StageConstraints`), then calls `RoleRouter::bind_reviewer` (`role_routing.rs:771-814`,
+   itself a lock-guarded lane-state mutation creating a retry-generation-scoped
+   reservation), then `RunHandle::bind_plan_peer`/`bind_plan_second_opinion`
+   (`run.rs:2159-2183`, a manifest write), then `RoleRouter::commit`
+   (`role_routing.rs:756-758`). This must happen at most once per stage-entry (not once per
+   attempt — repairs reuse the already-bound reviewer). It needs `&mut RunHandle`, `&RoleRouter`,
+   and live `&dyn MusterrollClient` simultaneously. It cannot be `JobPolicy::next_stage`
+   (must stay a pure function of the ledger) and cannot be `JobPolicy::prompt` or
+   `classify_attempt` (both run inside `walk_slot`'s per-attempt loop, so binding there
+   would rebind on every retry and would mutate a lock-guarded external file from a
+   supposedly pure, `Sync`-shared trait object).
+
+4. **The deepest gap: there is no seam for a policy to durably update job-specific typed
+   progress state.** `PlanProgress` (`run.rs:585-622`) is a six-variant resumable state
+   machine that the rest of the system reads directly off the manifest (`plan status`, the
+   dashboard, and `role_routing`'s terminal predicate via `state.rs` — all named in the
+   bead's own "what stays exactly as-is" list). It is written by roughly a dozen
+   `RunHandle` methods (`start_plan_authoring`, `replace_plan_author_before_artifact`,
+   `finish_plan_blocked`, `record_plan_author_attempt`, `await_plan_peer`,
+   `record_plan_stage_attempt`, `bind_plan_peer`, `bind_plan_second_opinion`,
+   `record_plan_peer_verdict`, `complete_plan_revision`, `record_plan_second_opinion`,
+   `finish_plan_needs_input`; see `run.rs:1942-2320` for the full set), each taking
+   `&mut RunHandle` directly. `record_plan_peer_verdict` alone
+   (`run.rs:2075-2135`) branches into three different outcomes — non-terminal
+   `Revising`/`AwaitingSecondOpinion`, or a terminal `Rejected`/`Accepted` that calls
+   `self.finish_with_verdict(...)` **immediately**, mid-loop, not at the end of a stage
+   sequence. `JobPolicy::transition(&self, ledger, stage_outcome) -> Transition`
+   (`runner.rs:814`) is deliberately pure — no `&mut RunHandle` — and `Transition`
+   (`runner.rs:399-409`) carries nothing but a `StageId` and a `Vec<AttemptOutput>`. There
+   is no value `transition` could return that the runner's generic stage loop
+   (`runner.rs:1651-1691`) would know how to turn into "call
+   `record_plan_peer_verdict(peer, verdict, require_second_opinion)`, including its
+   internal early-terminal branch." The runner's own `finalize` (`runner.rs:1441-1473`)
+   calls `finish_with_verdict` exactly once, at the very end of `AttemptRunner::run` — it
+   has no mechanism for a mid-loop terminal the way plan's peer-approve-without-second-
+   opinion path needs. This is the same class of gap the contract's own `## The genericity
+   is not there yet` table already named for `work` ("Terminal reconciliation is generic →
+   actually `reconcile_terminal_manifest` mutates only `RunDetails::Work`"); it was never
+   closed for `plan`, because `work` and `consult` have no comparable typed per-job
+   progress machine to preserve in the first place.
+
+### Secondary, non-blocking on their own
+
+- `append_plan_invocation` (`plan_job.rs:2481-2556`) writes a `crate::ledger::append`
+  scorecard row after every attempt, alongside the generic `run.append_event`. The
+  already-migrated `work` path (`cli.rs` around the `work_policy::WorkPolicy` dispatch,
+  `work_policy::ProductionAttemptExecutor`) does **not** write this row at all — grepped,
+  zero `ledger::append` call sites in `work_policy.rs`/`consult_policy.rs`. That is
+  precedent that dropping it may be an already-accepted gap, but it has not been decided
+  either way and a plan migration should not make that call silently a second time.
+- `reconcile_plan_reservations` (`plan_job.rs:843-897`) is a genuine outlier in the other
+  direction: it is a global scan of every run directory under the state dir, done exactly
+  once at the top of `dispatch()`, before any stage-specific logic runs. This one piece
+  plausibly does fit the bead's option (a) — a CLI-layer wrapper called once
+  before/after `AttemptRunner::run`, unchanged. It is the **per-attempt** pieces (findings
+  2 and 3 above) that do not fit that shape; conflating "reservation reconciliation" as a
+  single concern (as the bead's own framing does) understates that most of the reservation
+  surface is not the once-per-run reconciliation pass.
+
+### The right decomposition
+
+In the same spirit as `## Phase 1b-prep`'s already-sequenced items, the finding above
+implies three more prerequisites before a `plan` re-home can land as a policy-only change:
+
+1. **A narrow, audited seam for job-specific durable progress.** Replace the pure
+   `JobPolicy::transition` with something the runner calls *with* `&mut RunHandle` at the
+   stage boundary — e.g. `JobPolicy::apply_transition(&self, handle: &mut RunHandle,
+   ledger: &StageLedger, outcome: StageOutcome) -> Result<Transition>` — so a policy can
+   perform its own bounded manifest writes through methods `run.rs` already exposes
+   (`record_plan_peer_verdict` and siblings), including an early terminal. This is a
+   deliberate, scoped relaxation of "a policy never touches `RunHandle`," not scope creep,
+   and deserves its own ADR rather than being decided inside a migration commit.
+2. **Build the `StageConstraints` live-recheck-and-filter machinery `### Stage constraints`
+   already specifies**, generically, in `AttemptRunner::run`/`dispatch_stage_slots` — usable
+   by `review` later too, not plan-specific.
+3. **A capacity/reservation port** (Sol's "scheduler port", the bead's option (b)) —
+   `trait CapacityPort { fn select_and_bind(..) -> Result<ApprovedExecution>; fn
+   activate(..); fn recheck(..); }` — called by the runner at stage-entry and pre-attempt,
+   with a plan-specific implementation and a no-op implementation for the other jobs. This
+   needs its own design pass; grafting it into this migration ad hoc is exactly the
+   "distorting the runner" the bead's STOP-AND-SURFACE clause warns against.
+
+Only after 1–3 land does `plan`'s dispatch loop reduce to walking
+`next_stage`/`prompt`/`classify_attempt`/`apply_transition`, at which point the
+`GitWorktreeIsolated` executor already validated above plugs in with no further rework.
+
 ## Acceptance
 
 A Senior can implement `conductor-mkct` from this document without making a design
