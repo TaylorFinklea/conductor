@@ -14,6 +14,7 @@ mod job;
 mod ledger;
 mod plan;
 mod plan_job;
+mod probe;
 mod process;
 mod quarantine;
 mod ratchet;

@@ -2205,6 +2205,59 @@ fn run_work(it: &mut std::vec::IntoIter<String>) -> ExitCode {
             }
         };
 
+    // Bootstrap deadlock (bead `conductor-bxb`): if every pinned profile is
+    // `Unknown`, the pool above comes up empty and no ordinary dispatch can
+    // ever generate the evidence that would change that. Before the bead is
+    // claimed or the repo is touched, probe any Unknown+enabled pinned
+    // profile with a bounded, tools-disabled, read-only invocation; a
+    // validated probe appends exact-scope runtime-success evidence via
+    // Musterroll and the pool is re-resolved against a fresh snapshot. See
+    // `.docs/ai/phases/undertake-runner-contract.md`'s bootstrap-probe
+    // section and the bead's own pinned design.
+    let (candidates, dispatch_facts) = if candidates.is_empty() {
+        let outcome = match crate::probe::resolve_with_bootstrap_probe(
+            &state_dir(),
+            &options.repo.display().to_string(),
+            &options.bead,
+            binding,
+            &snapshot,
+            &crate::dispatch::CommandExec,
+            &musterroll,
+            std::time::Duration::from_secs(90),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                eprintln!("work: bootstrap probe failed — {error}");
+                return ExitCode::from(1);
+            }
+        };
+        if !outcome.probed.is_empty() {
+            let validated = outcome
+                .probed
+                .iter()
+                .filter(|report| matches!(report.verdict, crate::probe::ProbeVerdict::Validated))
+                .count();
+            println!(
+                "work: bootstrap probe attempted {} profile(s), {validated} validated",
+                outcome.probed.len()
+            );
+        }
+        (outcome.candidates, outcome.dispatch_facts)
+    } else {
+        (candidates, dispatch_facts)
+    };
+
+    if candidates.is_empty() {
+        // No eligible profile, and either nothing was Unknown+enabled to
+        // probe or probing did not produce one. Stop here — before any bead
+        // claim or repo mutation, per the bead's preflight ordering.
+        println!(
+            "work {}: Blocked — no eligible profile in the work job's pinned pool",
+            options.bead
+        );
+        return ExitCode::from(1);
+    }
+
     let bd_client = crate::bd::CommandBdClient::new();
     let issue = match crate::bd::BdClient::show(&bd_client, &options.repo, &options.bead) {
         Ok(issue) => issue,

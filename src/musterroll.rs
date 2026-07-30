@@ -33,6 +33,19 @@ pub(crate) trait MusterrollClient {
     fn observe(&self, _request: &ObservationRequest) -> Result<()> {
         Err(MusterrollError::unavailable("musterroll observation unavailable"))
     }
+
+    /// Append a bounded, exact-scope runtime-success attestation via
+    /// `musterroll success` (bead `conductor-bxb`). Unlike [`Self::observe`],
+    /// this can only ever promote one exact (provider, model) profile — never
+    /// a provider-wide health signal — and its evidence caps out at
+    /// `RUNTIME_SUCCESS_MAX_TTL_SECONDS` regardless of the requested
+    /// `expires_at`, both enforced by musterroll itself.
+    #[allow(dead_code)]
+    fn success(&self, _request: &SuccessObservationRequest) -> Result<()> {
+        Err(MusterrollError::unavailable(
+            "musterroll success observation unavailable",
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -645,6 +658,21 @@ pub(crate) struct RuntimeLimitEvidence {
     pub(crate) reason: RuntimeLimitReason,
 }
 
+/// Request for a bounded, machine-generated `musterroll success` attestation
+/// (bead `conductor-bxb`'s bootstrap probe). `provider` is musterroll's
+/// `availability_key`, and `model` must be the exact model configured for
+/// that provider in the roster — musterroll rejects an unrecognized
+/// (provider, model) pair rather than silently widening scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SuccessObservationRequest {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) evidence_id: String,
+    pub(crate) expires_at: String,
+    pub(crate) source: String,
+    pub(crate) reason: String,
+}
+
 impl ObservationRequest {
     pub(crate) fn runtime_limit(
         provider: impl Into<String>,
@@ -804,6 +832,34 @@ impl MusterrollClient for CommandMusterrollClient {
         }
         Ok(())
     }
+
+    fn success(&self, request: &SuccessObservationRequest) -> Result<()> {
+        let args = success_args(request);
+        let outcome = self
+            .attach_cancel(
+                crate::process::BoundedCommand::new("musterroll")
+                    .args(&args)
+                    .stdout_cap(4 * 1024 * 1024)
+                    .stderr_cap(256 * 1024)
+                    .timeout(std::time::Duration::from_secs(60)),
+            )
+            .run()
+            .map_err(|error| spawn_error("musterroll success", &error))?;
+
+        if outcome.timed_out() || outcome.stdout_truncated {
+            return Err(MusterrollError::command(
+                "musterroll success timed out or exceeded output bounds",
+            ));
+        }
+
+        if outcome.exit_code != Some(0) {
+            return Err(MusterrollError::command(command_failure_message(
+                "musterroll success",
+                &outcome,
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Formats a command's exit condition as `exit <code>`, `cancelled` (its
@@ -896,6 +952,25 @@ fn observation_args(request: &ObservationRequest) -> Vec<String> {
         args.extend(["--model".to_string(), model.to_string()]);
     }
     args
+}
+
+#[allow(dead_code)]
+fn success_args(request: &SuccessObservationRequest) -> Vec<String> {
+    vec![
+        "success".to_string(),
+        "--provider".to_string(),
+        request.provider.clone(),
+        "--model".to_string(),
+        request.model.clone(),
+        "--evidence-id".to_string(),
+        request.evidence_id.clone(),
+        "--expires-at".to_string(),
+        request.expires_at.clone(),
+        "--source".to_string(),
+        request.source.clone(),
+        "--reason".to_string(),
+        request.reason.clone(),
+    ]
 }
 
 pub(crate) fn canonical_provider_key(provider: &str) -> &str {
