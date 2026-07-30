@@ -2214,7 +2214,7 @@ fn run_work(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     // Musterroll and the pool is re-resolved against a fresh snapshot. See
     // `.docs/ai/phases/undertake-runner-contract.md`'s bootstrap-probe
     // section and the bead's own pinned design.
-    let (candidates, dispatch_facts) = if candidates.is_empty() {
+    let (candidates, dispatch_facts, roster_snapshot) = if candidates.is_empty() {
         let outcome = match crate::probe::resolve_with_bootstrap_probe(
             &state_dir(),
             &options.repo.display().to_string(),
@@ -2242,9 +2242,9 @@ fn run_work(it: &mut std::vec::IntoIter<String>) -> ExitCode {
                 outcome.probed.len()
             );
         }
-        (outcome.candidates, outcome.dispatch_facts)
+        (outcome.candidates, outcome.dispatch_facts, outcome.snapshot)
     } else {
-        (candidates, dispatch_facts)
+        (candidates, dispatch_facts, snapshot)
     };
 
     if candidates.is_empty() {
@@ -2354,7 +2354,10 @@ fn run_work(it: &mut std::vec::IntoIter<String>) -> ExitCode {
             },
             approved_profiles: binding.pinned_profile_ids().map(str::to_string).collect(),
             musterroll_roster_artifact: None,
-            roster_snapshot: None,
+            roster_snapshot: Some(crate::run::RosterSnapshotInput {
+                bytes: roster_snapshot.snapshot_bytes().to_vec(),
+                policy_sha256: roster_snapshot.policy_sha256().to_string(),
+            }),
             limits: crate::run::RunLimits {
                 item_wall_clock_mins: binding.limits.item_wall_clock_mins,
                 max_attempts: Some(max_attempts),
@@ -2415,16 +2418,27 @@ fn run_work(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         item_timeout,
         std::time::Duration::from_secs(5),
     );
-    // `WorkPolicy::revalidation_digests()` declares no digests (see its own
-    // doc comment for why `target_head` cannot be safely reused here), so
-    // `pinned_digests` stays empty; `digests` is still wired for
-    // completeness of the `RunnerPorts` seam.
-    let digests = crate::work_policy::HeadDigestSource::new(&commits, options.repo.clone());
+    // `WorkPolicy::revalidation_digests()` declares `RosterPolicySha256`
+    // (see its own doc comment): `pinned_digests` carries the value just
+    // pinned into this run's own manifest above, and `digests` reads that
+    // same pinned copy back rather than re-querying live Musterroll, so the
+    // check is pinned-vs-pinned and a resumed run with no pinned artifact
+    // fails closed (bead `conductor-i9lq`).
+    let roster_policy_sha256 = handle.manifest().roster_policy_sha256.clone();
+    let digests = crate::work_policy::HeadDigestSource::new(
+        &commits,
+        options.repo.clone(),
+        roster_policy_sha256.clone(),
+    );
+    let mut pinned_digests = std::collections::BTreeMap::new();
+    if let Some(policy_sha256) = roster_policy_sha256 {
+        pinned_digests.insert(crate::runner::DigestKind::RosterPolicySha256, policy_sha256);
+    }
     let request = crate::runner::RunRequest {
         state_dir: state,
         backend: request_backend,
         owner: "undertake".to_string(),
-        pinned_digests: std::collections::BTreeMap::new(),
+        pinned_digests,
     };
     let ports = crate::runner::RunnerPorts {
         exec: &exec,

@@ -427,6 +427,14 @@ pub(crate) struct BootstrapOutcome {
     pub(crate) candidates: Vec<ApprovedExecution>,
     pub(crate) dispatch_facts: BTreeMap<String, DispatchFacts>,
     pub(crate) probed: Vec<ProbeReport>,
+    /// The exact snapshot `candidates`/`dispatch_facts` were resolved
+    /// against: `initial_snapshot` when no probing ran (the pool was
+    /// already non-empty, or nothing pinned was Unknown+enabled), or the
+    /// post-probe re-snapshot when it did. Bead `conductor-i9lq`: the
+    /// caller pins this exact snapshot into the work run's manifest, so
+    /// eligibility and the pinned copy always trace back to the same
+    /// bytes -- never a second, potentially divergent Musterroll call.
+    pub(crate) snapshot: RosterSnapshot,
 }
 
 /// The CLI-layer preflight `undertake work` runs before job dispatch when
@@ -458,6 +466,7 @@ pub(crate) fn resolve_with_bootstrap_probe(
             candidates,
             dispatch_facts,
             probed: Vec::new(),
+            snapshot: initial_snapshot.clone(),
         });
     }
 
@@ -467,6 +476,7 @@ pub(crate) fn resolve_with_bootstrap_probe(
             candidates,
             dispatch_facts,
             probed: Vec::new(),
+            snapshot: initial_snapshot.clone(),
         });
     }
 
@@ -490,6 +500,7 @@ pub(crate) fn resolve_with_bootstrap_probe(
         candidates,
         dispatch_facts,
         probed,
+        snapshot: refreshed,
     })
 }
 
@@ -836,6 +847,85 @@ mod tests {
         assert_eq!(outcome.probed[0].verdict, ProbeVerdict::Validated);
         assert_eq!(musterroll.success_calls().len(), 1);
         assert_eq!(musterroll.success_calls()[0].provider, "only-provider");
+        let (recomputed, _) = crate::work_policy::resolve_candidates(&binding, &outcome.snapshot)
+            .expect("resolve candidates against the outcome's pinned snapshot");
+        assert_eq!(
+            recomputed
+                .iter()
+                .map(|candidate| candidate.profile_id.clone())
+                .collect::<Vec<_>>(),
+            outcome
+                .candidates
+                .iter()
+                .map(|candidate| candidate.profile_id.clone())
+                .collect::<Vec<_>>(),
+            "the snapshot returned for pinning must be the exact post-probe snapshot \
+             candidate resolution used, not the stale pre-probe one"
+        );
+    }
+
+    #[test]
+    fn already_eligible_pool_pins_the_initial_snapshot_without_probing() {
+        let temp = TempDir::new("already-eligible");
+        let binding = binding(&["healthy-worker"], &[]);
+        let snapshot = snapshot_with(&[fixture("healthy-worker", "healthy-provider", "healthy")]);
+        let musterroll = BootstrapMusterroll::new(snapshot.clone());
+        let exec = ScriptedExec::new(HashMap::new());
+
+        let outcome = resolve_with_bootstrap_probe(
+            temp.path(),
+            "/fixture/repo",
+            "bead-already-eligible",
+            &binding,
+            &snapshot,
+            &exec,
+            &musterroll,
+            Duration::from_secs(5),
+        )
+        .expect("bootstrap probe resolves");
+
+        assert_eq!(outcome.candidates.len(), 1);
+        assert!(
+            outcome.probed.is_empty(),
+            "an already-eligible pool must never be probed"
+        );
+        assert!(exec.spawned().is_empty());
+        assert_eq!(
+            outcome.snapshot, snapshot,
+            "no probing ran, so the pinned snapshot must be the exact initial snapshot \
+             eligibility was resolved from"
+        );
+    }
+
+    #[test]
+    fn nothing_unknown_to_probe_pins_the_initial_snapshot_and_stays_blocked() {
+        let temp = TempDir::new("nothing-to-probe");
+        let binding = binding(&["exhausted-worker"], &[]);
+        let snapshot =
+            snapshot_with(&[fixture("exhausted-worker", "exhausted-provider", "exhausted")]);
+        let musterroll = BootstrapMusterroll::new(snapshot.clone());
+        let exec = ScriptedExec::new(HashMap::new());
+
+        let outcome = resolve_with_bootstrap_probe(
+            temp.path(),
+            "/fixture/repo",
+            "bead-nothing-to-probe",
+            &binding,
+            &snapshot,
+            &exec,
+            &musterroll,
+            Duration::from_secs(5),
+        )
+        .expect("bootstrap probe resolves");
+
+        assert!(outcome.candidates.is_empty());
+        assert!(outcome.probed.is_empty());
+        assert!(exec.spawned().is_empty());
+        assert_eq!(
+            outcome.snapshot, snapshot,
+            "nothing was probed, so the pinned snapshot must still be the exact initial \
+             snapshot eligibility was (unsuccessfully) resolved against"
+        );
     }
 
     #[test]
@@ -1013,6 +1103,12 @@ mod tests {
             std::slice::from_ref(&candidate),
         )
         .expect("create probe run");
+        assert!(
+            handle.manifest().roster_snapshot.is_none(),
+            "the probe's own dedicated run must still create without a pinned roster \
+             snapshot (bead conductor-bxb) -- the `RunHandle::create` coverage-gap \
+             fail-open stays deliberate for this run"
+        );
         let musterroll = BootstrapMusterroll::new(snapshot_with(&[fixture(
             "only-worker",
             "only-provider",

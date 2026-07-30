@@ -3009,6 +3009,80 @@ mod tests {
             );
         }
 
+        /// Bead `conductor-i9lq`'s fail-closed requirement: a policy that
+        /// declares a revalidation digest (`work`'s `RosterPolicySha256`,
+        /// once its manifest lacks a pinned roster snapshot) with no
+        /// matching entry in `RunRequest::pinned_digests` must refuse
+        /// outright rather than run -- this is the mechanism a resumed
+        /// (reopened) run relies on to reject a manifest that never pinned
+        /// the artifact, distinct from `approval_digest_drift_mid_run_
+        /// fails_closed_and_releases_the_bead` above, where a pinned value
+        /// exists but the live reading disagrees with it.
+        #[test]
+        fn missing_pinned_digest_refuses_before_any_dispatch_or_bead_claim() {
+            let temp = TempDir::new("missing-pinned-digest");
+            let mut handle = create_run(&temp, "/artifact/roster-digest", Some("bead-4"), Some(5));
+
+            let stage = one_slot_stage(
+                "work",
+                vec![candidate("worker-1")],
+                1,
+                TargetKind::ArtifactOnly,
+                BTreeMap::new(),
+            );
+            let mut policy = ScriptedPolicy::new(run::RunJob::Work, vec![stage]);
+            policy.claims_bead = true;
+            policy.revalidation_digests = vec![DigestKind::RosterPolicySha256];
+
+            let executor = FakeAttemptExecutor::new(temp.path().join("stdout"));
+            let exec = FakeExec {
+                readiness: dispatch::AuthReadiness::Ready,
+            };
+            let commits = FakeCommitProbe { clean: true };
+            let bd = FakeBeadGateway::default();
+            let digests = FakeDigestSource::default();
+            let ports = RunnerPorts {
+                exec: &exec,
+                commits: &commits,
+                bd: &bd,
+                executor: &executor,
+                clock: &SystemClock,
+                digests: &digests,
+            };
+            // No `RosterPolicySha256` entry: mirrors a work run whose
+            // manifest never pinned a roster snapshot (a pre-conductor-i9lq
+            // run, or one whose artifact went missing) rather than a
+            // drifted-but-present value.
+            let request = RunRequest {
+                state_dir: temp.path().join("state"),
+                backend: Backend::Claude,
+                owner: "undertake".to_string(),
+                pinned_digests: BTreeMap::new(),
+            };
+
+            let error = AttemptRunner::run(&policy, &ports, &mut handle, &request)
+                .expect_err("a declared digest with no pinned value must refuse, not run");
+            assert!(
+                error.to_string().contains("RosterPolicySha256"),
+                "{error}"
+            );
+            assert_eq!(
+                executor.call_count(),
+                0,
+                "no attempt may dispatch before the missing pinned digest is caught"
+            );
+            assert!(
+                bd.calls().is_empty(),
+                "refusing before the digest check must never claim or release the bead"
+            );
+            assert_eq!(
+                handle.manifest().lifecycle,
+                run::RunLifecycle::Running,
+                "a refused run's durable state must be left exactly as `create_run` (via its \
+                 initial `run_started` event) already produced it, never advanced to `Finished`"
+            );
+        }
+
         #[test]
         fn transition_terminal_ends_the_run_without_visiting_a_later_stage() {
             let temp = TempDir::new("transition-terminal");

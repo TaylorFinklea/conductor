@@ -263,10 +263,10 @@ impl JobPolicy for WorkPolicy {
     }
 
     fn revalidation_digests(&self) -> &[DigestKind] {
-        // Deliberately empty, correcting the contract's draft table (which
-        // named `target_head`, `bead status/claim ownership`, and
-        // `roster_policy_sha256`) against how the generic per-stage-boundary
-        // mechanism actually behaves for a *mutating* job:
+        // Correcting the contract's draft table (which named `target_head`,
+        // `bead status/claim ownership`, and `roster_policy_sha256`)
+        // against how the generic per-stage-boundary mechanism actually
+        // behaves for a *mutating* job:
         //
         // - `target_head`: `revalidate_digests` runs at every stage
         //   boundary against one fixed pinned value supplied before the run
@@ -289,9 +289,24 @@ impl JobPolicy for WorkPolicy {
         //   before the loop's first (post-claim) one — no single pinned
         //   value can pass both without a runner-side ordering change this
         //   pass does not make.
-        // - `roster_policy_sha256`: no live Musterroll roster snapshot is
-        //   pinned into this run's manifest by this pass.
-        &[]
+        // - `roster_policy_sha256`: **no longer dropped.** Bead
+        //   `conductor-i9lq` makes `run_work` pin the exact Musterroll
+        //   snapshot bytes it resolved eligibility from into this run's
+        //   manifest at creation (`RunHandle::create`'s `roster_snapshot`
+        //   argument), so a pinned value now always exists to revalidate
+        //   against. Unlike `target_head`, this is not a live-drift check:
+        //   both `RunRequest::pinned_digests` and `HeadDigestSource::
+        //   current` read the same immutable, already-hash-validated
+        //   manifest field (see `run::validate_roster_snapshot`) rather
+        //   than re-querying live Musterroll, so the comparison is
+        //   pinned-vs-pinned and stable across the run's own lifetime —
+        //   mid-run drift of the *live* roster config cannot affect it.
+        //   Its real value surfaces on resume: `revalidate_digests`
+        //   requires a pinned value for every digest a policy declares, so
+        //   a run whose manifest lacks the copied snapshot entirely (a
+        //   pre-`conductor-i9lq` run, or a corrupted one) fails closed with
+        //   a legible diagnostic instead of silently proceeding.
+        &[DigestKind::RosterPolicySha256]
     }
 
     fn next_stage(&self, ledger: &StageLedger) -> Option<Stage> {
@@ -375,16 +390,30 @@ impl JobPolicy for WorkPolicy {
     }
 }
 
-/// Digest source backing [`WorkPolicy::revalidation_digests`]'s single
-/// declared digest.
+/// Digest source backing [`WorkPolicy::revalidation_digests`]. `TargetHead`
+/// reads live git state (declared by no job today; kept wired for
+/// completeness). `RosterPolicySha256` reads the pinned
+/// `roster_policy_sha256` captured from the run's own manifest at
+/// construction — never a live Musterroll query — so revalidation always
+/// checks the run's own pinned copy, per the runner contract's "Resume
+/// authorization is immutable" requirement.
 pub(crate) struct HeadDigestSource<'a, C: CommitProbe> {
     commits: &'a C,
     repo: PathBuf,
+    roster_policy_sha256: Option<String>,
 }
 
 impl<'a, C: CommitProbe> HeadDigestSource<'a, C> {
-    pub(crate) fn new(commits: &'a C, repo: PathBuf) -> Self {
-        Self { commits, repo }
+    pub(crate) fn new(
+        commits: &'a C,
+        repo: PathBuf,
+        roster_policy_sha256: Option<String>,
+    ) -> Self {
+        Self {
+            commits,
+            repo,
+            roster_policy_sha256,
+        }
     }
 }
 
@@ -396,6 +425,11 @@ impl<C: CommitProbe> DigestSource for HeadDigestSource<'_, C> {
                 .head(&self.repo)
                 .map(Option::unwrap_or_default)
                 .map_err(|error| crate::runner::RunnerError::new(error.to_string())),
+            DigestKind::RosterPolicySha256 => self.roster_policy_sha256.clone().ok_or_else(|| {
+                crate::runner::RunnerError::new(
+                    "work run manifest has no pinned roster snapshot to revalidate against",
+                )
+            }),
             other => Err(crate::runner::RunnerError::new(format!(
                 "WorkPolicy does not declare revalidation digest {other:?}"
             ))),
@@ -856,6 +890,29 @@ mod tests {
         }
     }
 
+    /// A minimal, schema-valid `musterroll/roster@2` snapshot (no providers
+    /// or profiles needed for these tests, which construct their own
+    /// [`ApprovedExecution`] candidates directly) plus its `policy_sha256`,
+    /// for pinning into a [`run::NewRun`] the same way `undertake work`
+    /// pins the exact bytes it resolved eligibility from.
+    fn fixture_roster_snapshot() -> (Vec<u8>, String) {
+        let policy_sha256 = "c".repeat(64);
+        let bytes = serde_json::json!({
+            "schema": "musterroll/roster@2",
+            "generated_at": "2026-07-28T00:00:00Z",
+            "source_artifact": {
+                "path": "/fixture/musterroll-roster.toml",
+                "sha256": "a".repeat(64)
+            },
+            "policy_sha256": policy_sha256,
+            "providers": [],
+            "profiles": []
+        })
+        .to_string()
+        .into_bytes();
+        (bytes, policy_sha256)
+    }
+
     /// Test-scoped [`AttemptExecutor`]. Uses real [`CommandExec`] and real
     /// [`GitCommitProbe`] for every process/git operation it performs, but
     /// invokes the scripted worker backend by its absolute path via
@@ -1040,6 +1097,8 @@ mod tests {
             .expect("head")
             .expect("head present after init commit");
 
+        let (roster_snapshot_bytes, roster_policy_sha256) = fixture_roster_snapshot();
+
         let mut handle = run::RunHandle::create(
             &state_dir,
             run::RunJob::Work,
@@ -1050,7 +1109,10 @@ mod tests {
                 },
                 approved_profiles: vec!["test-worker".to_string()],
                 musterroll_roster_artifact: None,
-                roster_snapshot: None,
+                roster_snapshot: Some(run::RosterSnapshotInput {
+                    bytes: roster_snapshot_bytes.clone(),
+                    policy_sha256: roster_policy_sha256.clone(),
+                }),
                 limits: run::RunLimits {
                     item_wall_clock_mins: Some(5),
                     max_attempts: Some(max_attempts),
@@ -1079,6 +1141,26 @@ mod tests {
         )
         .expect("create run");
 
+        // Bead `conductor-i9lq`: `undertake work` pins the exact roster
+        // snapshot bytes eligibility was resolved from into the run
+        // manifest -- proven here directly, since `RunHandle::create` is
+        // the same primitive `run_work` calls.
+        let pinned_snapshot = handle
+            .manifest()
+            .roster_snapshot
+            .as_ref()
+            .expect("work run creation pins a roster snapshot artifact");
+        assert_eq!(
+            pinned_snapshot.sha256,
+            format!("{:x}", Sha256::digest(&roster_snapshot_bytes)),
+            "pinned artifact hash must match the exact snapshot bytes eligibility was \
+             resolved from"
+        );
+        assert_eq!(
+            handle.manifest().roster_policy_sha256.as_deref(),
+            Some(roster_policy_sha256.as_str())
+        );
+
         let run_dir = handle.dir().to_path_buf();
         let exec = CommandExec;
         let executor = ScriptedTestExecutor {
@@ -1091,12 +1173,15 @@ mod tests {
             sequence: AtomicU64::new(0),
         };
 
-        let digests = HeadDigestSource::new(&commits, repo.clone());
+        let digests =
+            HeadDigestSource::new(&commits, repo.clone(), Some(roster_policy_sha256.clone()));
+        let mut pinned_digests = BTreeMap::new();
+        pinned_digests.insert(DigestKind::RosterPolicySha256, roster_policy_sha256.clone());
         let request = RunRequest {
             state_dir: state_dir.clone(),
             backend: Backend::Pi,
             owner: "undertake".to_string(),
-            pinned_digests: BTreeMap::new(),
+            pinned_digests,
         };
         let ports = RunnerPorts {
             exec: &exec,
