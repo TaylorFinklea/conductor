@@ -1,6 +1,6 @@
 # current-state.md — undertake
 
-Branch: `main` at `6ce2d7e`; 46 commits ahead of `origin/main`, not pushed.
+Branch: `main` at `2ebfb26`; 48 commits ahead of `origin/main`, not pushed.
 
 ## Plan
 
@@ -27,7 +27,7 @@ Chain: prep ✓ → `mkct` ✓ → `v37z` ✓ → `vd3y` → `bxb` → `eueb`/`u
 - Next: `conductor-vd3y` (per the contract doc's `RunRequest` doc comment: populate `pinned_digests` from a run's pinned manifest/approval envelope — the generic loop takes it as an input and does not own sourcing it).
 - Suite green at 917 passed / 0 failed / 3 ignored; clippy clean. Parity corpus 126, no loss.
 
-## Open questions
+## Open questions (updated)
 
 - Musterroll must add `model_family` to `roster@2` before `ao8` can be enforced (cross-repo).
 - Phase 6 needs the chezmoi `AGENTS.md` + guildhall-orchestration migration applied by a human.
