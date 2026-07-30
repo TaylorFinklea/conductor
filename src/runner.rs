@@ -423,7 +423,46 @@ pub(crate) struct AttemptContext<'a> {
     pub(crate) attempt_index: u32,
     pub(crate) candidate: &'a ApprovedExecution,
     pub(crate) prior_stages: &'a StageLedger,
-    pub(crate) prior_attempt_output: Option<&'a ArtifactRef>,
+    pub(crate) prior_attempt_output: Option<PriorAttemptOutput<'a>>,
+}
+
+/// The prior attempt's pinned identity (`artifact`) plus a bounded, in-memory
+/// copy of its actual captured bytes (`bytes`) — what a `RetrySameCandidate`
+/// repair prompt needs to *quote* the failure, not just reference it by
+/// hash. `walk_slot` threads `bytes` straight from the slot thread's own
+/// in-memory `AttemptOutput`; it is never read back from a run-directory
+/// file, because the single-writer post-join phase (`write_attempt_events`)
+/// has not captured that file yet when a same-slot repair prompt is built.
+/// `bytes` is capped at [`PRIOR_ATTEMPT_OUTPUT_CAP_BYTES`] — see
+/// [`cap_prior_attempt_output`] — so a runaway attempt cannot balloon the
+/// next prompt; `artifact.sha256` still identifies the *full*, uncapped
+/// output.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PriorAttemptOutput<'a> {
+    pub(crate) artifact: &'a ArtifactRef,
+    pub(crate) bytes: &'a [u8],
+}
+
+/// Upper bound on how many bytes of a prior attempt's output travel into the
+/// next attempt's [`AttemptContext`]. A repair prompt needs enough of the
+/// failure to quote it back to the model, not a full replay of a runaway or
+/// pathological attempt's stdout.
+const PRIOR_ATTEMPT_OUTPUT_CAP_BYTES: usize = 256 * 1024;
+
+/// Bounds `bytes` to [`PRIOR_ATTEMPT_OUTPUT_CAP_BYTES`], appending an
+/// explicit truncation marker (naming how many bytes were dropped) when the
+/// cap is exceeded. Returns a borrowed slice unchanged when `bytes` is
+/// already within the cap, so the common case allocates nothing.
+fn cap_prior_attempt_output(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if bytes.len() <= PRIOR_ATTEMPT_OUTPUT_CAP_BYTES {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let omitted = bytes.len() - PRIOR_ATTEMPT_OUTPUT_CAP_BYTES;
+    let marker = format!("\n...[truncated: {omitted} bytes omitted]...\n");
+    let mut truncated = Vec::with_capacity(PRIOR_ATTEMPT_OUTPUT_CAP_BYTES + marker.len());
+    truncated.extend_from_slice(&bytes[..PRIOR_ATTEMPT_OUTPUT_CAP_BYTES]);
+    truncated.extend_from_slice(marker.as_bytes());
+    std::borrow::Cow::Owned(truncated)
 }
 
 /// What a policy returns from `JobPolicy::prompt` — prompt and schema
@@ -955,13 +994,22 @@ fn walk_slot(
         let mut fatal = false;
         for attempt_index in 1..=stage.attempt_budget.value() {
             let attempt_index = u32::from(attempt_index);
+            let capped_prior_bytes = prior_output
+                .as_ref()
+                .map(|output| cap_prior_attempt_output(&output.bytes));
+            let prior_attempt_output = prior_output.as_ref().zip(capped_prior_bytes.as_ref()).map(
+                |(output, bytes)| PriorAttemptOutput {
+                    artifact: &output.artifact,
+                    bytes: bytes.as_ref(),
+                },
+            );
             let ctx = AttemptContext {
                 stage,
                 slot,
                 attempt_index,
                 candidate,
                 prior_stages: ledger,
-                prior_attempt_output: prior_output.as_ref().map(|output| &output.artifact),
+                prior_attempt_output,
             };
             let prompt = policy.prompt(ctx);
             let input_sha256 = sha256_hex(prompt.prompt.as_bytes());
@@ -2422,8 +2470,11 @@ mod tests {
                         ctx.slot.index,
                         ctx.attempt_index,
                         ctx.candidate.profile_id,
-                        ctx.prior_attempt_output
-                            .map(|artifact| artifact.sha256.clone()),
+                        ctx.prior_attempt_output.map(|prior| format!(
+                            "sha256={} content={:?}",
+                            prior.artifact.sha256,
+                            String::from_utf8_lossy(prior.bytes)
+                        )),
                         ctx.prior_stages.completed_stages().count(),
                     ),
                     response_schema: None,
@@ -2773,6 +2824,11 @@ mod tests {
                 "retry attempt must carry the failed attempt's output: {}",
                 calls[1].1
             );
+            assert!(
+                calls[1].1.contains("first-output"),
+                "retry attempt's prompt must quote the failed attempt's actual bytes, not just its hash: {}",
+                calls[1].1
+            );
 
             let started = attempt_started_events(&handle);
             assert_eq!(started.len(), 2);
@@ -2781,6 +2837,79 @@ mod tests {
                 started[1].invocation.as_ref().expect("invocation").retry_of,
                 Some(first_id),
                 "the retry's InvocationEvidence must link back to the first attempt's event id"
+            );
+        }
+
+        #[test]
+        fn retry_same_candidate_truncates_an_oversized_prior_output_with_an_explicit_marker() {
+            let temp = TempDir::new("retry-same-candidate-truncated");
+            let mut handle = create_run(&temp, "/artifact/review-target", None, Some(5));
+
+            let mut outcome_actions = BTreeMap::new();
+            outcome_actions.insert(
+                AttemptOutcomeCategory::ProcessFailure,
+                AttemptAction::RetrySameCandidate,
+            );
+            let stage = one_slot_stage(
+                "review",
+                vec![candidate("worker-1")],
+                2,
+                TargetKind::ArtifactOnly,
+                outcome_actions,
+            );
+            let policy = ScriptedPolicy::new(run::RunJob::Work, vec![stage]);
+
+            // Double the 256 KiB cap so the truncated prompt is materially,
+            // not just marginally, smaller than the untruncated output.
+            let oversized: String = "a".repeat(512 * 1024);
+            let oversized_leaked: &'static str = Box::leak(oversized.into_boxed_str());
+
+            let executor = FakeAttemptExecutor::new(temp.path().join("stdout"));
+            executor.script(
+                "worker-1",
+                vec![
+                    ScriptedAttempt::Failed(
+                        DispatchFailure::ExitNonZero { code: Some(1) },
+                        oversized_leaked,
+                    ),
+                    ScriptedAttempt::Success("second-output"),
+                ],
+            );
+            let exec = FakeExec {
+                readiness: dispatch::AuthReadiness::Ready,
+            };
+            let commits = FakeCommitProbe { clean: true };
+            let bd = FakeBeadGateway::default();
+            let digests = FakeDigestSource::default();
+            let ports = RunnerPorts {
+                exec: &exec,
+                commits: &commits,
+                bd: &bd,
+                executor: &executor,
+                clock: &SystemClock,
+                digests: &digests,
+            };
+            let request = RunRequest {
+                state_dir: temp.path().join("state"),
+                backend: Backend::Claude,
+                owner: "undertake".to_string(),
+                pinned_digests: BTreeMap::new(),
+            };
+
+            let terminal =
+                AttemptRunner::run(&policy, &ports, &mut handle, &request).expect("run completes");
+            assert_eq!(terminal.verdict, TerminalVerdict::Completed);
+
+            let calls = executor.calls();
+            assert_eq!(calls.len(), 2);
+            assert!(
+                calls[1].1.contains("...[truncated: 262144 bytes omitted]..."),
+                "the retry prompt must carry an explicit truncation marker naming the omitted byte count: {}",
+                calls[1].1
+            );
+            assert!(
+                calls[1].1.len() < oversized_leaked.len(),
+                "the retry prompt must be materially smaller than the untruncated prior output"
             );
         }
 
